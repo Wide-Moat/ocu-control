@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# One-per-deployment control plane. Bring it up with a single command from the
+# repo root:
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# (With a published release image available, drop --build and set
+# OCU_CONTROL_TAG to the release tag.)
+#
+# SCAFFOLD POSTURE. The flag surface below tracks the scaffold daemon; the real
+# serving wiring (the two ingress listeners, the host-dialled control channel,
+# the teardown finalizer) lands with the implementation PRs. Until then `up`
+# exits non-zero on the scaffold's "serve not implemented" refusal — by design.
+#
+# Posture notes:
+# - The root filesystem is read-only; the writable surfaces are the audit sink
+#   (fail-closed OCSF records) and the runtime directory for the operator
+#   ingress socket.
+# - The Storage-JWT signing key and the operator credential are read-only
+#   secret mounts the deployment supplies. They are never baked into the image
+#   and never written by the daemon.
+# - RuntimeProvider: Docker is the v1 backend. The control plane drives
+#   per-session executor containers through the provider seam, so it needs a
+#   path to the runtime. The Docker socket is mounted read-only here as the
+#   provider endpoint; tighten this to a brokered/rootless socket in a hardened
+#   deployment. The control plane carries no customer payload.
+# - stop_grace_period covers the host-driven teardown finalizer (credential
+#   revoke, egress-route drop, writable-surface scrub) before the SIGKILL
+#   fallback.
+
+services:
+  controld:
+    image: ghcr.io/wide-moat/ocu-control:${OCU_CONTROL_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # Compose resolves a relative seccomp path against the CWD of the
+      # `docker compose` invocation, which the docs pin to the repo root
+      # (`docker compose -f deploy/docker-compose.yml ...`). The profile lives
+      # at deploy/seccomp/, so it must be referenced as ./deploy/seccomp/ for
+      # the default-deny hardening to actually apply.
+      - seccomp:./deploy/seccomp/ocu-controld.json
+    stop_grace_period: 30s
+    command:
+      - -operator-listen
+      - unix:///run/ocu-control/operator.sock
+      - -gateway-listen
+      - 127.0.0.1:9466
+      - -runtime-tier
+      - ${OCU_RUNTIME_TIER:-runc}
+      - -runtime-provider
+      - docker
+      - -jwt-signing-key
+      - /run/secrets/storage-jwt-signing.key
+      - -audit-sink
+      - /var/log/ocu-control/audit.ocsf.jsonl
+    volumes:
+      - audit:/var/log/ocu-control
+      - runtime:/run/ocu-control
+      # Storage-JWT signing key — a read-only secret mount the deployment
+      # supplies. Replace the host path with your own secret source.
+      - ${OCU_JWT_SIGNING_KEY:-./deploy/dev-secrets/storage-jwt-signing.key}:/run/secrets/storage-jwt-signing.key:ro
+      # RuntimeProvider endpoint (Docker, v1). Read-only; tighten in a
+      # hardened deployment.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/ocu-controld", "-health-check"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  # Fail-closed audit sink: an audit-write failure denies the privileged
+  # action, so this volume filling up stops privileged actions, not auditing.
+  audit:
+  # Runtime directory for the operator ingress socket (0700, host-owned).
+  runtime:

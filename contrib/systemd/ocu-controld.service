@@ -1,0 +1,108 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# ocu-controld.service — systemd unit for the control-plane daemon
+#
+# Requires systemd >= 207 (Type=notify). Tested on systemd >= 240.
+#
+# INSTALLATION:
+#   cp contrib/systemd/ocu-controld.service /etc/systemd/system/
+#   systemctl daemon-reload
+#   systemctl enable --now ocu-controld
+#
+# SITE CUSTOMISATION — use a drop-in rather than editing this file:
+#   mkdir /etc/systemd/system/ocu-controld.service.d/
+#   # create site.conf with [Service] Environment= overrides
+#   systemctl daemon-reload
+#
+# The two ReadWritePaths entries cover the only mutable surfaces:
+#   1. Audit sink — fail-closed OCSF JSONL hash-chained records.
+#   2. Runtime dir — the operator-ingress Unix socket.
+# The Storage-JWT signing key and the operator credential are read-only secret
+# mounts the deployment supplies; they are never written by the daemon.
+#
+# IMPORTANT — log rotation: NEVER use copytruncate on the audit sink.
+# The sink is hash-chained; copytruncate breaks the chain. The correct
+# procedure is stop -> rotate (move/rename) -> start.
+
+[Unit]
+Description=Open Computer Use control plane daemon (component-02)
+Documentation=https://github.com/Wide-Moat/ocu-control
+# The control plane dials guests and the RuntimeProvider endpoint over the
+# network, so it needs the network up before it serves.
+After=network.target local-fs.target
+
+[Service]
+# Type=notify: the daemon sends READY=1 via NOTIFY_SOCKET after both ingress
+# listeners begin accepting connections, and STOPPING=1 on SIGTERM/SIGINT.
+# systemd waits for READY=1 before declaring the unit active.
+Type=notify
+NotifyAccess=main
+
+User=ocucontrol
+Group=ocucontrol
+
+# ExecStart: the required serving flags. Adjust per deployment. All flags can
+# also be supplied via OCU_CONTROL_* environment variables in a drop-in
+# [Service] Environment= block.
+#
+# SCAFFOLD: the current daemon validates this invocation and then refuses with
+# "serve not implemented" — the real serve wiring lands with the lifecycle PRs.
+ExecStart=/usr/local/bin/ocu-controld \
+    -operator-listen unix:///run/ocu-control/operator.sock \
+    -gateway-listen 127.0.0.1:9466 \
+    -runtime-tier runc \
+    -runtime-provider docker \
+    -jwt-signing-key /etc/ocu-control/storage-jwt-signing.key \
+    -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+
+# Graceful stop must cover the host-driven teardown finalizer (credential
+# revoke, egress-route drop, writable-surface scrub) for every live session
+# before the SIGKILL fallback, or systemd kills the daemon mid-teardown and
+# leaves a session live. Tune TimeoutStopSec to the deployment's finalizer
+# bound once the lifecycle engine lands; the value below is a conservative
+# scaffold default.
+TimeoutStopSec=120s
+KillMode=mixed
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=5s
+
+# ── Security hardening ────────────────────────────────────────────────────
+# The control plane needs no elevated capabilities: it binds two listeners,
+# appends to a log file, reads a signing key, and dials the runtime endpoint.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Allow only the syscall groups a normal service daemon needs.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The two mutable write surfaces (everything else is read-only under
+# ProtectSystem=strict):
+ReadWritePaths=/var/log/ocu-control
+ReadWritePaths=/run/ocu-control
+
+# Let systemd manage the runtime, log, and state directories (created with
+# correct ownership before ExecStart runs).
+RuntimeDirectory=ocu-control
+RuntimeDirectoryMode=0700
+LogsDirectory=ocu-control
+StateDirectory=ocu-control
+
+[Install]
+WantedBy=multi-user.target

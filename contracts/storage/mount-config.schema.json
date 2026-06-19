@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.open-computer-use.dev/storage/mount-config.schema.json",
+  "$comment": "SPDX-License-Identifier: FSL-1.1-Apache-2.0 | Copyright (c) 2025 Open Computer Use Contributors | File-operation mount surface (mount-plane provisioning push: control plane -> host -> Session sandbox). One config shape: top-level service_url + ca_cert_pem + a mounts[] array; each mount carries its own auth_token (the pre-issued Storage-JWT) and its own readonly posture. The per-operation file-op RPC bodies live in file-ops.schema.json. NFR-SEC-25. JSON Schema 2020-12 (json-schema.org).",
+  "title": "File-operation mount config",
+  "description": "One mount-config shape: top-level `service_url` + `ca_cert_pem` + a `mounts[]` array. Each mount carries its own `auth_token` (the pre-issued Storage-JWT), its own `filesystem_id`/`memory_store_id` scope, and its own `readonly` posture (false=RW, true=RO); its freshness window is the per-mount `cache_duration_s` (short for RO inputs, long for the RW sink). The mount client presents storage as a FUSE filesystem (rclone VFS over FUSE); the FUSE mechanism is a component-spec detail and is deliberately absent from this schema (NFR-SEC-25). No object-store/S3 fields. No backend-encryption fields: isolation is by filesystem_id scope enforced at the storage engine, not per-session crypt keys; crypt is not modelled on. The file-op RPC message set is split out to file-ops.schema.json (status TBD).",
+
+  "$defs": {
+    "SchemaVersion": {
+      "description": "Interface version. Breaking change increments major (NFR-IC-04).",
+      "type": "string",
+      "pattern": "^v[0-9]+(alpha|beta)?[0-9]*$",
+      "examples": ["v1alpha"]
+    },
+
+    "FilesystemId": {
+      "description": "Per-session logical scope (the isolation unit, not a crypto boundary). Egress binds connection to this id (NFR-SEC-25).",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "examples": ["session_01HXYZ_chat"]
+    },
+
+    "Octal": {
+      "description": "Host-set POSIX permission bits as an octal string. Agent (non-root) cannot change.",
+      "type": "string",
+      "pattern": "^0[0-7]{3}$",
+      "examples": ["0755", "0644"]
+    },
+
+    "CacheDurationSeconds": {
+      "description": "Per-mount cache_duration_s: maps to the VFS DirCacheTime, a local dir-listing freshness window in whole seconds, not a backend mechanism. RO inputs use a short window so externally-written user data appears promptly; the RW output mount uses a long window since the agent is the writer and invalidates locally. Directional defaults by mount: uploads 1, tool_results 3, transcripts 10, outputs 3600.",
+      "type": "integer",
+      "minimum": 0,
+      "examples": [1, 3, 10, 3600]
+    },
+
+    "BackendCacheTtlSeconds": {
+      "description": "Config-level backend cache freshness window in whole seconds, distinct from the per-mount local-VFS window cache_duration_s. A host-side provisioning concern, so it sits at the top level of the config.",
+      "type": "integer",
+      "minimum": 0,
+      "x-ocu-tbd": "The backend_cache_ttl field name is confirmed present. Two things stay unconfirmed before freeze: (1) value encoding — a sibling cache-TTL option defaults to a duration (1h), so integer-seconds is unverified; (2) top-level-vs-per-mount placement. Do not freeze the type or the placement."
+    },
+
+    "ByteSize": {
+      "description": "Local VFS cache cap as a size string. Files over the cap stream rather than cache.",
+      "type": "string",
+      "pattern": "^[0-9]+(B|K|M|G|T)?$",
+      "examples": ["1G", "512M"]
+    },
+
+    "VfsCacheMode": {
+      "description": "Page-cache policy for the mount.",
+      "type": "string",
+      "enum": ["off", "minimal", "writes", "full"]
+    },
+
+    "Mount": {
+      "description": "One mount entry. Carries its own scoped Storage-JWT (`auth_token`), its scope (`filesystem_id` XOR `memory_store_id`), and its `readonly` posture. RW vs RO is host-enforced; the agent cannot flip it.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "destination",
+        "auth_token",
+        "readonly",
+        "vfs_cache_mode",
+        "cache_duration_s",
+        "vfs_cache_max_size",
+        "dir_perms",
+        "file_perms"
+      ],
+      "oneOf": [
+        { "required": ["filesystem_id"], "not": { "required": ["memory_store_id"] } },
+        { "required": ["memory_store_id"], "not": { "required": ["filesystem_id"] } }
+      ],
+      "properties": {
+        "destination": {
+          "description": "Absolute guest mountpoint.",
+          "type": "string",
+          "pattern": "^/.+",
+          "examples": ["/workspace/out"]
+        },
+        "auth_token": {
+          "description": "Pre-issued WEAK session JWT (an OCU-chosen signing algorithm, e.g. ES256), opaque to the holder. Scoped {filesystem_id + intent + downloadable}, short-lived, fixed-window, no refresh (TTL is an OCU deployment parameter, not a sourced value); minted and signed by the Control plane (the Storage-JWT signing-key holder, which publishes a JWKS the egress edge validates against) and delivered in the provisioning push. It is an edge-only assertion: the egress edge validates it, strips it, and exchanges it for the real filestore credential keyed on filesystem_id (the exchange counterparty issuing the real credential MAY be an external/customer credential authority); the mount client forwards this weak JWT as a static Authorization: Bearer, but ocu-filestore never receives it — it receives only the edge-injected real credential, on which the storage engine enforces scope.",
+          "type": "string",
+          "minLength": 1
+        },
+        "filesystem_id": { "$ref": "#/$defs/FilesystemId" },
+        "memory_store_id": {
+          "description": "Parallel scope id for memory-backed mounts; present only when the backing scope is a memory store rather than a filesystem.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "readonly": {
+          "description": "false => read-write mount, true => read-only. Host-enforced; the agent cannot flip it.",
+          "type": "boolean"
+        },
+        "vfs_cache_mode": { "$ref": "#/$defs/VfsCacheMode" },
+        "cache_duration_s": { "$ref": "#/$defs/CacheDurationSeconds" },
+        "vfs_cache_max_size": {
+          "description": "Local VFS cache cap per mount. Files over the cap stream rather than cache.",
+          "$ref": "#/$defs/ByteSize"
+        },
+        "dir_perms": { "$ref": "#/$defs/Octal" },
+        "file_perms": { "$ref": "#/$defs/Octal" }
+      },
+      "$comment": "RW/RO is carried by `readonly`, host-enforced. cache_duration_s sets the per-mount directional window (short for RO inputs, long for the RW sink; defaults pinned in CacheDurationSeconds, tunable per deployment). The backend source path is resolved at the storage engine from filesystem_id + the mount's RW/RO intent and is deliberately off the wire (least-data, NFR-SEC-25) — not a guest- or host-facing mount field. NFR-SEC-25.",
+      "$comment-no-role": "No `role` field. RW/RO is the per-mount `readonly` boolean and the directional cache window is cache_duration_s itself; a role enum (uploads/tool_results/transcripts/outputs) bound to readonly/cache would only duplicate values already carried by `readonly` and cache_duration_s, with no source. The role names survive solely as the directional-window vocabulary in CacheDurationSeconds."
+    }
+  },
+
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "service_url", "ca_cert_pem", "mounts"],
+  "properties": {
+    "schema_version": { "$ref": "#/$defs/SchemaVersion" },
+    "service_url": {
+      "description": "Single allow-listed object-store service_url the mount client dials guest-out over the egress hop.",
+      "type": "string",
+      "format": "uri",
+      "pattern": "^https://",
+      "examples": ["https://storage.internal"]
+    },
+    "ca_cert_pem": {
+      "description": "Inspection-CA trust anchor (PEM) injected into the guest trust store so the guest trusts the egress hop that terminates TLS, validates the weak session JWT, and exchanges it for the real filestore credential it injects onward.",
+      "type": "string",
+      "contentMediaType": "application/x-pem-file",
+      "pattern": "-----BEGIN CERTIFICATE-----"
+    },
+    "mounts": {
+      "description": "Every mount provisioned in the guest. Each entry's RW/RO posture is its own `readonly` flag; there is no separate read-only array.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/Mount" }
+    },
+    "backend_cache_ttl": { "$ref": "#/$defs/BackendCacheTtlSeconds" }
+  },
+  "$comment-ocu-additions": "`schema_version` and `ca_cert_pem` are OCU-side additions with no reference anchor; they are kept top-level by design. `service_url`, `mounts`, and every per-mount field name (`destination`, `auth_token`, `filesystem_id`, `memory_store_id`, `readonly`, `cache_duration_s`, `vfs_cache_mode`, `vfs_cache_max_size`, `dir_perms`, `file_perms`) match the reference wire shape."
+}

@@ -1,0 +1,41 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# TEST RIG ONLY — a Docker-in-Docker daemon the runtime-provider integration
+# legs drive through the RuntimeProvider seam (no mocks: the provider tests run
+# against a real container runtime, not a fake). This file is distinct from the
+# one-click deployment compose; nothing here is a production posture.
+#
+# The control plane has NO object-store backend: there is no MinIO/S3 rig. The
+# only external dependency the integration legs need is a reachable container
+# runtime, which this rig provides.
+#
+# Local invocation:
+#
+#   docker compose -f deploy/docker-compose.test.yml up -d --wait runtime
+#   # point the integration legs at the rig:
+#   OCU_RUNTIME_PROVIDER_ENDPOINT=tcp://127.0.0.1:2375 \
+#     go test -run 'Integration' ./internal/runtime/ -count=1
+#   docker compose -f deploy/docker-compose.test.yml down -v
+#
+# These package paths do not exist yet (scaffolding). The rig is staged so the
+# provider integration leg has a real runtime to dial the moment it lands.
+
+services:
+  # A throwaway dockerd the RuntimeProvider integration leg drives. Insecure
+  # TCP on loopback only — a test-rig value, never a production posture.
+  runtime:
+    # TODO: pin to a multi-arch index digest (image@sha256:...) when the
+    # RuntimeProvider integration leg lands and this rig is first exercised.
+    # Pinned by tag for now so the scaffold carries no fake digest.
+    image: docker:27-dind
+    privileged: true
+    command: ["dockerd", "--host=tcp://0.0.0.0:2375", "--tls=false"]
+    ports:
+      - "127.0.0.1:2375:2375"
+    healthcheck:
+      test: ["CMD", "docker", "-H", "tcp://127.0.0.1:2375", "info"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s

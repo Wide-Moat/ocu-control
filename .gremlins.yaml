@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# go-gremlins mutation-testing configuration. Auto-discovered at the module
+# root by `gremlins unleash` (and by `make mutation` and the mutation CI job),
+# so the scope lives here in one place instead of being duplicated across the
+# command lines.
+#
+# Scope: the pure-logic leaf packages where mutation testing has the highest
+# signal and the suite is fast — the admission matrix, the row-as-reservation
+# create flow, and the kill-switch / denylist engine. The runtime-provider,
+# control-channel, and state-store packages are deliberately excluded: they
+# need a live container backend and a live socket, which would make a mutation
+# run enormous for little added signal over their own integration suites.
+#
+# These directories do not exist yet (scaffolding). The scope is declarative
+# so it ratchets in as the logic packages land; coverpkg and the command-line
+# path argument must stay in agreement.
+#
+# Schema reference: https://github.com/go-gremlins/gremlins
+unleash:
+  coverpkg: ./internal/admission/...,./internal/reservation/...,./internal/killswitch/...
+  # Thresholds are 0 (advisory) until a stable baseline is measured on the CI
+  # toolchain. The ratchet plan: once gremlins reports a real efficacy figure
+  # on the pinned Go toolchain, set threshold.efficacy / threshold.mutant-coverage
+  # to floor(baseline) and drop continue-on-error in the workflow so a drop in
+  # assertion strength fails the gate.
+  threshold:
+    efficacy: 0
+    mutant-coverage: 0

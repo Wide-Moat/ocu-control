@@ -1,0 +1,39 @@
+Open Computer Use — Control plane
+Copyright (c) 2025 Open Computer Use Contributors
+https://github.com/Wide-Moat/ocu-control
+
+This repository holds the control-plane implementation of Open Computer Use
+(the architecture and specifications live in
+https://github.com/Wide-Moat/open-computer-use).
+
+Licensed under the Functional Source License, Version 1.1, Apache 2.0 Future
+License (FSL-1.1-Apache-2.0). See LICENSE.
+
+Two years after each release, that release automatically converts to Apache
+License 2.0 under the Grant of Future License clause.
+
+You may use, copy, modify, fork, and redistribute the Software for any purpose
+other than offering a hosted or embedded service that competes with our paid
+version(s) of the Software. Self-hosting for internal use within your
+organization is explicitly permitted and is not considered competition.
+
+LICENSE-APACHE and LICENSE-MIT are included as reference texts for dependency
+licenses; they are not the license of this Software.
+
+## Third-Party Notices
+
+These are the runtime dependencies expected as the implementation lands; the
+require block in go.mod stays empty until real code imports them. Each clears
+the architecture repo's dependency policy (license gate + supply-chain gate)
+before it is added.
+
+### pgregory.net/rapid
+
+Source: https://github.com/flyingmutant/rapid
+License: Mozilla Public License Version 2.0 (MPL-2.0)
+Used by: test binaries only (property-based test suites)
+
+The rapid library is used under the terms of the Mozilla Public License
+Version 2.0. MPL-2.0 is a weak copyleft license (file-level); it does not
+extend to the rest of this codebase. A copy of the MPL-2.0 is available at
+https://www.mozilla.org/en-US/MPL/2.0/.

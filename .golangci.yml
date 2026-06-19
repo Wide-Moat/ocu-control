@@ -1,0 +1,171 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# golangci-lint configuration — a structural meta-linter for this
+# security-sensitive control-plane daemon. It complements (does not replace)
+# the standalone gates in CI: gofmt, go vet, staticcheck, and govulncheck each
+# run as their own jobs. The value this config adds over those is the curated
+# security/correctness set below (gosec, errorlint, bodyclose, ...), not a
+# re-run of analyses already gated elsewhere.
+#
+# Schema is golangci-lint v2 (the tool's current major). See
+# https://golangci-lint.run/ for the configuration reference.
+#
+# Path-scoped exclusions are added narrowly, with a one-line rationale, as the
+# implementation packages land — never a bare //nolint in source.
+version: "2"
+
+run:
+  # The daemon is concurrency-heavy and the security set is not cheap; give it
+  # headroom so a cold cache never flakes the gate. CI passes --timeout=5m too.
+  timeout: 5m
+  # Lint test files as well — the property and conformance suites are
+  # first-class code that guards the admission, reservation, and kill-switch
+  # logic.
+  tests: true
+
+linters:
+  # Start from an explicit set rather than "enable-all minus": every linter is
+  # here on purpose, and the standard defaults (govet, errcheck, ineffassign,
+  # unused, staticcheck) are named so the intent is visible.
+  default: none
+  enable:
+    # ── defaults (named explicitly) ──────────────────────────────────────────
+    - govet
+    - errcheck
+    - ineffassign
+    - unused
+    # staticcheck also runs as its own pinned CI job; kept here for local
+    # `make lint` convenience so one command surfaces everything.
+    - staticcheck
+    # ── security (the reason this meta-linter exists for this repo) ───────────
+    - gosec
+    # ── correctness / value-add ──────────────────────────────────────────────
+    - errorlint    # wrapped-error comparison correctness — load-bearing given
+                   # the sentinel-error refusal mapping (==/switch on wrapped errs)
+    - bodyclose    # HTTP response bodies must close — the daemon speaks HTTP
+                   # over its ingress listeners and the host-dialled channel
+    - copyloopvar  # Go 1.22+ loop-var capture (supersedes exportloopref)
+    - unconvert    # redundant type conversions
+    - unparam      # unused function parameters / always-same returns
+    - nakedret     # naked returns in longer functions hide the value flow
+    - prealloc     # slices appended in a loop with a known length
+    - gocritic     # opinionated diagnostics/style/performance checks
+    - revive       # light, fast style/lint pass (replacement for golint)
+    - nolintlint   # a //nolint must name a linter and carry an explanation
+
+  settings:
+    gosec:
+      excludes:
+        # G104 (unhandled errors) duplicates errcheck, which is already
+        # enabled; keeping both double-reports the same finding.
+        - G104
+
+    errorlint:
+      # comparison + asserts are the load-bearing checks for this repo's
+      # sentinel-error refusal mapping: they catch == / type-switch on an error
+      # that may arrive wrapped. Keep both on.
+      comparison: true
+      asserts: true
+      # errorf is OFF on purpose: the daemon's wrap idiom is `%w` for the
+      # matchable sentinel and `%v` for the opaque cause, so only the sentinel
+      # is reachable through errors.Is. errorlint's errorf check wants the cause
+      # wrapped too, which would widen the matchable surface against intent.
+      errorf: false
+
+    errcheck:
+      # Checking the error of these calls adds noise without changing behavior:
+      # the Close calls are on the deferred cleanup path, and io.WriteString
+      # here only ever targets the fmt.State of a redacting String/Format method
+      # where a write error is unactionable. Everything else stays checked.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - io.WriteString
+
+    govet:
+      enable-all: true
+      disable:
+        # fieldalignment is a micro-optimization that fights readability of the
+        # config and wire structs; not worth the churn for this daemon.
+        - fieldalignment
+        # shadow flags the idiomatic `if err := f(); err != nil { ... }` block
+        # form pervasively; it is deliberately NOT in go vet's default set for
+        # that reason. Re-scoping every inner err would hurt, not help, clarity.
+        - shadow
+
+    nakedret:
+      max-func-lines: 30
+
+    revive:
+      # Light touch: rely on the default rule set rather than a hand-tuned wall
+      # of rules. staticcheck/gocritic carry the heavier style load.
+      severity: warning
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    gocritic:
+      # diagnostic + performance carry the real signal (likely-bug and
+      # allocation/copy patterns). The style tag is taste and overlaps revive
+      # and staticcheck, so it is left off rather than fought finding by
+      # finding.
+      enabled-tags:
+        - diagnostic
+        - performance
+      disabled-checks:
+        # Performance-tag checks that fight readable, intentional code (large
+        # value receivers/params and value-range copies are deliberate here);
+        # off so the gate stays signal, not taste.
+        - hugeParam
+        - rangeValCopy
+
+  exclusions:
+    # Use the maintained community presets for well-known false positives
+    # (e.g. errcheck on os.Setenv in examples) rather than re-deriving them.
+    presets:
+      - common-false-positives
+      - std-error-handling
+    rules:
+      # ── test files: idiomatic test patterns are not production findings ─────
+      # The production source stays under the full linter set; only test
+      # fixtures get this relief, where helper-return assertions, partial
+      # struct literals, and style quickfixes are noise, not defects.
+      - path: _test.go
+        linters:
+          - gosec      # tests legitimately write temp files, use weak rng, etc.
+          - errcheck   # asserting on every helper return drowns the real checks
+          - unparam    # table-driven test helpers carry uniform signatures
+          - prealloc   # test fixtures favor clarity over micro-allocation
+          - gocritic   # fixture nits (stringXbytes, redundantSprint, ...) add no
+                       # safety
+          - bodyclose  # short-lived probe responses in tests are not leaks
+          - staticcheck # QF* quickfix suggestions on interface-assertion fixtures
+      # govet's unusedwrite fires on intentional partial struct literals in test
+      # fixtures (a cfg built once, only some fields read by the case); keep
+      # unusedwrite for the source, drop it for tests.
+      - path: _test.go
+        text: "unusedwrite"
+        linters:
+          - govet
+      # copyloopvar: a leftover `x := x` loop copy in a test is harmless and
+      # redundant, not a defect; the source carries no such copies.
+      - path: _test.go
+        linters:
+          - copyloopvar
+      # ── shared test-support packages: same relief as _test.go ──────────────
+      # A *test package (e.g. internal/state/statetest) holds the cross-impl
+      # conformance suite that several packages' tests import, so its files
+      # cannot carry the _test.go suffix yet they are pure test-support code.
+      # The same idiomatic-test-helper allowances apply: uniform helper
+      # signatures (unparam) and the testing-package style set.
+      - path: internal/state/statetest/
+        linters:
+          - unparam
+          - gocritic
+
+formatters:
+  enable:
+    - gofmt

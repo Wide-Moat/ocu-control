@@ -1,0 +1,149 @@
+---
+# examples/k8s/control-deployment.yaml
+#
+# Control-plane Deployment for the ocu-controld daemon (component-02).
+#
+# ONE-PER-DEPLOYMENT. This manifest runs the single control plane that owns
+# session lifecycle, admission/quota, the kill-switch/denylist, and the
+# Storage-JWT signer for the whole deployment. It is NOT scaled out: the
+# kill-switch-under-saturation target reserves admission priority for the
+# revoke route rather than adding replicas (component-02 Operational concerns).
+#
+# SCAFFOLD STUB. The flag surface tracks the scaffold daemon; the real serving
+# wiring lands with the lifecycle PRs. Until then the pod's daemon refuses with
+# "serve not implemented" by design. The per-session executor is a separate
+# deployable (ocu-sandbox, container-05, [1..N]) the control plane drives over
+# the host-dialled control channel; it is not part of this manifest.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocu-controld
+  labels:
+    app.kubernetes.io/name: ocu-controld
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: open-computer-use
+spec:
+  # Recreate, NOT RollingUpdate: this is the single deployment-wide control
+  # plane and the sole custodian of the session registry and the denylist.
+  # Two live instances would split-brain that state. Recreate fully terminates
+  # the old pod before the new one starts, so there is exactly one custodian at
+  # every instant.
+  strategy:
+    type: Recreate
+
+  # One replica — the control plane is one-per-deployment. Do NOT increase.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ocu-controld
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ocu-controld
+        app.kubernetes.io/component: control-plane
+    spec:
+      # The grace period must cover the host-driven teardown finalizer for
+      # every live session (credential revoke, egress-route drop,
+      # writable-surface scrub). Tune to the finalizer bound once the
+      # lifecycle engine lands; the value below is a conservative scaffold
+      # default that matches the systemd unit's TimeoutStopSec.
+      terminationGracePeriodSeconds: 120
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          # RuntimeDefault is the portable choice. For tighter confinement,
+          # deploy deploy/seccomp/ocu-controld.json to each node and switch to
+          #   type: Localhost
+          #   localhostProfile: ocu-controld/ocu-controld.json
+          type: RuntimeDefault
+
+      volumes:
+        # Fail-closed hash-chained OCSF JSONL audit sink. emptyDir here is a
+        # stub; a real deployment points this at a durable, single-writer
+        # volume or streams to the audit pipeline.
+        - name: audit
+          emptyDir: {}
+        # Runtime dir for the operator-ingress Unix socket.
+        - name: runtime
+          emptyDir: {}
+        # Storage-JWT signing key — a read-only Secret mount. Create the Secret
+        # out of band; the key is never baked into the image.
+        - name: jwt-signing-key
+          secret:
+            secretName: ocu-control-jwt-signing-key
+            defaultMode: 0400
+
+      containers:
+        - name: ocu-controld
+          image: ghcr.io/wide-moat/ocu-control:latest
+          imagePullPolicy: Always
+
+          args:
+            - -operator-listen
+            - unix:///run/ocu-control/operator.sock
+            - -gateway-listen
+            - 127.0.0.1:9466
+            - -runtime-tier
+            - runc
+            - -runtime-provider
+            - docker
+            - -jwt-signing-key
+            - /run/secrets/ocu-control/storage-jwt-signing.key
+            - -audit-sink
+            - /var/log/ocu-control/audit.ocsf.jsonl
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+
+          volumeMounts:
+            - name: audit
+              mountPath: /var/log/ocu-control
+            - name: runtime
+              mountPath: /run/ocu-control
+            - name: jwt-signing-key
+              mountPath: /run/secrets/ocu-control
+              readOnly: true
+
+          # Liveness/readiness use the daemon's own -health-check self-probe as
+          # an exec probe (distroless has no shell or curl, and the ops listener
+          # binds loopback only — an httpGet from the node never reaches it).
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/ocu-controld
+                - -health-check
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/ocu-controld
+                - -health-check
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi

@@ -1,0 +1,143 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: security
+
+on:
+  push:
+    branches: [main]
+    # Tag refs do not match a branches: filter; without this a v* tag would
+    # release from a ref these gates never scanned. release.yml waits for
+    # this workflow's check runs on the tagged commit.
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly cron: Sunday at 02:00 UTC (T2-10, SUPPLY-03)
+    - cron: '0 2 * * 0'
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: read
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  lexicon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: naming denylist
+        # The project keeps a denylist of terms that must not appear in the
+        # tree (working names, third-party naming). The list is maintained as
+        # a repository secret so the denied terms are not themselves published.
+        # On forks (no secret) the job passes with a notice; the gate is
+        # enforced on this repository's own PRs and pushes.
+        env:
+          DENYLIST: ${{ secrets.LEXICON_DENYLIST }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DENYLIST:-}" ]; then
+            echo "::notice::LEXICON_DENYLIST not configured in this context; skipping"
+            exit 0
+          fi
+          # grep exit codes: 0 = hit (fail the gate), 1 = clean, >=2 = grep
+          # itself errored (malformed pattern, read error) — a broken gate
+          # must fail loud, never pass as clean.
+          rc=0
+          hits=$(grep -rniE "$DENYLIST" --exclude-dir='.git' . 2>/tmp/grep-err) || rc=$?
+          if [ "$rc" -ge 2 ]; then
+            cat /tmp/grep-err >&2
+            echo "::error::lexicon grep failed (rc=$rc) — fix the denylist pattern; failing closed"
+            exit 1
+          fi
+          if [ "$rc" -eq 0 ]; then
+            echo "$hits" | sed -E 's/^([^:]+:[0-9]+).*/\1: denied term/'
+            echo "::error::denied term found — see the project lexicon policy"
+            exit 1
+          fi
+          echo "lexicon clean"
+
+  secrets-gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      # The gitleaks GitHub Action requires a paid org licence; the OSS
+      # docker image does not. Run it directly with the default ruleset.
+      - name: gitleaks (docker, default ruleset)
+        run: |
+          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 \
+            detect --source=/repo --redact --no-banner
+
+  secrets-trufflehog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: trufflehog
+        uses: trufflesecurity/trufflehog@d411fff7b8879a62509f3fa98c07f247ac089a51 # v3.95.5
+        with:
+          path: ./
+          # `--fail` is appended by the entrypoint; `--no-verification`
+          # removes the egress credential-validation calls. Do not also pass
+          # --results=... or a second --fail (the action rejects repeats and
+          # errors on equal BASE/HEAD).
+          extra_args: --no-verification
+
+  sast-semgrep:
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: semgrep
+        # Emit SARIF for the Security tab AND keep the blocking exit code: run
+        # the SARIF pass non-blocking, then a second gating pass. `|| true` on
+        # the first keeps a finding from masking the upload; the second is the
+        # gate.
+        run: |
+          semgrep ci --sarif --output=semgrep.sarif || true
+          semgrep ci
+        env:
+          # Rulesets target this codebase's actual language (Go) plus the
+          # cross-cutting security and infra packs. Language packs for
+          # languages not present in the tree add scan time without coverage,
+          # so they are omitted.
+          SEMGREP_RULES: >-
+            p/security-audit p/owasp-top-ten p/golang
+            p/github-actions p/secrets
+          SEMGREP_SUPPRESS_ERRORS: "false"
+      - name: upload semgrep SARIF to the Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        with:
+          sarif_file: semgrep.sarif
+        continue-on-error: true
+
+  sca-trivy-fs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: trivy filesystem — CRITICAL blocks
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: "false"
+
+  conventional-commits:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: amannn/action-semantic-pull-request@0723387faaf9b38adef4775cd42cfd5155ed6017 # v5.5.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,36 @@
+# ─── private planning artefacts — local only ───
+.planning/
+
+# ─── OS / editor ───
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# ─── language build/runtime ───
+# The compiled daemon binary (the CI e2e/release jobs build it as
+# ./ocu-controld; a local build must never enter the tree).
+/ocu-controld
+*.bin
+
+# Property-test (rapid) failure corpus — regenerated on every failing run,
+# never source. Keep it out of the tree so a transient local failure can't
+# leak a .fail file into a commit.
+testdata/rapid/
+**/testdata/rapid/
+
+# Coverage profiles — build artifacts produced by `go test -coverprofile`,
+# never source (CI uploads them as run artifacts).
+cover.out
+*.coverprofile
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+.env
+.env.*
+!.env.example
+
+# ─── local-only Claude Code instructions ───
+CLAUDE.local.md
