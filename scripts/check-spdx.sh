@@ -14,6 +14,7 @@
 #   .github/workflows/*.yml    — CI workflow definitions
 #   Dockerfile                 — the shipped build recipe
 #   contrib/systemd/*.service  — the shipped systemd unit
+#   contrib/sysusers.d/*.conf  — the shipped sysusers.d service-account declaration
 #   contracts/openapi/*.yaml   — the OpenAPI 3.1 wire surfaces this repo defines,
 #                                plus their redocly lint config; YAML comment SPDX.
 #   contracts/proto/**/*.proto — the gRPC wire surfaces this repo defines; // SPDX.
@@ -45,6 +46,7 @@ readonly -a IN_SCOPE=(
   '.github/workflows/*.yml'
   'Dockerfile'
   'contrib/systemd/*.service'
+  'contrib/sysusers.d/*.conf'
   'contracts/openapi/*.yaml'
   'contracts/proto/*.yaml'
   'contracts/proto/**/*.proto'

@@ -371,6 +371,141 @@ func Test_Manifests_JWKSArtifactNote(t *testing.T) {
 	}
 }
 
+// systemdDirectiveValue returns the token after `=` for the FIRST real directive
+// line whose trimmed prefix is exactly key (e.g. "User="). Comment lines are skipped
+// (a real directive never starts with `#`), so the header note that now mentions the
+// user does not confuse the read. Returns "" when the directive is absent.
+func systemdDirectiveValue(lines []string, key string) string {
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasPrefix(trimmed, key) {
+			return strings.TrimSpace(strings.TrimPrefix(trimmed, key))
+		}
+	}
+	return ""
+}
+
+// sysusersDecl is one sysusers.d declaration: the type field (e.g. "u" or "g") and
+// the name field that follows it.
+type sysusersDecl struct {
+	typ  string
+	name string
+}
+
+// sysusersDecls parses the declarations of a sysusers.d file. Blank and `#`-comment
+// lines are skipped; each remaining line is split on whitespace and its first two
+// fields are taken as type and name. Naive whitespace splitting is safe for the name
+// because type and name precede the quoted gecos field — field[0] and field[1] never
+// contain spaces.
+func sysusersDecls(lines []string) []sysusersDecl {
+	var decls []sysusersDecl
+	for _, raw := range lines {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 {
+			continue
+		}
+		decls = append(decls, sysusersDecl{typ: fields[0], name: fields[1]})
+	}
+	return decls
+}
+
+// Test_SystemdUnit_SysusersUserMatches is the cross-file consistency guard for the
+// service account: the user/group the systemd unit runs as MUST be the user/group the
+// shipped sysusers.d file creates. A drift between contrib/systemd's User=/Group= and
+// contrib/sysusers.d's declared name is exactly the failure mode this guards — it
+// would make the first `systemctl enable --now` fail user-not-found. It also pins the
+// SPDX header and the locked-account shape (no home, no login shell) on the conf.
+func Test_SystemdUnit_SysusersUserMatches(t *testing.T) {
+	t.Parallel()
+	root := repoRoot(t)
+
+	// STEP A — the unit's runtime identity.
+	unitLines := readFileLines(t, filepath.Join(root, "contrib", "systemd", "ocu-controld.service"))
+	unitUser := systemdDirectiveValue(unitLines, "User=")
+	unitGroup := systemdDirectiveValue(unitLines, "Group=")
+	if unitUser == "" {
+		t.Fatal("systemd unit declares no User= directive")
+	}
+	if unitGroup == "" {
+		t.Fatal("systemd unit declares no Group= directive")
+	}
+
+	// STEP B — the sysusers.d declarations.
+	confPath := filepath.Join(root, "contrib", "sysusers.d", "ocu-control.conf")
+	confLines := readFileLines(t, confPath)
+	decls := sysusersDecls(confLines)
+	userNames := map[string]bool{}
+	groupNames := map[string]bool{}
+	for _, d := range decls {
+		switch d.typ {
+		case "u":
+			// A `u` line creates a system user AND an implicit same-name group.
+			userNames[d.name] = true
+			groupNames[d.name] = true
+		case "g":
+			groupNames[d.name] = true
+		}
+	}
+	if len(userNames) == 0 {
+		t.Fatal("sysusers.d declares no system user (no `u` line): the unit references a user nothing creates")
+	}
+
+	// STEP C — the cross-file equality (the non-vacuous core).
+	if !userNames[unitUser] {
+		t.Fatalf("drift: systemd unit runs as User=%s but contrib/sysusers.d/ocu-control.conf declares no `u` line for it (declared users: %v)", unitUser, keysOf(userNames))
+	}
+	if !groupNames[unitGroup] {
+		t.Fatalf("drift: systemd unit runs as Group=%s but contrib/sysusers.d/ocu-control.conf declares no matching group (a `u` or `g` line); declared groups: %v", unitGroup, keysOf(groupNames))
+	}
+
+	// STEP D — SPDX header on the new conf (mirrors the repo's spdx discipline).
+	if len(confLines) < 2 {
+		t.Fatalf("sysusers.d conf has %d lines, want at least the two SPDX header lines", len(confLines))
+	}
+	if confLines[0] != "# SPDX-License-Identifier: FSL-1.1-Apache-2.0" {
+		t.Fatalf("sysusers.d conf line 1 = %q, want the SPDX-License-Identifier header", confLines[0])
+	}
+	if confLines[1] != "# Copyright (c) 2025 Open Computer Use Contributors" {
+		t.Fatalf("sysusers.d conf line 2 = %q, want the copyright header", confLines[1])
+	}
+
+	// STEP E — the locked-account shape: a future edit that grants the service
+	// account a home directory or a login shell fails here.
+	var userLine string
+	for _, raw := range confLines {
+		fields := strings.Fields(strings.TrimSpace(raw))
+		if len(fields) >= 2 && fields[0] == "u" && fields[1] == unitUser {
+			userLine = strings.TrimSpace(raw)
+			break
+		}
+	}
+	if userLine == "" {
+		t.Fatalf("no `u %s` line found in sysusers.d conf for the locked-account shape check", unitUser)
+	}
+	if !strings.Contains(userLine, "/nonexistent") {
+		t.Fatalf("sysusers.d `u` line must pin home /nonexistent (no home dir); got: %q", userLine)
+	}
+	if !strings.Contains(userLine, "/usr/sbin/nologin") {
+		t.Fatalf("sysusers.d `u` line must pin shell /usr/sbin/nologin (no interactive login); got: %q", userLine)
+	}
+}
+
+// keysOf returns the keys of a string-keyed set for a readable failure message.
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
 // runBinary runs bin with argv, bounded by timeout, and returns combined output. A
 // timeout is not an error here: a manifest whose argv clears flag validation reaches
 // the serve path, which may run until the bound. The caller asserts only on output

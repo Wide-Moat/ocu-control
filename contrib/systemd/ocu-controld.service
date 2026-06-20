@@ -7,8 +7,15 @@
 #
 # INSTALLATION:
 #   cp contrib/systemd/ocu-controld.service /etc/systemd/system/
+#   cp contrib/sysusers.d/ocu-control.conf /etc/sysusers.d/
+#   systemd-sysusers              # creates the ocucontrol system user + group
 #   systemctl daemon-reload
 #   systemctl enable --now ocu-controld
+#
+# The unit runs as User=ocucontrol / Group=ocucontrol (see [Service] below); the
+# systemd-sysusers step above provisions that locked, non-login service account
+# from contrib/sysusers.d/ocu-control.conf. Without it the first start fails
+# user-not-found.
 #
 # SITE CUSTOMISATION — use a drop-in rather than editing this file:
 #   mkdir /etc/systemd/system/ocu-controld.service.d/
