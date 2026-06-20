@@ -271,9 +271,19 @@ func (e *Engine) forceKillKey(ctx context.Context, key string) error {
 // cannot stall the sweep. Releasing through the Custodian keeps the four Store
 // mutators custodied in one type and is idempotent against an already-released row.
 func (e *Engine) forceKillRow(ctx context.Context, row state.SessionRow) error {
+	// The teardown Sandbox carries the host-derived session key on Egress.FilesystemID
+	// so the shared below-seam finalizer step-1 (revoke session JWT) can look up the
+	// jti the create-path mint recorded against that same key. This mirrors
+	// lifecycle.Destroy exactly: the frozen session row does not persist the real
+	// filesystem_id, so the revocation handle is the host-derived session key both the
+	// create and the kill paths derive — never a body hint (NFR-SEC-43). Without this
+	// the emergency kill-switch would force-remove the container but leave the weak
+	// Storage-JWT live until its TTL, the exact authority the host-initiated revoke
+	// exists to cut (NFR-SEC-01).
 	sandbox := runtime.Sandbox{
 		Name:      runtime.SessionName(row.Key),
 		RuntimeID: row.ContainerName,
+		Egress:    runtime.EgressBinding{Name: runtime.SessionName(row.Key), FilesystemID: row.Key},
 	}
 	stepCtx, cancel := context.WithTimeout(ctx, forceKillStepTimeout)
 	defer cancel()

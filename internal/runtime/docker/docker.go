@@ -57,8 +57,12 @@ const (
 	// labelSessionName carries the host-derived SessionName, the pure-function
 	// input the reconciler feeds back into networkName/containerName.
 	labelSessionName = "ocu-session-name"
-	// labelFilesystemID carries the egress scope so the re-derived EgressBinding
-	// is complete enough to drive the finalizer's route drop.
+	// labelFilesystemID records the egress SCOPE (the real filesystem_id) as
+	// recorded data, never authority (NFR-SEC-43). The reconcile-derived revoke
+	// handle binds on the host-derived session key (labelSessionName == row.Key),
+	// the key the create-path mint recorded the jti under — NOT this label — so the
+	// scope and the revocation-record key stay distinct. The label is retained for
+	// the Phase-4 egress route drop, which needs the real scope at teardown.
 	labelFilesystemID = "ocu-filesystem-id"
 )
 
@@ -361,8 +365,18 @@ func (p *Provider) Reconcile(ctx context.Context) ([]runtime.Sandbox, error) {
 			Name:      name,
 			RuntimeID: s.ID,
 			Egress: runtime.EgressBinding{
-				Name:         name,
-				FilesystemID: s.Labels[labelFilesystemID],
+				Name: name,
+				// The revoke handle on Egress.FilesystemID is the host-derived session
+				// key (== labelSessionName == row.Key), the SAME key the create-path mint
+				// recorded the jti under, so a reconcile-driven force-kill addresses the
+				// recorded jti exactly as lifecycle.Destroy and the kill-switch do. The
+				// filesystem_id label seeds the egress SCOPE, not the revocation record
+				// key — binding on it instead of the session key would silently miss the
+				// recorded jti once the Revoker persists across restart (NFR-SEC-01,
+				// NFR-SEC-43). Keeping both revoke-driving sites on row.Key removes that
+				// landmine now, while the Revoker index is in-memory and a mismatch would
+				// be masked.
+				FilesystemID: string(name),
 			},
 			Tier: p.tier,
 		})

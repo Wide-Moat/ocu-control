@@ -605,7 +605,12 @@ func TestReconcile_ReDerivesSandbox(t *testing.T) {
 	if len(sbs) != 1 {
 		t.Fatalf("Reconcile: want 1 re-derived sandbox, got %d (%v)", len(sbs), sbs)
 	}
-	if sbs[0].Name != "sess-x" || sbs[0].RuntimeID != "ctr-1" || sbs[0].Egress.FilesystemID != "fs-x" {
+	// The re-derived Egress.FilesystemID is the host-derived session key (==
+	// labelSessionName == row.Key), the revoke-record key the create-path mint
+	// recorded the jti under — NOT the filesystem_id label, which seeds the egress
+	// scope. See TestReconcileDerivesRevokeKeyFromSessionName for the
+	// distinct-label regression guard on this binding.
+	if sbs[0].Name != "sess-x" || sbs[0].RuntimeID != "ctr-1" || sbs[0].Egress.FilesystemID != "sess-x" {
 		t.Errorf("re-derived sandbox mismatch: %+v", sbs[0])
 	}
 }
