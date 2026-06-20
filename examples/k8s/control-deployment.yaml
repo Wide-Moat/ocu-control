@@ -82,6 +82,13 @@ spec:
           secret:
             secretName: ocu-control-jwt-signing-key
             defaultMode: 0400
+        # OPTIONAL — writable volume for the emitted JWKS artifact (paired with
+        # the commented -jwks-path arg above). readOnlyRootFilesystem is true, so
+        # the emit needs a writable mount; an emptyDir shared read-only with a
+        # static-file sidecar (or fronted by an Ingress) is the served-by-deploy-
+        # layer surface. Control only EMITS the file; the deploy layer SERVES it.
+        # - name: jwks
+        #   emptyDir: {}
 
       containers:
         - name: ocu-controld
@@ -108,6 +115,18 @@ spec:
             - /run/secrets/ocu-control/storage-jwt-signing.key
             - -audit-sink
             - /var/log/ocu-control/audit.ocsf.jsonl
+            # OPTIONAL — Storage-JWT JWKS artifact (ADR-0019 §35). Uncomment the
+            # two args below (and the `jwks` volume + mount) to have Control EMIT
+            # the static JWKS document at this path. Control emits the JWKS
+            # artifact at -jwks-path; the deploy layer (an in-pod static-file
+            # sidecar, an Ingress, or a CDN) serves it over HTTP at the egress
+            # edge's remote_jwks URI (ADR-0019 §35). Control adds no third
+            # listener — the two-listener invariant (§39 / NFR-SEC-52) is
+            # unchanged. The artifact re-renders on boot/restart (v1 has no live
+            # rotation hook). The mount must be writable (readOnlyRootFilesystem
+            # is true), so back it with the emptyDir volume hinted below.
+            # - -jwks-path
+            # - /var/lib/ocu-control/jwks/jwks.json
 
           securityContext:
             runAsNonRoot: true
@@ -129,6 +148,12 @@ spec:
             - name: jwt-signing-key
               mountPath: /run/secrets/ocu-control
               readOnly: true
+            # OPTIONAL — writable mount for the emitted JWKS artifact (paired
+            # with the commented -jwks-path arg and the jwks volume above). A
+            # static-file sidecar mounts the SAME volume read-only and serves it
+            # at the egress edge's remote_jwks URI; Control adds no third listener.
+            # - name: jwks
+            #   mountPath: /var/lib/ocu-control/jwks
 
           # Liveness/readiness use the daemon's own -health-check self-probe as
           # an exec probe (distroless has no shell or curl, and the operator

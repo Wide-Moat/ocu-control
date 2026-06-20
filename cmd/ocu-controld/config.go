@@ -41,6 +41,7 @@ type config struct {
 	caCert          string // path to the CA certificate PEM rendered into every mount-config
 	auditSink       string // OCSF audit fan-in sink
 	stateDSN        string // Postgres DSN for durable state; empty selects the in-memory store
+	jwksPath        string // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
 	create          bool   // a create request presented at startup (smoke hook)
 }
 
@@ -71,6 +72,10 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.caCert, "ca-cert", "", "path to the CA certificate PEM rendered into every mount-config")
 	fs.StringVar(&cfg.auditSink, "audit-sink", "", "OCSF audit fan-in sink (required)")
 	fs.StringVar(&cfg.stateDSN, "state-dsn", "", "Postgres DSN for durable state; empty selects the in-memory store (minimal shelf)")
+	fs.StringVar(&cfg.jwksPath, "jwks-path", "",
+		"OPTIONAL path to write the static JWKS artifact the deploy layer serves at the "+
+			"egress edge's remote_jwks URI (ADR-0019 §35); unset disables the emit. Control "+
+			"adds NO listener — it writes a file the deploy layer serves")
 	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	fs.BoolVar(&healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")

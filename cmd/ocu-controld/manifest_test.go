@@ -337,6 +337,40 @@ func Test_Manifests_ClearFlagValidation_RealBinary(t *testing.T) {
 	}
 }
 
+// Test_Manifests_JWKSArtifactNote pins the no-silent NOTE the JWKS-artifact change
+// adds to each shipped manifest: Control only EMITS the static JWKS document at
+// -jwks-path and the deploy layer SERVES it, adding no third listener (the
+// two-listener invariant is unchanged). This is a doc-pin — it does not alter the
+// argv extractors or the required-flag cross-check, both of which still see the
+// active argv byte-for-byte (the -jwks-path stanza is OPTIONAL and commented).
+func Test_Manifests_JWKSArtifactNote(t *testing.T) {
+	t.Parallel()
+	// Substrings every manifest must carry near its storage/JWT config. They name
+	// the emit-vs-serve split and the no-third-listener guarantee.
+	wantSubstrings := []string{
+		"-jwks-path",
+		"the deploy layer",
+		"no third listener",
+		"ADR-0019 §35",
+	}
+	for _, m := range loadManifestArgvs(t) {
+		m := m
+		t.Run(m.name, func(t *testing.T) {
+			t.Parallel()
+			raw, err := os.ReadFile(m.path)
+			if err != nil {
+				t.Fatalf("read manifest %q: %v", m.path, err)
+			}
+			body := string(raw)
+			for _, want := range wantSubstrings {
+				if !strings.Contains(body, want) {
+					t.Fatalf("%s manifest is missing the JWKS-artifact note substring %q", m.name, want)
+				}
+			}
+		})
+	}
+}
+
 // runBinary runs bin with argv, bounded by timeout, and returns combined output. A
 // timeout is not an error here: a manifest whose argv clears flag validation reaches
 // the serve path, which may run until the bound. The caller asserts only on output

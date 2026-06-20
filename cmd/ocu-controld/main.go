@@ -44,6 +44,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/ingress/gateway"
 	"github.com/Wide-Moat/ocu-control/internal/ingress/operator"
+	"github.com/Wide-Moat/ocu-control/internal/jwks"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
@@ -210,6 +211,23 @@ func serve(ctx context.Context, cfg config) error {
 	signer, revoker, err := buildSigner(cfg, clk)
 	if err != nil {
 		return fmt.Errorf("boot: load storage-jwt signer: %w", err)
+	}
+
+	// Storage-JWT JWKS artifact, FAIL-CLOSED at boot: when -jwks-path is set, render
+	// the static JWKS document the deploy layer serves at the egress edge's
+	// remote_jwks URI (ADR-0019 §35) so the edge can validate the weak Storage-JWT
+	// via stock Envoy jwt_authn remote_jwks. An empty key set here is a fail-closed
+	// boot abort — never a silently-written empty Set (which would make the edge
+	// reject every token or mask a missing signer). -jwks-path unset is a clean
+	// no-op: the minimal shelf may run without storage provisioning. This is a FILE
+	// write, not a network surface — it adds NO third listener, so the two-listener
+	// invariant (§39 / NFR-SEC-52) is unchanged. It is NOT gated on the listeners
+	// binding (it must exist before the edge would fetch it), but it DOES abort the
+	// boot closed on an empty set. v1 has no live rotation hook, so the render
+	// trigger is boot/restart; a future live-rotation seam re-invokes WriteArtifact
+	// over the same path to re-render the served document.
+	if err := renderJWKSArtifact(cfg, signer); err != nil {
+		return err
 	}
 
 	// The docker finalizer step 3 scrubs the per-session handoff root under the SAME
@@ -494,6 +512,40 @@ func buildSigner(cfg config, clk state.Clock) (*cred.Signer, *cred.Revoker, erro
 	revoker := cred.NewRevoker(clk)
 	signer.UseRevoker(revoker)
 	return signer, revoker, nil
+}
+
+// renderJWKSArtifact emits the static JWKS document the deploy layer serves at the
+// egress edge's remote_jwks URI (ADR-0019 §35), so the edge can validate the weak
+// Storage-JWT via stock Envoy jwt_authn remote_jwks. It is the thin WHEN/WHETHER
+// wiring around jwks.WriteArtifact, which owns the serialization and the atomic
+// temp+fsync+rename write:
+//
+//   - -jwks-path UNSET: a clean no-op (nil). The minimal shelf may run without a
+//     signer/path, so the unset case writes nothing and never fails closed.
+//   - -jwks-path SET: render the artifact from the signer's LIVE PublicKeys() (the
+//     active key plus, during a rotation overlap, the just-superseded key) and
+//     write it atomically. An empty key set is a FAIL-CLOSED boot abort — never a
+//     silently-written empty Set — surfaced as a typed error so
+//     errors.Is(err, jwks.ErrEmptyKeySet) holds at the boot seam.
+//
+// It adds NO network surface: it hands signer.PublicKeys() to internal/jwks and
+// lets that package own the bytes; cmd never touches JWK fields directly. v1 has no
+// live rotation hook (cred rotates only via an operator/boot-driven Rotate the
+// daemon does not call at runtime), so the render happens once at boot from the
+// live PublicKeys(); a future live-rotation seam re-invokes WriteArtifact to
+// re-render the served document atomically.
+func renderJWKSArtifact(cfg config, signer *cred.Signer) error {
+	if cfg.jwksPath == "" {
+		return nil
+	}
+	var pub []cred.PublicKey
+	if signer != nil {
+		pub = signer.PublicKeys()
+	}
+	if err := jwks.WriteArtifact(cfg.jwksPath, pub); err != nil {
+		return fmt.Errorf("boot: render jwks artifact: %w", err)
+	}
+	return nil
 }
 
 // algOf maps the validated -jwt-alg string to the cred.Alg. The string was already
