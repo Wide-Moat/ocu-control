@@ -15,8 +15,8 @@ name: mutation
 # added signal over their own integration suites. The scope lives in
 # .gremlins.yaml at the repo root (coverpkg) so it is declared once.
 #
-# These package directories do not exist yet (scaffolding); the scope is
-# declarative so it ratchets in as the logic packages land.
+# The loop below skips any scoped directory that is absent with a notice
+# rather than failing, so the scope and the tree never have to move in lockstep.
 #
 # ADVISORY (continue-on-error: true) for now. gremlins is slow and its
 # coverage-to-mutant position matching is not yet reliable on this repo's Go
@@ -72,9 +72,9 @@ jobs:
         # does not exist yet is skipped with a warning, not a failure.
         run: |
           set -u
-          for pkg in ./internal/admission/ ./internal/reservation/ ./internal/killswitch/; do
+          for pkg in ./internal/admission/ ./internal/registry/ ./internal/quota/ ./internal/killswitch/; do
             if [ ! -d "$pkg" ]; then
-              echo "::notice::$pkg does not exist yet (scaffolding); skipping"
+              echo "::notice::$pkg does not exist; skipping"
               continue
             fi
             echo "::group::gremlins unleash $pkg"

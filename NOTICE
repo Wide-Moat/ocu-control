@@ -22,16 +22,54 @@ licenses; they are not the license of this Software.
 
 ## Third-Party Notices
 
-These are the runtime dependencies expected as the implementation lands; the
-require block in go.mod stays empty until real code imports them. Each clears
-the architecture repo's dependency policy (license gate + supply-chain gate)
-before it is added.
+These are the direct third-party dependencies this module requires. Each clears
+the architecture repo's dependency policy (license gate + supply-chain gate).
+Transitive dependencies are recorded in go.mod and go.sum; their licenses are
+carried under their own terms.
+
+### github.com/docker/docker
+
+Source: https://github.com/moby/moby
+License: Apache-2.0
+Used by: the Docker RuntimeProvider backend, behind the seam (control logic
+imports the provider interface, never the SDK).
+
+### github.com/jackc/pgx/v5
+
+Source: https://github.com/jackc/pgx
+License: MIT
+Used by: the Postgres state.Store leg.
+
+### github.com/golang-jwt/jwt/v5
+
+Source: https://github.com/golang-jwt/jwt
+License: MIT
+Used by: minting and signing the weak Storage-JWT.
+
+### github.com/santhosh-tekuri/jsonschema/v6
+
+Source: https://github.com/santhosh-tekuri/jsonschema
+License: Apache-2.0
+Used by: JSON Schema validation of the vendored contracts and the rendered
+mount-config.
+
+### github.com/containerd/errdefs
+
+Source: https://github.com/containerd/errdefs
+License: Apache-2.0
+Used by: the Docker SDK surface (error classification).
+
+### github.com/opencontainers/image-spec
+
+Source: https://github.com/opencontainers/image-spec
+License: Apache-2.0
+Used by: the Docker SDK surface (image descriptors).
 
 ### pgregory.net/rapid
 
 Source: https://github.com/flyingmutant/rapid
 License: Mozilla Public License Version 2.0 (MPL-2.0)
-Used by: test binaries only (property-based test suites)
+Used by: test binaries only (property-based test suites).
 
 The rapid library is used under the terms of the Mozilla Public License
 Version 2.0. MPL-2.0 is a weak copyleft license (file-level); it does not

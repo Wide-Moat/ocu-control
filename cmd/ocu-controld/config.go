@@ -2,10 +2,11 @@
 // Copyright (c) 2025 Open Computer Use Contributors
 //
 // Flag surface and pre-bind validation for ocu-controld. The validation order
-// here is the load-bearing part of the scaffold: required-flag presence and
-// enum membership are checked, then the KILL-SWITCH-FIRST gate refuses a
-// create before any listener could bind. No network endpoint is opened on any
-// path through this file.
+// here is the load-bearing pre-bind gate: required-flag presence and enum
+// membership are checked before any Store is constructed, so a malformed
+// invocation never builds a Store and the kill-switch-first create refusal can
+// originate in the real boot path rather than a hardcoded branch. No network
+// endpoint is opened on any path through this file.
 
 package main
 
@@ -23,8 +24,7 @@ const (
 	modeHealthCheck
 )
 
-// config is the parsed serving invocation. Fields mirror the scaffold flag
-// surface; the real config grows with the implementation.
+// config is the parsed serving invocation — the daemon's full flag surface.
 type config struct {
 	operatorListen  string // operator/lifecycle ingress endpoint (distinct from gateway)
 	gatewayListen   string // gateway service-identity ingress endpoint

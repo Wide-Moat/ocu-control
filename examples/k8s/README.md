@@ -1,10 +1,11 @@
 # Kubernetes deployment examples — ocu-controld
 
 Applyable Kubernetes manifests for the control plane (`ocu-controld`,
-component-02). These are scaffold stubs: the flag surface tracks the scaffold
-daemon, and the daemon refuses with "serve not implemented" until the lifecycle
-PRs land. The shape — one-per-deployment, single replica, hardened
-securityContext, exec health-probe — is the real target.
+component-02). The daemon runs the full create→destroy lifecycle; what these
+manifests leave deployment-specific is the RuntimeProvider endpoint (the
+runtime socket the operator supplies, see below). The shape —
+one-per-deployment, single replica, hardened securityContext, exec
+health-probe — is the deployment target.
 
 Questions or issues: developer@widemoat.ai
 
@@ -46,7 +47,7 @@ single instance is the design, not a limitation to grow past.
 ## Storage-JWT signing key
 
 Control holds the Storage-JWT signing key as a read-only Secret mount; it mints
-the weak, `filesystem_id`-scoped session JWT and publishes a JWKS the Egress
+the weak, `filesystem_id`-scoped session JWT and renders the JWKS the Egress
 trust-edge validates against. The key is never baked into the image and never
 written by the daemon. Control does not hold the real filestore credential and
 does not speak the filestore protocol — the mount runs inside the sandbox

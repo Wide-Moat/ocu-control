@@ -50,9 +50,9 @@ spec:
     spec:
       # The grace period must cover the host-driven teardown finalizer for
       # every live session (credential revoke, egress-route drop,
-      # writable-surface scrub). Tune to the finalizer bound once the
-      # lifecycle engine lands; the value below is a conservative scaffold
-      # default that matches the systemd unit's TimeoutStopSec.
+      # writable-surface scrub). The value below is a conservative default
+      # that matches the systemd unit's TimeoutStopSec; tune it to the
+      # finalizer bound for your session ceiling.
       terminationGracePeriodSeconds: 120
 
       securityContext:

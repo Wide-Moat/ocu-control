@@ -17,9 +17,9 @@ the language is Go only ([ADR-0012](https://github.com/Wide-Moat/open-computer-u
 Two listeners back the daemon on distinct endpoints: an operator/lifecycle
 ingress and a gateway service-identity ingress. The kill-switch and force-kill
 routes exist only on the operator ingress; no gateway route reaches it
-(component-02 Boundaries; NFR-SEC-52). The scaffold takes both endpoints as
-`-operator-listen` and `-gateway-listen`, validated and refused pre-bind before
-either binds.
+(component-02 Boundaries; NFR-SEC-52). The daemon takes both endpoints as
+`-operator-listen` and `-gateway-listen`, validates them pre-bind, and binds
+both off the boot readiness hook — strictly after the deny posture is durable.
 
 ## Host dials guest
 
@@ -35,7 +35,7 @@ grants the guest no new authority.
 
 Control drives per-session executor containers through a `RuntimeProvider`
 interface, never a concrete container SDK. Docker is the v1 provider; Kubernetes
-and Firecracker are future implementations behind the same seam. No
+and Firecracker are `NotImplemented` behind the same seam. No
 `docker/docker/client` import appears in control logic — the dependency lives
 behind the interface so the create / start / inspect / stop / teardown call set
 is one narrow contract the rest of the plane depends on. The deployment-wide
@@ -46,8 +46,9 @@ provider and is never chosen per-request.
 
 The session registry, the denylist / kill-switch state, and the quota counters
 sit behind a `state.Store` interface. The minimal shelf ships an in-memory
-store; a Postgres-backed store lands later behind the same seam without touching
-the lifecycle logic above it. Control is the sole custodian of this state — no
+store; a Postgres-backed store sits behind the same seam (selected by a
+non-empty `-state-dsn`) without touching the lifecycle logic above it. Control
+is the sole custodian of this state — no
 other component mutates it and the guest holds no handle that reaches it
 (component-02 Invariants).
 
@@ -64,7 +65,7 @@ NFR-SEC-65.
 ## Storage boundary
 
 Control's storage job is narrow: mint the weak `filesystem_id`-scoped Storage-JWT,
-sign it, publish a JWKS the Egress trust-edge validates against, and render and
+sign it, render the JWKS the Egress trust-edge validates against, and render and
 deliver one mount-config per session into the guest over the host-only
 provisioning push. Control does **not** perform the mount and does **not** speak
 the filestore protocol.

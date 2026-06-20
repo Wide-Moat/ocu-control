@@ -5,8 +5,8 @@
 // the control plane welds its session registry, deny posture, and quota
 // counters to. Control logic depends on this interface only — never on a
 // concrete database type. An in-memory implementation ships on the minimal
-// shelf; a Postgres implementation lands behind the same interface for
-// cross-restart durability. Both pass one shared conformance suite.
+// shelf; a Postgres implementation (internal/state/postgres) sits behind the same
+// interface for cross-restart durability. Both pass one shared conformance suite.
 //
 // Each method below traces to a numbered Phase-1 requirement; no requirement is
 // left without a method, and no method exists that a requirement does not force.

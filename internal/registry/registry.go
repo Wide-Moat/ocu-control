@@ -114,8 +114,8 @@ var ErrNotOwned = errors.New("registry: session not addressable")
 // reporting an EMPTY set, so RevokeAll fails closed (it refuses to claim it
 // force-killed every row when it could not even enumerate them) instead of
 // leaving a just-reserved session live. This is the registry's seam for the
-// enumeration capability the durable Store gains in a later phase; it touches the
-// frozen Store interface not at all.
+// live-enumeration capability both shipped Stores provide via LiveSessions; it
+// touches the frozen Store interface not at all.
 var ErrEnumerationUnsupported = errors.New("registry: store does not support live-session enumeration")
 
 // LiveLister is the narrow optional capability a Store may implement to enumerate

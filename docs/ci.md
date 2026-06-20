@@ -38,10 +38,10 @@ no `continue-on-error`.
 ## mutation.yml
 
 go-gremlins on the pure-logic leaf packages (`internal/admission`,
-`internal/reservation`, `internal/killswitch`), scoped in `.gremlins.yaml`.
-Advisory (`continue-on-error`) until a stable efficacy baseline; the ratchet
-plan is in the workflow header. The package dirs do not exist yet — the job
-skips a missing dir with a notice.
+`internal/registry`, `internal/quota`, `internal/killswitch`), scoped in
+`.gremlins.yaml`. Advisory (`continue-on-error`) until a stable efficacy
+baseline; the ratchet plan is in the workflow header. The job skips a missing
+dir with a notice.
 
 ## security.yml
 

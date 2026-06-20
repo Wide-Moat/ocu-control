@@ -3,23 +3,26 @@
 //
 // ocu-controld — the one-per-deployment control plane daemon (component-02).
 //
-// This is the scaffold entry point. It does not yet run sessions: the session
-// registry, admission matrix, kill-switch engine, Storage-JWT signer, and the
-// per-session executor supervisor land as the internal/ packages are built.
-// What it does today is validate its own invocation and refuse a bad one
-// pre-bind with a typed error — the observable behaviour scripts/e2e-smoke.sh
-// asserts against the real binary:
+// main wires SIGINT/SIGTERM into the root context, so a host-initiated stop
+// unwinds the serve loops cleanly. run() dispatches the -version and
+// -health-check informational modes, then validates the serving invocation and
+// runs the kill-switch-first boot.
 //
-//  1. a missing required flag is named in the refusal text;
-//  2. an unknown -runtime-tier / -runtime-provider is refused, never
-//     silently defaulted;
-//  3. KILL-SWITCH-FIRST: a create request is refused loudly before any
-//     listener binds (the denylist/kill-switch DENY-ALL engages first), and
-//     no socket is ever bound on a refusal.
+// serve() is the composition root. It opens the state.Store (in-memory or
+// Postgres), runs Boot — which loads the durable deny posture and engages
+// DENY-ALL before any listener binds — constructs the Storage-JWT signer, the
+// RuntimeProvider behind the seam, and the durable OCSF audit sink, composes the
+// lifecycle Manager and the kill-switch Engine, and binds the operator and
+// gateway listeners ONLY off the boot readiness hook (so a bind is reachable
+// only after the deny posture is durable). It then serves until the
+// signal-driven shutdown.
 //
-// The real lifecycle wiring (host-dials-guest control channel, teardown
-// finalizer, audit emission) replaces the placeholder run() as the
-// implementation PRs land.
+// Boot is fail-closed throughout: an unreachable store, a missing signing key,
+// or an unopenable audit sink aborts before any listener binds. -create-on-start
+// is the pre-bind smoke hook: a create presented at startup flows through the
+// real Boot and Store path and is refused against the engaged kill-switch
+// (NFR-SEC-01) without registering the bind hook, so no socket is ever bound on
+// the refusal.
 package main
 
 import (

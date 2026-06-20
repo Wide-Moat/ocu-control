@@ -2,17 +2,6 @@
 // dependency arrives through the architecture repo's dependency policy
 // (license gate + supply-chain gate); see NOTICE for third-party license
 // notices.
-//
-// Expected runtime dependencies as the implementation lands (none are wired
-// yet — this is scaffolding, so the require block stays empty until real code
-// imports them):
-//   - github.com/docker/docker      — the v1 RuntimeProvider backend (behind
-//                                      the seam; control logic imports the
-//                                      provider interface, never the SDK)
-//   - github.com/golang-jwt/jwt/v5  — minting/signing the weak Storage-JWT and
-//                                      publishing the JWKS
-//   - github.com/prometheus/client_golang — ops-listener metrics
-//   - pgregory.net/rapid            — property tests (test binaries only)
 module github.com/Wide-Moat/ocu-control
 
 go 1.26.4

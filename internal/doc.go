@@ -3,8 +3,6 @@
 
 // Package internal is the layout anchor for ocu-control's private packages.
 //
-// Landed (Phase 1 — the control-plane spine):
-//
 //	internal/state           — the state.Store seam: the session registry, the
 //	                           denylist / kill-switch deny posture, and the quota
 //	                           counters, behind one interface. In-memory (minimal
@@ -22,13 +20,17 @@
 //	                           /healthz readiness gate.
 //	internal/runtime         — the RuntimeProvider seam: one coarse Materialize +
 //	                           the canon-fixed teardown pair + Reconcile, behind a
-//	                           substrate-neutral descriptor. The k8s and Firecracker
-//	                           backends are NotImplemented stubs.
+//	                           substrate-neutral descriptor.
 //	internal/runtime/docker  — the v1 Docker backend (the only package that imports
 //	                           the Docker SDK): the HOST-01 hardened HostConfig, the
 //	                           embedded deny-default seccomp profile, the atomic
 //	                           Materialize with rollback, and the NFR-SEC-65 ordered
 //	                           teardown finalizer.
+//	internal/runtime/k8s     — the Kubernetes backend stub: every method returns
+//	                           ErrNotImplemented behind the same seam.
+//	internal/runtime/firecracker — the Firecracker backend stub: Materialize and
+//	                           teardown abort with ErrNotImplemented; there is no
+//	                           insecure fallback to a shared kernel.
 //	internal/runtimemap      — the single mapping between state.Identity and the
 //	                           runtime seam's leaf-local Identity, with a
 //	                           compile-time field-parity guard.
@@ -39,10 +41,26 @@
 //	internal/registry        — the session-registry sole custodian: the only caller
 //	                           of the Store reservation mutators; the host-derived
 //	                           Key that a body id can never become.
+//	internal/cred            — the Storage-JWT signer keyring and the monotonic
+//	                           Revoker the below-seam finalizer revokes session
+//	                           tokens through.
+//	internal/jwks            — renders the JWKS document the Egress trust-edge
+//	                           validates against, plus a Control-side verifier (no
+//	                           HTTP publish surface).
+//	internal/mountcfg        — the schema-validated mount-config render.
+//	internal/provisioning    — pushes the rendered mount-config into the host-owned
+//	                           handoff bind before the mount client boots.
+//	internal/controlrpc      — the host-dialled control-RPC dialer that mints its
+//	                           per-dial exec JWT through the narrow MintExecJWT seam.
 //	internal/handoff         — stages the non-secret handoff material (info JSON,
 //	                           the Ed25519 public key, the 0700 sock dir).
 //	internal/audit           — the fail-closed AuditSink port; the deny-on-emit
-//	                           branch ships now, the OCSF serializer is later.
+//	                           branch denies any privileged action whose audit write
+//	                           fails.
+//	internal/audit/ocsf      — the OCSF chain serializer: maps each privileged
+//	                           Record to an OCSF API Activity event, assigns a
+//	                           per-source monotonic sequence, hash-chains the spine,
+//	                           and persists it through the fsync-on-write FileSink.
 //	internal/ingress         — the capability scope seam: an OperatorScope is
 //	                           mintable only by possessing the OperatorSeam, so the
 //	                           gateway cannot call an operator route at compile time.
@@ -56,5 +74,5 @@
 //	                           fail-closed, reachable only on the operator scope.
 //
 // The coverage floor and the mutation scope (.gremlins.yaml) are declared
-// against these paths so they ratchet as the code arrives.
+// against these paths so they ratchet as the code changes.
 package internal

@@ -164,14 +164,17 @@ presented at startup is refused before any listener binds (kill-switch-first).
 
 ## Coverage floor ratchet
 
-The CI `go / coverage` job measures line coverage over `./internal/...` (the
-control plane's real logic; `cmd/` is a thin wiring shim and is excluded). The
-floor is a placeholder of **0%** while `internal/` carries no logic yet.
+The CI `go / coverage` job measures line coverage over the production
+`internal/` packages (the control plane's real logic; `cmd/` is a thin wiring
+shim and `internal/state/statetest` is the shared conformance-suite support
+package, both excluded). The job runs with a Postgres service container and
+`OCU_TEST_DATABASE_URL` set, so the Postgres `state.Store` leg counts. The floor
+is **91%** — `floor(first-measured) - 1` against the 92.9% first measurement
+(see [`docs/testing.md`](docs/testing.md)).
 
-The floor is a ratchet: it is never lowered. New code ships with tests in
-the same PR. When the first logic package lands, set the floor to
-`floor(measured) - 1`; when a later PR raises measured coverage, raise the
-floor to match. Do not open a PR that lowers the floor.
+The floor is a ratchet: it is never lowered. New code ships with tests in the
+same PR. When a later PR raises measured coverage, raise the floor to match. Do
+not open a PR that lowers the floor.
 
 Run `make cover` locally to measure coverage and enforce the floor before
 pushing.
@@ -232,7 +235,8 @@ on known-exploitable vulnerabilities reachable from this module.
 
 The `mutation / gremlins` job (go-gremlins) runs on every PR and on a weekly
 cron, scoped to the pure-logic leaf packages (`internal/admission`,
-`internal/reservation`, `internal/killswitch`). It measures assertion strength
+`internal/registry`, `internal/quota`, `internal/killswitch`). It measures
+assertion strength
 — it rewrites covered source and re-runs the suite, so a surviving mutant marks
 a line the tests execute but do not assert on, a gap line coverage cannot see.
 It is **advisory** (`continue-on-error`): it surfaces the efficacy summary in

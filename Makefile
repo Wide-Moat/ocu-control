@@ -141,23 +141,20 @@ lint: ## golangci-lint run — structural meta-linter (.golangci.yml), pinned to
 # ── mutation (advisory — NOT part of `make check`) ────────────────────────────
 #
 # Mirrors the mutation.yml CI job: go-gremlins on the pure-logic leaf packages
-# (admission, reservation, killswitch). Mutation testing measures assertion
+# (admission, registry, quota, killswitch). Mutation testing measures assertion
 # strength — it rewrites covered source and re-runs the suite; a mutant the
 # tests still pass on is a line executed but not asserted on, which line
 # coverage cannot see. The coverpkg scope is read from .gremlins.yaml at the
-# repo root.
-#
-# These package directories do not exist yet (scaffolding); the scope is
-# declarative so it ratchets in as the code arrives. Advisory and deliberately
-# excluded from `make check`.
+# repo root and the path loop below must stay in agreement with it. Advisory and
+# deliberately excluded from `make check`.
 
-mutation: ## go-gremlins mutation test (advisory) on admission/reservation/killswitch — pinned to $(GREMLINS_VERSION)
+mutation: ## go-gremlins mutation test (advisory) on admission/registry/quota/killswitch — pinned to $(GREMLINS_VERSION)
 	@if ! command -v gremlins >/dev/null 2>&1; then \
 	  echo "gremlins not found — install with:"; \
 	  echo "  go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; \
 	  exit 1; \
 	fi
-	@for pkg in ./internal/admission/ ./internal/reservation/ ./internal/killswitch/; do \
+	@for pkg in ./internal/admission/ ./internal/registry/ ./internal/quota/ ./internal/killswitch/; do \
 	  echo "--- gremlins unleash $$pkg ---"; \
 	  gremlins unleash "$$pkg" || echo "gremlins reported a non-zero exit for $$pkg (advisory)"; \
 	done

@@ -8,13 +8,15 @@
 // effect it records (NFR: every privileged op emits a chain-linked event BEFORE
 // ack; deny if the audit write fails).
 //
-// This phase ships the PORT and the fail-closed-on-emit-failure BRANCH, exercised
-// on every privileged op (create-commit, destroy, revoke-one, revoke-all,
-// denylist-edit, quota-override). The real OCSF serializer (class_uid, chain hash)
-// lands in a later phase behind this exact interface; the Record fields here are
-// the minimum the fail-closed branch needs to be real now: who, what, which
-// session, the host-derived identity. A RecordingFake with a fault mode ships so
-// the deny-on-emit-failure path is unit-exercised rather than asserted on faith.
+// This package defines the PORT and the fail-closed-on-emit-failure BRANCH,
+// exercised on every privileged op: the operator/SOAR actions (create-commit,
+// destroy, revoke-one, revoke-all, denylist-edit, quota-override) and the
+// system-initiated create-rejected record (NFR-SEC-46/72). The OCSF serializer
+// that maps each Record to an API Activity event (class_uid 6003) and hash-chains
+// the durable spine lives in internal/audit/ocsf behind this exact interface; the
+// Record fields here are who, what, which session, and the host-derived identity.
+// A RecordingFake with a fault mode ships so the deny-on-emit-failure path is
+// unit-exercised rather than asserted on faith.
 //
 // The package is a leaf: it imports nothing internal, so every layer above can
 // hold the AuditSink without dragging the lifecycle, registry, or state seams
@@ -89,13 +91,13 @@ func (a Action) String() string {
 	}
 }
 
-// Record is the minimal event shape this phase emits. The full OCSF mapping
-// (class_uid, the chain hash that links each record to its predecessor) lands in
-// a later phase; the fields here are exactly what the fail-closed branch needs to
-// be real now: which privileged Action, which ingress Channel it arrived on, the
-// host-derived reservation Key the action targets, and the host-derived caller
-// and tenant. None of these is ever populated from a request body — they are the
-// host-resolved values the layer above already holds.
+// Record is the minimal event shape the sink emits. internal/audit/ocsf produces
+// the full OCSF mapping from these fields — the class_uid and the chain hash that
+// links each record to its predecessor; the fields here are exactly what the
+// fail-closed branch needs: which privileged Action, which ingress Channel it
+// arrived on, the host-derived reservation Key the action targets, and the
+// host-derived caller and tenant. None of these is ever populated from a request
+// body — they are the host-resolved values the layer above already holds.
 type Record struct {
 	// Action is the privileged operation this record attests.
 	Action Action
@@ -125,10 +127,10 @@ var ErrAuditWriteFailed = errors.New("audit: record write failed, action denied 
 
 // AuditSink is the emit seam. Emit returns nil ONLY when the record is durably
 // recorded; any non-nil error denies the privileged action that called it. The
-// real OCSF implementation lands later behind this interface; this phase supplies
-// RecordingFake. It is the only audit surface the lifecycle and kill-switch
-// layers hold. Every method takes a context.Context first (repo convention) and
-// an implementation is safe for concurrent use.
+// OCSF chain sink (internal/audit/ocsf) implements this interface in production;
+// RecordingFake is the test double. It is the only audit surface the lifecycle
+// and kill-switch layers hold. Every method takes a context.Context first (repo
+// convention) and an implementation is safe for concurrent use.
 type AuditSink interface {
 	// Emit makes rec durable and returns nil, or returns a non-nil error that the
 	// caller treats as a fail-closed deny. It MUST NOT report success for a record

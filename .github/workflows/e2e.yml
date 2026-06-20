@@ -39,12 +39,10 @@ jobs:
           retention-days: 1
 
   # e2e is the RELEASE-GATING job: it exercises the REAL daemon binary —
-  # no mocks. It is a REQUIRED check — no continue-on-error. Today the
-  # daemon is a scaffold that validates its flag surface and refuses with a
-  # typed error; the smoke below asserts exactly that observable behaviour.
-  # The Integration|E2E test slice grows with the lifecycle implementation
-  # PRs (real ingress listeners, host-dialled control channel, teardown
-  # finalizer) and runs under this same job.
+  # no mocks. It is a REQUIRED check — no continue-on-error. The smoke below
+  # asserts the pre-bind refusals against the real binary; the Integration|E2E
+  # slice that follows drives the full create→destroy lifecycle against a real
+  # state.Store and the real Docker daemon under this same job.
   e2e:
     runs-on: ubuntu-latest
     needs: build-controld

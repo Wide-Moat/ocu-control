@@ -12,4 +12,5 @@
 /contracts/                       @Wide-Moat/maintainers
 /internal/admission/              @Wide-Moat/maintainers
 /internal/killswitch/             @Wide-Moat/maintainers
-/internal/reservation/            @Wide-Moat/maintainers
+/internal/registry/               @Wide-Moat/maintainers
+/internal/quota/                  @Wide-Moat/maintainers

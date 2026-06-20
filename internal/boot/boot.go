@@ -29,8 +29,10 @@
 //     state.ErrKillSwitchEngaged read back from real durable state — not a
 //     hardcoded branch.
 //
-// The two real ingress listeners, the admission matrix, quota, the runtime
-// provider, JWT, and audit are later phases. This package binds nothing.
+// The ingress listeners, the admission matrix, quota, the RuntimeProvider, the
+// Storage-JWT signer, and OCSF audit live in their own packages and are composed
+// in cmd/ocu-controld; this package owns only the kill-switch-first ordering
+// invariant and binds nothing itself.
 package boot
 
 import (
