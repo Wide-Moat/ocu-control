@@ -39,6 +39,7 @@ valid_args=(
   -gateway-listen "$gwsock"
   -runtime-tier runc
   -runtime-provider docker
+  -workload-profile trusted_operator
   -jwt-signing-key "$tmp/jwt-signing.key"
   -audit-sink "$tmp/audit.ocsf.jsonl"
 )
@@ -65,7 +66,7 @@ echo "$out" | grep -q -- "-operator-listen" || {
 # 2. unknown runtime tier — refused, never silently defaulted.
 code=0
 out=$("$BIN" -operator-listen "$opsock" -gateway-listen "$gwsock" \
-  -runtime-tier bogus -runtime-provider docker \
+  -runtime-tier bogus -runtime-provider docker -workload-profile trusted_operator \
   -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" 2>&1) || code=$?
 echo "$out"
 if [ "$code" -ne 1 ]; then
@@ -80,7 +81,7 @@ echo "$out" | grep -q "unknown runtime tier" || {
 # 3. unknown runtime provider — refused, never silently defaulted.
 code=0
 out=$("$BIN" -operator-listen "$opsock" -gateway-listen "$gwsock" \
-  -runtime-tier runc -runtime-provider podman \
+  -runtime-tier runc -runtime-provider podman -workload-profile trusted_operator \
   -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" 2>&1) || code=$?
 echo "$out"
 if [ "$code" -ne 1 ]; then
@@ -89,6 +90,22 @@ if [ "$code" -ne 1 ]; then
 fi
 echo "$out" | grep -q "unknown runtime provider" || {
   echo "::error::unknown-runtime-provider sentinel missing from output"
+  fail=1
+}
+
+# 3b. unknown workload profile — refused, never silently defaulted to a permissive
+#     profile (a defaulted profile would silently widen the admission matrix).
+code=0
+out=$("$BIN" -operator-listen "$opsock" -gateway-listen "$gwsock" \
+  -runtime-tier runc -runtime-provider docker -workload-profile wide-open \
+  -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" 2>&1) || code=$?
+echo "$out"
+if [ "$code" -ne 1 ]; then
+  echo "::error::expected exit 1 on unknown workload profile, got $code"
+  fail=1
+fi
+echo "$out" | grep -q "unknown workload profile" || {
+  echo "::error::unknown-workload-profile sentinel missing from output"
   fail=1
 }
 

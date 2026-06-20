@@ -30,6 +30,7 @@ type config struct {
 	gatewayListen   string // gateway service-identity ingress endpoint
 	runtimeTier     string // deployment-wide isolation tier; never per-request
 	runtimeProvider string // container backend behind the RuntimeProvider seam
+	workloadProfile string // deployment-declared trust profile feeding the admission matrix; never per-request
 	jwtSigningKey   string // path to the Storage-JWT signing key (config/secret mount)
 	auditSink       string // OCSF audit fan-in sink
 	stateDSN        string // Postgres DSN for durable state; empty selects the in-memory store
@@ -51,7 +52,8 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.operatorListen, "operator-listen", "", "operator/lifecycle ingress endpoint (required)")
 	fs.StringVar(&cfg.gatewayListen, "gateway-listen", "", "gateway service-identity ingress endpoint (required)")
 	fs.StringVar(&cfg.runtimeTier, "runtime-tier", "", "deployment-wide isolation tier: runc|gvisor|firecracker (required)")
-	fs.StringVar(&cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker (required)")
+	fs.StringVar(&cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker|k8s (required)")
+	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
 	fs.StringVar(&cfg.auditSink, "audit-sink", "", "OCSF audit fan-in sink (required)")
 	fs.StringVar(&cfg.stateDSN, "state-dsn", "", "Postgres DSN for durable state; empty selects the in-memory store (minimal shelf)")
@@ -90,6 +92,7 @@ func validate(cfg config) error {
 		{"gateway-listen", cfg.gatewayListen},
 		{"runtime-tier", cfg.runtimeTier},
 		{"runtime-provider", cfg.runtimeProvider},
+		{"workload-profile", cfg.workloadProfile},
 		{"jwt-signing-key", cfg.jwtSigningKey},
 		{"audit-sink", cfg.auditSink},
 	} {
@@ -98,13 +101,19 @@ func validate(cfg config) error {
 		}
 	}
 
-	// 2. Enum membership — an unknown tier/provider is refused, never coerced
-	//    to a default.
+	// 2. Enum membership — an unknown tier/provider/profile is refused, never
+	//    coerced to a default. The workload profile is closed-enum exactly like the
+	//    tier: an omitted profile is caught by the required-flag loop above, and an
+	//    unknown one is refused here, never silently defaulted to a permissive
+	//    profile (a defaulted profile would silently widen the admission matrix).
 	if !knownRuntimeTiers[cfg.runtimeTier] {
 		return fmt.Errorf("%w: %q (choose runc|gvisor|firecracker)", errUnknownRuntimeTier, cfg.runtimeTier)
 	}
 	if !knownRuntimeProviders[cfg.runtimeProvider] {
-		return fmt.Errorf("%w: %q (v1 provider is docker)", errUnknownProvider, cfg.runtimeProvider)
+		return fmt.Errorf("%w: %q (choose docker|k8s)", errUnknownProvider, cfg.runtimeProvider)
+	}
+	if !knownWorkloadProfiles[cfg.workloadProfile] {
+		return fmt.Errorf("%w: %q (choose trusted_operator|internal_workforce|untrusted)", errUnknownWorkloadProfile, cfg.workloadProfile)
 	}
 
 	return nil

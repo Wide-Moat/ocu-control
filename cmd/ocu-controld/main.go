@@ -27,8 +27,22 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 
+	"github.com/Wide-Moat/ocu-control/internal/admission"
+	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/boot"
+	"github.com/Wide-Moat/ocu-control/internal/handoff"
+	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/ingress/gateway"
+	"github.com/Wide-Moat/ocu-control/internal/ingress/operator"
+	"github.com/Wide-Moat/ocu-control/internal/killswitch"
+	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/quota"
+	"github.com/Wide-Moat/ocu-control/internal/registry"
+	"github.com/Wide-Moat/ocu-control/internal/runtime"
+	"github.com/Wide-Moat/ocu-control/internal/runtime/docker"
+	"github.com/Wide-Moat/ocu-control/internal/runtime/k8s"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 	"github.com/Wide-Moat/ocu-control/internal/state/postgres"
 )
@@ -39,10 +53,11 @@ var version = "dev"
 // Sentinel refusals. The e2e smoke greps stable substrings of these, so the
 // wording is load-bearing: do not reword without updating scripts/e2e-smoke.sh.
 var (
-	errRequiredFlagMissing = errors.New("required flag missing or invalid")
-	errUnknownRuntimeTier  = errors.New("unknown runtime tier")
-	errUnknownProvider     = errors.New("unknown runtime provider")
-	errKillSwitchFirst     = errors.New("kill-switch engaged before listener bind: create refused (NFR-SEC-01)")
+	errRequiredFlagMissing    = errors.New("required flag missing or invalid")
+	errUnknownRuntimeTier     = errors.New("unknown runtime tier")
+	errUnknownProvider        = errors.New("unknown runtime provider")
+	errUnknownWorkloadProfile = errors.New("unknown workload profile")
+	errKillSwitchFirst        = errors.New("kill-switch engaged before listener bind: create refused (NFR-SEC-01)")
 )
 
 // knownRuntimeTiers and knownRuntimeProviders are the closed enumerations the
@@ -52,7 +67,13 @@ var (
 // RuntimeProvider seam).
 var (
 	knownRuntimeTiers     = map[string]bool{"runc": true, "gvisor": true, "firecracker": true}
-	knownRuntimeProviders = map[string]bool{"docker": true}
+	knownRuntimeProviders = map[string]bool{"docker": true, "k8s": true}
+	// knownWorkloadProfiles is the closed enumeration the admission matrix is keyed
+	// on. An omitted profile is caught as a missing required flag; an unknown one is
+	// refused here, never coerced to a permissive default — a defaulted profile would
+	// silently widen the admission matrix (the must-fix discipline mirroring
+	// -runtime-tier).
+	knownWorkloadProfiles = map[string]bool{"trusted_operator": true, "internal_workforce": true, "untrusted": true}
 )
 
 func main() {
@@ -102,20 +123,25 @@ func openStore(ctx context.Context, dsn string, clk state.Clock) (state.Store, e
 }
 
 // serve runs the kill-switch-first boot sequence after the static gates have
-// passed: it constructs one clock and the selected Store, builds the boot
-// Sequencer, and runs Boot — which loads the durable deny posture and engages
-// the deployment-wide kill-switch BEFORE any listener could bind. An
-// unreachable store at boot is fail-closed: serve returns and binds nothing.
+// passed, then composes the lifecycle layer and the two-listener ingress and
+// binds both listeners — but ONLY off the boot readiness hook, strictly after
+// Boot has loaded the durable deny posture and engaged the deployment-wide
+// kill-switch. An unreachable store at boot is fail-closed: serve returns and
+// binds nothing.
 //
-// With -create-on-start, a create is presented through the real
-// Sequencer.AdmitCreate path. The engaged kill-switch makes Store.Reserve
-// refuse with state.ErrKillSwitchEngaged, which serve re-wraps under
-// errKillSwitchFirst so the operator-facing refusal still names NFR-SEC-01 —
-// but the refusal now originates in a real Store read, not a hardcoded branch.
-// AdmitCreate runs before the (stubbed) bind, so no socket exists at refusal.
+// The composition wires the deployment-fixed profile and tier into the lifecycle
+// Manager (neither is per-request), constructs the kill-switch Engine and both
+// ingress adapters, and hands the SINGLE OperatorSeam to the operator adapter
+// ALONE — the gateway adapter is given no seam and has no import path to the mint,
+// so the kill-switch is unreachable from the gateway as a compile fact.
 //
-// The actual two-listener ingress bind is a Phase-3 step; here it stays a stub
-// reached only after a clean, create-free boot.
+// With -create-on-start (the smoke hook), a create is presented through the real
+// Sequencer.AdmitCreate path BEFORE any bind hook is registered: the engaged
+// kill-switch makes Store.Reserve refuse with state.ErrKillSwitchEngaged, which
+// serve re-wraps under errKillSwitchFirst so the operator-facing refusal still
+// names NFR-SEC-01. Because this path returns before the bind hook is installed,
+// the create-on-start refusal binds no socket — the e2e smoke asserts exactly
+// that no socket exists on the refusal.
 func serve(ctx context.Context, cfg config) error {
 	clk := state.SystemClock()
 
@@ -126,32 +152,240 @@ func serve(ctx context.Context, cfg config) error {
 		return fmt.Errorf("boot: open state store: %w", err)
 	}
 
-	seq := boot.New(store, clk)
-	if err := seq.Boot(ctx); err != nil {
-		// Fail-closed: the deny posture could not be loaded/engaged, so the
-		// daemon stays not-ready and binds nothing.
+	// The create-on-start smoke hook is a PRE-BIND refusal: it must flow through the
+	// real boot + Store path and refuse against the engaged kill-switch WITHOUT
+	// registering the listener-bind hook, so no socket is ever bound on the refusal.
+	// It runs its own minimal Boot (no onReady) and returns the NFR-SEC-01 refusal.
+	if cfg.create {
+		return serveCreateOnStart(ctx, store, clk)
+	}
+
+	tier, err := runtimeTierOf(cfg.runtimeTier)
+	if err != nil {
+		return err
+	}
+	profile, err := workloadProfileOf(cfg.workloadProfile)
+	if err != nil {
+		return err
+	}
+	provider, err := providerOf(cfg.runtimeProvider, tier)
+	if err != nil {
 		return err
 	}
 
-	// The kill-switch-first create gate, flowing through the real Store. The
-	// refusal's typed cause is state.ErrKillSwitchEngaged from the engaged
-	// global posture; we re-wrap it so the load-bearing NFR-SEC-01 text holds.
-	if cfg.create {
-		owner := state.Identity{Tenant: "smoke-tenant", Caller: "smoke-caller"}
-		if err := seq.AdmitCreate(ctx, "create-on-start", owner); err != nil {
-			if errors.Is(err, state.ErrKillSwitchEngaged) {
-				return fmt.Errorf("%w: %v", errKillSwitchFirst, err)
-			}
+	mgr, eng := compose(store, clk, provider, profile, tier)
+
+	// The single operator capability: minted ONCE and handed to the operator
+	// adapter ALONE. The gateway adapter is constructed with no seam.
+	seam := ingress.NewOperatorSeam()
+	seq := boot.New(store, clk)
+
+	opListener := operator.NewListener(socketPathOf(cfg.operatorListen), operator.Deps{
+		Manager:  mgr,
+		Engine:   eng,
+		Healthz:  seq.Healthz(),
+		Resolver: operator.NewPeerCredResolver(nil),
+		Seam:     seam, // the operator adapter alone holds the seam
+	})
+	gwListener := gateway.NewListener(tcpAddrOf(cfg.gatewayListen), gateway.Deps{
+		Manager:  mgr,
+		Resolver: gateway.NewCertSANResolver(nil),
+		// No TLSConfig wired in this phase: the gateway binds plain TCP whose
+		// connections carry no verified SAN, so every Resolve fails closed (a
+		// clearly-stubbed, fail-closed posture). No OperatorSeam is passed.
+	})
+
+	// The bind hook runs from inside Boot, strictly AFTER readiness flips to ready
+	// (the deny posture is loaded-and-durable). The reconciler sweep runs first so a
+	// crashed-mid-create orphan is reclaimed before traffic is admitted, then both
+	// listeners bind and serve. Binding here makes "bind reachable only after deny
+	// posture durable" structural, not incidental.
+	seq.SetOnReady(func(hookCtx context.Context) error {
+		if err := mgr.Reconcile(hookCtx); err != nil {
+			return fmt.Errorf("boot: reconcile orphans: %w", err)
+		}
+		if err := opListener.Bind(); err != nil {
 			return err
 		}
-		// An admitted create here would be a kill-switch-first violation: this
-		// branch is unreachable in Phase 1 because Boot always engages the
-		// global posture.
-		return errors.New("boot: create admitted despite kill-switch-first posture (invariant violated)")
+		if err := gwListener.Bind(); err != nil {
+			_ = opListener.Close()
+			return err
+		}
+		return nil
+	})
+
+	if err := seq.Boot(ctx); err != nil {
+		// Fail-closed: the deny posture could not be loaded/engaged (or a bind in the
+		// readiness hook failed), so the daemon stays not-ready. Close anything that
+		// did bind so the refusal leaves no half-open listener.
+		_ = opListener.Close()
+		_ = gwListener.Close()
+		return err
 	}
 
-	// A real serve would bind the two ingress listeners here, mounting
-	// seq.Healthz() on the operator listener. Phase 1 stops short of binding:
-	// the listener wiring lands in Phase 3.
-	return fmt.Errorf("listener bind not yet wired in this phase (deny posture engaged, tier=%s provider=%s)", cfg.runtimeTier, cfg.runtimeProvider)
+	// Both listeners are bound. Serve them until the process context is cancelled;
+	// the first serve error (or a clean ctx shutdown returning nil) ends the daemon.
+	return serveListeners(ctx, opListener, gwListener)
+}
+
+// serveCreateOnStart drives the kill-switch-first create smoke hook end-to-end
+// through the real boot + Store path and refuses pre-bind. It registers NO
+// readiness bind hook, so the refusal binds no socket — the e2e smoke asserts
+// exactly that. The refusal's typed cause is state.ErrKillSwitchEngaged from the
+// boot-engaged global posture; it is re-wrapped under errKillSwitchFirst so the
+// load-bearing NFR-SEC-01 text holds.
+func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock) error {
+	seq := boot.New(store, clk)
+	if err := seq.Boot(ctx); err != nil {
+		return err
+	}
+	owner := state.Identity{Tenant: "smoke-tenant", Caller: "smoke-caller"}
+	if err := seq.AdmitCreate(ctx, "create-on-start", owner); err != nil {
+		if errors.Is(err, state.ErrKillSwitchEngaged) {
+			return fmt.Errorf("%w: %v", errKillSwitchFirst, err)
+		}
+		return err
+	}
+	// An admitted create here would be a kill-switch-first violation: unreachable
+	// because Boot always engages the global posture.
+	return errors.New("boot: create admitted despite kill-switch-first posture (invariant violated)")
+}
+
+// compose builds the lifecycle Manager and the kill-switch Engine over the shared
+// Store, Clock, and Provider. The minimal-shelf collaborators — an in-tree
+// handoff Stager, an audit RecordingFake (the real OCSF serializer is a later
+// phase; the fail-closed branch ships now), and a deployment Limits — are bound
+// here. profile and tier are deployment-fixed and flow onto the Manager as fixed
+// fields; CreateInput carries neither.
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier) (*lifecycle.Manager, *killswitch.Engine) {
+	custodian := registry.NewCustodian(store)
+	gate := quota.NewGate(store, clk, defaultLimits())
+	stager := handoff.NewStager(handoffBase)
+	sink := audit.NewRecordingFake()
+
+	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+		Custodian: custodian,
+		Provider:  provider,
+		Clock:     clk,
+		Quota:     gate,
+		Handoff:   stager,
+		Audit:     sink,
+		Profile:   profile,
+		Tier:      tier,
+	})
+	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
+	return mgr, eng
+}
+
+// serveListeners runs both bound listeners until ctx is cancelled, returning the
+// first serve error. A clean ctx-driven shutdown returns nil. It closes both
+// listeners on exit so neither socket survives the daemon.
+func serveListeners(ctx context.Context, op *operator.Listener, gw *gateway.Listener) error {
+	defer func() {
+		_ = op.Close()
+		_ = gw.Close()
+	}()
+
+	errCh := make(chan error, 2)
+	go func() { errCh <- op.Serve(ctx) }()
+	go func() { errCh <- gw.Serve(ctx) }()
+
+	// Return the first non-nil serve error (or nil on a clean shutdown of the first
+	// listener to exit); the deferred Close stops the other.
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errCh:
+		return err
+	}
+}
+
+// handoffBase is the host-owned directory under which the handoff Stager writes
+// each per-session 0700 root. It is a fixed minimal-shelf path; a deployment may
+// override it in a later phase.
+const handoffBase = "/run/ocu-control/handoff"
+
+// defaultLimits is the minimal-shelf deployment quota policy. The values are
+// conservative non-zero ceilings so the create path charges real counters; a
+// deployment tunes them in a later phase.
+func defaultLimits() quota.Limits {
+	return quota.Limits{
+		ConcurrentSessionsPerTenant: 64,
+		MCPCallsPerMinPerTenant:     600,
+		StorageGBPerTenant:          100,
+		EgressBytesPerDayPerTenant:  1 << 40, // 1 TiB/day
+		CreateRatePerCallerPerMin:   30,
+	}
+}
+
+// runtimeTierOf maps the validated -runtime-tier string to the runtime.RuntimeTier
+// the provider is constructed bound to. The string was already enum-checked in
+// validate(); an unexpected value here is a hard internal error, never a default.
+func runtimeTierOf(s string) (runtime.RuntimeTier, error) {
+	switch s {
+	case "runc":
+		return runtime.TierRunc, nil
+	case "gvisor":
+		return runtime.TierGvisor, nil
+	case "firecracker":
+		return runtime.TierFirecracker, nil
+	default:
+		return 0, fmt.Errorf("%w: %q", errUnknownRuntimeTier, s)
+	}
+}
+
+// workloadProfileOf maps the validated -workload-profile string to the
+// admission.WorkloadProfile the Manager holds as a fixed field. The string was
+// already enum-checked in validate(); an unexpected value here is a hard internal
+// error, never a default — a defaulted profile would silently widen the matrix.
+func workloadProfileOf(s string) (admission.WorkloadProfile, error) {
+	switch s {
+	case "trusted_operator":
+		return admission.ProfileTrustedOperator, nil
+	case "internal_workforce":
+		return admission.ProfileInternalWorkforce, nil
+	case "untrusted":
+		return admission.ProfileUntrusted, nil
+	default:
+		return 0, fmt.Errorf("%w: %q", errUnknownWorkloadProfile, s)
+	}
+}
+
+// providerOf constructs the RuntimeProvider behind the seam from the validated
+// -runtime-provider string, bound to the deployment-wide tier. docker builds the
+// real env-configured Docker provider; k8s returns the (NotImplemented) k8s
+// provider. The tier is fixed at construction and can never be weakened by a
+// request.
+func providerOf(name string, tier runtime.RuntimeTier) (runtime.RuntimeProvider, error) {
+	switch name {
+	case "docker":
+		p, err := docker.NewDockerProvider(tier, docker.Deps{})
+		if err != nil {
+			return nil, fmt.Errorf("boot: construct docker provider: %w", err)
+		}
+		return p, nil
+	case "k8s":
+		return k8s.New(), nil
+	default:
+		return nil, fmt.Errorf("%w: %q", errUnknownProvider, name)
+	}
+}
+
+// socketPathOf strips a unix:// scheme from the operator endpoint, yielding the
+// filesystem socket path net.Listen("unix", ...) takes. A bare path is returned
+// unchanged.
+func socketPathOf(endpoint string) string {
+	if p, ok := strings.CutPrefix(endpoint, "unix://"); ok {
+		return p
+	}
+	return endpoint
+}
+
+// tcpAddrOf strips a tcp:// scheme from the gateway endpoint, yielding the
+// host:port net.Listen("tcp", ...) takes. A bare host:port is returned unchanged.
+func tcpAddrOf(endpoint string) string {
+	if a, ok := strings.CutPrefix(endpoint, "tcp://"); ok {
+		return a
+	}
+	return endpoint
 }

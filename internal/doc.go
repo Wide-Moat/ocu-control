@@ -32,14 +32,28 @@
 //	internal/runtimemap      — the single mapping between state.Identity and the
 //	                           runtime seam's leaf-local Identity, with a
 //	                           compile-time field-parity guard.
-//
-// Lands as the later phases fill in (each behind a narrow seam, per
-// component-02):
-//
-//	internal/admission    — the workload-trust-profile × runtime-tier matrix,
-//	                        run fail-closed at the top of Create
-//	internal/ingress      — the two listeners (operator + gateway), distinct
-//	                        endpoints, no cross-route
+//	internal/admission       — the workload-trust-profile × runtime-tier matrix as
+//	                           a total, fail-closed data table (NFR-SEC-38).
+//	internal/quota           — the create-time quota gate: atomic check-and-charge
+//	                           over the Store counters, refused-not-queued.
+//	internal/registry        — the session-registry sole custodian: the only caller
+//	                           of the Store reservation mutators; the host-derived
+//	                           Key that a body id can never become.
+//	internal/handoff         — stages the non-secret handoff material (info JSON,
+//	                           the Ed25519 public key, the 0700 sock dir).
+//	internal/audit           — the fail-closed AuditSink port; the deny-on-emit
+//	                           branch ships now, the OCSF serializer is later.
+//	internal/ingress         — the capability scope seam: an OperatorScope is
+//	                           mintable only by possessing the OperatorSeam, so the
+//	                           gateway cannot call an operator route at compile time.
+//	internal/ingress/operator — the operator/lifecycle Unix-socket ingress (holds
+//	                           the OperatorSeam; SO_PEERCRED-attested + SOAR).
+//	internal/ingress/gateway — the gateway service-identity ingress (mTLS cert-SAN;
+//	                           no operator scope).
+//	internal/lifecycle       — the create→destroy pipeline: an ordered []stage with
+//	                           a LIFO unwind stack so a failed create leaves no orphan.
+//	internal/killswitch      — the host-initiated revoke engine (one/all), audit-first
+//	                           fail-closed, reachable only on the operator scope.
 //
 // The coverage floor and the mutation scope (.gremlins.yaml) are declared
 // against these paths so they ratchet as the code arrives.

@@ -48,6 +48,24 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     needs: build-controld
+    # A Postgres service so the full lifecycle create→destroy e2e drives a REAL
+    # state.Store and the REAL Docker daemon the runner ships TOGETHER — the
+    # milestone capability (create + manage a container's lifecycle with state in
+    # the database). The Docker daemon is local to the runner.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: ocu_control_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d ocu_control_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -83,6 +101,17 @@ jobs:
         env:
           OCU_RUNTIME_IT: "1"
         run: go test -run 'TestIT' ./internal/runtime/docker/ -v -timeout 600s
+      # The milestone capstone: the WHOLE lifecycle pipeline driven against a REAL
+      # Postgres state.Store AND the REAL Docker daemon together — admission →
+      # quota → reserve → stage-handoff → materialize a real container → commit →
+      # bind, then a host-driven destroy that removes the container and tombstones
+      # the row. The daemon is local to the runner, so the HOST-01 bind sources
+      # resolve from t.TempDir (no OCU_RUNTIME_IT_STAGE_DIR needed).
+      - name: run the lifecycle create→destroy e2e (real Postgres + real Docker)
+        env:
+          OCU_TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/ocu_control_test?sslmode=disable
+          OCU_RUNTIME_IT: "1"
+        run: go test -run 'TestE2E_CreateDestroy_RealBackends' ./internal/lifecycle/ -v -timeout 600s
 
   # docker-build catches go.mod / Dockerfile toolchain drift on every PR and
   # push to main — the class of bug where go.mod advances past the builder
