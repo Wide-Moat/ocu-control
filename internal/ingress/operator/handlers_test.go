@@ -8,6 +8,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress/operator"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/state"
@@ -127,6 +128,86 @@ func TestRevokeViaSOARNoVerifierConfigured(t *testing.T) {
 	if err := h.RevokeOneViaSOAR(context.Background(), attestedConn(1001), []byte("p"), []byte("s"), "k", "x"); !errors.Is(err, killswitch.ErrSOARUnverified) {
 		t.Fatalf("RevokeOneViaSOAR with no verifier = %v; want ErrSOARUnverified (fail-closed)", err)
 	}
+}
+
+// TestSOARRevokeRecordsPrincipalNotSocketPeer is the load-bearing P2-R2 proof: for a
+// SOAR-driven revoke the audit actor (actor.user) MUST be the verified SOAR
+// PRINCIPAL, NOT the unix-socket peer that delivered the webhook. The socket is
+// attested with one identity (socketPeer) and the verifier surfaces a DISTINCT SOAR
+// principal; the emitted audit Record must carry the principal as the actor, so the
+// assertion is not vacuous. Both SOAR verbs are exercised.
+func TestSOARRevokeRecordsPrincipalNotSocketPeer(t *testing.T) {
+	t.Parallel()
+	socketPeer := state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}
+	principal := state.Identity{Tenant: "soar-tenant", Caller: "soar-principal"}
+	if principal == socketPeer {
+		t.Fatal("test setup error: the SOAR principal must differ from the socket peer")
+	}
+
+	t.Run("revoke_one", func(t *testing.T) {
+		t.Parallel()
+		h, sink, _ := newTestHandlers(t, fixedResolver{id: socketPeer}, &fakeVerifier{identity: principal})
+		if err := h.RevokeOneViaSOAR(context.Background(), attestedConn(1000), []byte("p"), []byte("s"), "session-key", "soar"); err != nil {
+			t.Fatalf("RevokeOneViaSOAR (verified) = %v; want nil", err)
+		}
+		assertActorIsPrincipal(t, sink, audit.ActionRevokeOne, principal, socketPeer)
+	})
+
+	t.Run("revoke_all", func(t *testing.T) {
+		t.Parallel()
+		h, sink, _ := newTestHandlers(t, fixedResolver{id: socketPeer}, &fakeVerifier{identity: principal})
+		if err := h.RevokeAllViaSOAR(context.Background(), attestedConn(1000), []byte("p"), []byte("s"), "soar"); err != nil {
+			t.Fatalf("RevokeAllViaSOAR (verified) = %v; want nil", err)
+		}
+		assertActorIsPrincipal(t, sink, audit.ActionRevokeAll, principal, socketPeer)
+	})
+}
+
+// TestAdminRevokeRecordsSocketPeerAsActor proves the admin/CLI channel's complement
+// of the SOAR rule: there the host-attested socket peer IS the operator, so a
+// non-SOAR RevokeOne records the socket-peer identity as the audit actor.
+func TestAdminRevokeRecordsSocketPeerAsActor(t *testing.T) {
+	t.Parallel()
+	socketPeer := state.Identity{Tenant: "ocu-operator", Caller: "uid:7777"}
+	h, sink, _ := newTestHandlers(t, fixedResolver{id: socketPeer}, nil)
+	if err := h.RevokeOne(context.Background(), attestedConn(7777), "session-key", "incident"); err != nil {
+		t.Fatalf("RevokeOne = %v; want nil", err)
+	}
+	rec, ok := recordFor(sink, audit.ActionRevokeOne)
+	if !ok {
+		t.Fatal("RevokeOne did not emit an ActionRevokeOne record")
+	}
+	if rec.Caller != socketPeer.Caller || rec.Tenant != socketPeer.Tenant {
+		t.Fatalf("admin revoke actor = {%q,%q}, want the socket peer {%q,%q}",
+			rec.Tenant, rec.Caller, socketPeer.Tenant, socketPeer.Caller)
+	}
+}
+
+// assertActorIsPrincipal fails unless the first Record for action carries principal
+// as the actor and is NOT the socket peer, the precise P2-R2 invariant.
+func assertActorIsPrincipal(t *testing.T, sink *audit.RecordingFake, action audit.Action, principal, socketPeer state.Identity) {
+	t.Helper()
+	rec, ok := recordFor(sink, action)
+	if !ok {
+		t.Fatalf("no audit Record for %v after a SOAR revoke", action)
+	}
+	if rec.Caller != principal.Caller || rec.Tenant != principal.Tenant {
+		t.Fatalf("SOAR %v actor = {%q,%q}, want the SOAR principal {%q,%q}",
+			action, rec.Tenant, rec.Caller, principal.Tenant, principal.Caller)
+	}
+	if rec.Caller == socketPeer.Caller && rec.Tenant == socketPeer.Tenant {
+		t.Fatalf("SOAR %v actor = the SOCKET PEER %+v; the actor must be the SOAR principal (P2-R2)", action, socketPeer)
+	}
+}
+
+// recordFor returns the first recorded Record for action and whether one was found.
+func recordFor(sink *audit.RecordingFake, action audit.Action) (audit.Record, bool) {
+	for _, rec := range sink.Records() {
+		if rec.Action == action {
+			return rec, true
+		}
+	}
+	return audit.Record{}, false
 }
 
 // TestSOARHandlersUnattestedRefused proves both SOAR handlers refuse an unattested

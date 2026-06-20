@@ -17,9 +17,48 @@ import (
 func TestOperatorSeamMintsValidScope(t *testing.T) {
 	t.Parallel()
 	seam := ingress.NewOperatorSeam()
-	scope := seam.Mint()
+	scope := seam.Mint(state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"})
 	if !scope.Valid() {
 		t.Fatalf("OperatorScope minted from NewOperatorSeam().Mint() is not Valid")
+	}
+}
+
+// TestMintStampsHostAttestedIdentity proves Mint stamps the host-attested operator
+// identity onto the scope and Identity() round-trips it. This is the field the
+// kill-switch Engine reads to record the audit actor (actor.user = who acted), so
+// the stamped value must survive the mint exactly.
+func TestMintStampsHostAttestedIdentity(t *testing.T) {
+	t.Parallel()
+	want := state.Identity{Tenant: "ocu-operator", Caller: "uid:4242"}
+	scope := ingress.NewOperatorSeam().Mint(want)
+	if got := scope.Identity(); got != want {
+		t.Fatalf("scope.Identity() = %+v, want %+v (Mint must stamp the host-attested identity)", got, want)
+	}
+	if !scope.Valid() {
+		t.Fatalf("a scope minted from a genuine seam with an identity must still be Valid")
+	}
+}
+
+// TestForgedAndZeroScopeReportZeroIdentity proves the identity is NOT part of the
+// seal: a forged seam's scope and the inert zero-value scope both report the zero
+// Identity AND fail Valid, so a forged identity grants no authority and reads as
+// empty rather than leaking a value the witness never admitted.
+func TestForgedAndZeroScopeReportZeroIdentity(t *testing.T) {
+	t.Parallel()
+	// A forged zero-value seam minted with a non-zero identity: the witness is nil, so
+	// Valid is false, and the scope still carries whatever identity was passed — but the
+	// Engine never reads it because the scope is invalid and refused first.
+	forged := ingress.OperatorSeam{}.Mint(state.Identity{Tenant: "spoof", Caller: "spoof"})
+	if forged.Valid() {
+		t.Fatalf("a scope minted from a forged zero-value seam reports Valid; the seal regressed")
+	}
+	// The inert zero-value scope reports the zero Identity, matching its invalid witness.
+	var zero ingress.OperatorScope
+	if zero.Valid() {
+		t.Fatalf("zero-value OperatorScope reports Valid")
+	}
+	if got := zero.Identity(); got != (state.Identity{}) {
+		t.Fatalf("zero-value OperatorScope.Identity() = %+v, want the zero Identity", got)
 	}
 }
 
@@ -42,7 +81,7 @@ func TestZeroOperatorScopeIsInvalid(t *testing.T) {
 func TestZeroOperatorSeamMintsInvalidScope(t *testing.T) {
 	t.Parallel()
 	var forged ingress.OperatorSeam
-	scope := forged.Mint()
+	scope := forged.Mint(state.Identity{})
 	if scope.Valid() {
 		t.Fatalf("OperatorScope minted from a zero-value OperatorSeam reports Valid; the empty-literal hole is open")
 	}
@@ -72,8 +111,8 @@ func TestZeroServiceScopeIsInvalid(t *testing.T) {
 // (There is exactly one genuine witness pointer; Mint propagates it.)
 func TestDistinctSeamsMintEquivalentlyValidScopes(t *testing.T) {
 	t.Parallel()
-	a := ingress.NewOperatorSeam().Mint()
-	b := ingress.NewOperatorSeam().Mint()
+	a := ingress.NewOperatorSeam().Mint(state.Identity{})
+	b := ingress.NewOperatorSeam().Mint(state.Identity{})
 	if !a.Valid() || !b.Valid() {
 		t.Fatalf("a seam minted by NewOperatorSeam must always mint a Valid scope: a=%v b=%v", a.Valid(), b.Valid())
 	}

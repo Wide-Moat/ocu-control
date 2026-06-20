@@ -24,8 +24,17 @@ import (
 // ksStart anchors the FakeClock for reproducible deny-entry Since stamps.
 var ksStart = time.Date(2025, time.April, 5, 6, 7, 8, 0, time.UTC)
 
-// owner is the host-derived identity the reserved-row fixtures are written under.
+// owner is the host-derived identity the reserved-row fixtures are written under. It
+// is the quota TARGET in the override tests — deliberately DISTINCT from operatorID
+// so the operator-as-actor assertion (the actor must be WHO ACTED, not the target)
+// is not vacuous.
 var owner = state.Identity{Tenant: "tenant-x", Caller: "caller-x"}
+
+// operatorID is the host-attested operator identity stamped onto the engine
+// harness's OperatorScope at mint. The kill-switch records it as the audit actor
+// (actor.user = who acted) for every privileged action, so the actor-assertion tests
+// check the emitted Record carries THIS identity, distinct from owner.
+var operatorID = state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}
 
 // recordingProvider counts ForceKill calls and tracks the live RuntimeIDs so a test
 // can prove RevokeAll force-killed a reserved row. It never fails.
@@ -130,7 +139,7 @@ func newEngineHarness() *engineHarness {
 	provider := newRecordingProvider()
 	sink := audit.NewRecordingFake()
 	engine := killswitch.NewEngine(store, cust, provider, clk, sink)
-	scope := ingress.NewOperatorSeam().Mint()
+	scope := ingress.NewOperatorSeam().Mint(operatorID)
 	return &engineHarness{
 		engine:   engine,
 		store:    store,
@@ -185,10 +194,15 @@ func TestRevokeAllForceKillsJustReservedRow(t *testing.T) {
 	if row.State != state.StateReleased {
 		t.Fatalf("force-killed row state = %v, want RELEASED", row.State)
 	}
-	// Exactly one revoke_all audit record, emitted first.
+	// Exactly one revoke_all audit record, emitted first, carrying the OPERATOR
+	// identity as the actor (actor.user = who acted), never the row owner.
 	recs := h.audit.Records()
 	if len(recs) != 1 || recs[0].Action != audit.ActionRevokeAll {
 		t.Fatalf("audit records = %+v, want one revoke_all", recs)
+	}
+	if recs[0].Caller != operatorID.Caller || recs[0].Tenant != operatorID.Tenant {
+		t.Fatalf("revoke_all actor = {%q,%q}, want the operator {%q,%q}",
+			recs[0].Tenant, recs[0].Caller, operatorID.Tenant, operatorID.Caller)
 	}
 }
 
@@ -222,6 +236,11 @@ func TestRevokeOneAuthorsSessionDenyAndForceKills(t *testing.T) {
 	recs := h.audit.Records()
 	if len(recs) != 1 || recs[0].Action != audit.ActionRevokeOne || recs[0].Key != key.String() {
 		t.Fatalf("audit records = %+v, want one revoke_one for the target key", recs)
+	}
+	// The actor is the OPERATOR who issued the revoke, never the targeted row owner.
+	if recs[0].Caller != operatorID.Caller || recs[0].Tenant != operatorID.Tenant {
+		t.Fatalf("revoke_one actor = {%q,%q}, want the operator {%q,%q}",
+			recs[0].Tenant, recs[0].Caller, operatorID.Tenant, operatorID.Caller)
 	}
 }
 
@@ -281,40 +300,50 @@ func TestRevokeRejectsInvalidScope(t *testing.T) {
 }
 
 // ed25519SOAR is a concrete SOARVerifier over an Ed25519 SOAR principal key, the
-// shape the operator adapter supplies in a later step. The accept/reject test
-// exercises it here so the verify-then-mint contract has a real implementation.
-type ed25519SOAR struct{ pub ed25519.PublicKey }
+// shape the operator adapter supplies in a later step. On a successful verify it
+// surfaces the SOAR PRINCIPAL identity — the authority for a SOAR-driven revoke and
+// thus the audit actor (P2-R2). The accept/reject test exercises it here so the
+// verify-then-mint contract has a real implementation.
+type ed25519SOAR struct {
+	pub       ed25519.PublicKey
+	principal state.Identity
+}
 
-func (v ed25519SOAR) Verify(_ context.Context, payload, sig []byte) error {
+func (v ed25519SOAR) Verify(_ context.Context, payload, sig []byte) (state.Identity, error) {
 	if !ed25519.Verify(v.pub, payload, sig) {
-		return fmt.Errorf("%w: signature did not verify", killswitch.ErrSOARUnverified)
+		return state.Identity{}, fmt.Errorf("%w: signature did not verify", killswitch.ErrSOARUnverified)
 	}
-	return nil
+	return v.principal, nil
 }
 
 // compile-time proof the concrete verifier satisfies the port.
 var _ killswitch.SOARVerifier = ed25519SOAR{}
 
 // TestSOARVerifierAcceptReject proves the verify-then-mint gate: a valid SOAR
-// signature verifies (nil), a tampered one rejects with ErrSOARUnverified — so an
-// unverifiable SOAR call never reaches the Engine.
+// signature verifies and surfaces the principal identity, a tampered one rejects
+// with ErrSOARUnverified — so an unverifiable SOAR call never reaches the Engine.
 func TestSOARVerifierAcceptReject(t *testing.T) {
 	t.Parallel()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
-	v := ed25519SOAR{pub: pub}
+	principal := state.Identity{Tenant: "soar-tenant", Caller: "soar-principal"}
+	v := ed25519SOAR{pub: pub, principal: principal}
 	payload := []byte(`{"action":"revoke_all","reason":"incident"}`)
 	sig := ed25519.Sign(priv, payload)
 
-	if err := v.Verify(context.Background(), payload, sig); err != nil {
+	gotID, err := v.Verify(context.Background(), payload, sig)
+	if err != nil {
 		t.Fatalf("Verify of a valid signature = %v, want nil (accept)", err)
+	}
+	if gotID != principal {
+		t.Fatalf("Verify surfaced principal %+v, want %+v", gotID, principal)
 	}
 
 	tampered := append([]byte(nil), sig...)
 	tampered[0] ^= 0xFF
-	if err := v.Verify(context.Background(), payload, tampered); !errors.Is(err, killswitch.ErrSOARUnverified) {
+	if _, err := v.Verify(context.Background(), payload, tampered); !errors.Is(err, killswitch.ErrSOARUnverified) {
 		t.Fatalf("Verify of a tampered signature = %v, want ErrSOARUnverified (reject)", err)
 	}
 }
@@ -340,9 +369,14 @@ func TestLiftDenyClearsSessionDeny(t *testing.T) {
 	if _, err := h.cust.Reserve(ctx, key, owner); err != nil {
 		t.Fatalf("Reserve after LiftDeny = %v, want success (deny lifted)", err)
 	}
-	// The edit was audited.
-	if !auditedAction(h.audit, audit.ActionEditDenylist) {
+	// The edit was audited, with the OPERATOR identity as the actor.
+	rec, ok := recordFor(h.audit, audit.ActionEditDenylist)
+	if !ok {
 		t.Fatal("LiftDeny did not emit an ActionEditDenylist record")
+	}
+	if rec.Caller != operatorID.Caller || rec.Tenant != operatorID.Tenant {
+		t.Fatalf("lift-deny actor = {%q,%q}, want the operator {%q,%q}",
+			rec.Tenant, rec.Caller, operatorID.Tenant, operatorID.Caller)
 	}
 }
 
@@ -403,8 +437,20 @@ func TestOverrideQuotaChargesAndAudits(t *testing.T) {
 	if got != 5 {
 		t.Fatalf("counter after OverrideQuota(+5) = %d, want 5", got)
 	}
-	if !auditedAction(h.audit, audit.ActionOverrideQuota) {
+	// The audit actor is the OPERATOR who issued the override (scope.Identity), NOT the
+	// quota TARGET (key.Identity == owner). The target is the OBJECT of the action; the
+	// operator is its subject. This is the load-bearing OverrideQuota ruling: actor.user
+	// is WHO ACTED, so an override of owner's counter records the operator, not owner.
+	rec, ok := recordFor(h.audit, audit.ActionOverrideQuota)
+	if !ok {
 		t.Fatal("OverrideQuota did not emit an ActionOverrideQuota record")
+	}
+	if rec.Caller != operatorID.Caller || rec.Tenant != operatorID.Tenant {
+		t.Fatalf("override-quota actor = {%q,%q}, want the operator {%q,%q}",
+			rec.Tenant, rec.Caller, operatorID.Tenant, operatorID.Caller)
+	}
+	if rec.Caller == owner.Caller && rec.Tenant == owner.Tenant {
+		t.Fatalf("override-quota actor = the quota TARGET %+v; the actor must be the operator, not the target", owner)
 	}
 }
 
@@ -429,12 +475,13 @@ func TestOverrideQuotaAuditFailureDenies(t *testing.T) {
 	}
 }
 
-// auditedAction reports whether the recording sink holds a record for action.
-func auditedAction(sink *audit.RecordingFake, action audit.Action) bool {
+// recordFor returns the first recorded Record for action and whether one was found,
+// so an actor-assertion test can inspect the emitted actor.user fields.
+func recordFor(sink *audit.RecordingFake, action audit.Action) (audit.Record, bool) {
 	for _, rec := range sink.Records() {
 		if rec.Action == action {
-			return true
+			return rec, true
 		}
 	}
-	return false
+	return audit.Record{}, false
 }

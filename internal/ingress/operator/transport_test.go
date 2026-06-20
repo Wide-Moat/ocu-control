@@ -481,6 +481,6 @@ var _ killswitch.SOARVerifier = errBadVerifier{}
 
 type errBadVerifier struct{}
 
-func (errBadVerifier) Verify(context.Context, []byte, []byte) error {
-	return errors.New("never verifies")
+func (errBadVerifier) Verify(context.Context, []byte, []byte) (state.Identity, error) {
+	return state.Identity{}, errors.New("never verifies")
 }

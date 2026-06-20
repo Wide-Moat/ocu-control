@@ -17,7 +17,10 @@
 // `go build` the seal test invokes on this exact path.
 package scopecompilefail
 
-import "github.com/Wide-Moat/ocu-control/internal/ingress"
+import (
+	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/state"
+)
 
 // operatorOnly stands in for the operator-only surface the kill-switch Engine
 // exposes (RevokeOne/RevokeAll/denylist-edit/quota-override): each such method
@@ -39,8 +42,11 @@ func forgeWitnessType() {
 
 // forgeSeamField tries to set the seam's unexported mint pointer to bootstrap a
 // genuine scope from a hand-built seam. FORBIDDEN: the mint field is unexported.
+// (Mint now requires the host-attested identity arg; a forged seam still yields an
+// INVALID scope regardless of the identity passed, so this remains a proof of the
+// seal, not a route through it.)
 func forgeSeamField() ingress.OperatorScope {
-	return ingress.OperatorSeam{mint: nil}.Mint()
+	return ingress.OperatorSeam{mint: nil}.Mint(state.Identity{})
 }
 
 // callOperatorOnlyWithServiceScope tries to invoke the operator-only surface with a

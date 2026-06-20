@@ -268,14 +268,24 @@ func (s *listerStore) LiveSessions(ctx context.Context) ([]state.SessionRow, err
 	return out, nil
 }
 
-// fakeVerifier is a test SOARVerifier: it returns err (nil = verified).
-type fakeVerifier struct{ err error }
+// fakeVerifier is a test SOARVerifier: on a successful verify (err == nil) it
+// surfaces the configured SOAR PRINCIPAL identity, the authority for a SOAR-driven
+// revoke; on a failure it returns the zero Identity and err. The principal is
+// deliberately distinct from the socket-peer identity in the SOAR tests so the
+// principal-as-actor assertion is not vacuous (P2-R2).
+type fakeVerifier struct {
+	identity state.Identity
+	err      error
+}
 
-func (f *fakeVerifier) Verify(ctx context.Context, _, _ []byte) error {
+func (f *fakeVerifier) Verify(ctx context.Context, _, _ []byte) (state.Identity, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return state.Identity{}, err
 	}
-	return f.err
+	if f.err != nil {
+		return state.Identity{}, f.err
+	}
+	return f.identity, nil
 }
 
 // writeMarker writes a regular file at path so a Bind can prove it refuses a

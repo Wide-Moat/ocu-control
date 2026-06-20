@@ -60,15 +60,23 @@ var genuineServiceWitness = &serviceWitness{}
 // OperatorScope is the capability the operator ingress holds. Operator-only methods
 // (kill-switch RevokeOne/RevokeAll, denylist edit, quota override, force-kill
 // destroy) take it as a REQUIRED parameter, so a gateway caller — which can obtain
-// no value of it — cannot even FORM a call to them. Its single field is UNEXPORTED
-// and a concrete *operatorWitness, so no package outside this one can build a
-// non-zero OperatorScope with a composite literal NOR convert a ServiceScope into
-// one; the only producer is OperatorSeam.Mint. The zero value is inert: Valid
+// no value of it — cannot even FORM a call to them. Both its fields are UNEXPORTED:
+// the witness is a concrete *operatorWitness, so no package outside this one can
+// build a non-zero OperatorScope with a composite literal NOR convert a ServiceScope
+// into one; the only producer is OperatorSeam.Mint. The zero value is inert: Valid
 // reports false for it, and every operator-only method asserts Valid before acting,
 // so a zero-value OperatorScope passed by reflection or an accidental struct copy
 // authorizes nothing.
+//
+// The id field carries the HOST-ATTESTED operator identity stamped at mint, so the
+// privileged-action audit trail records WHO acted (NFR-SEC-43): the audit actor is
+// always the host-attested operator (peer-cred for admin/CLI, SOAR principal for
+// SOAR), never a request-body hint. The identity is pure data carried alongside the
+// witness — it is NOT part of the capability seal: Valid never reads it, so a forged
+// scope carrying any identity is still invalid.
 type OperatorScope struct {
-	w *operatorWitness
+	w  *operatorWitness
+	id state.Identity
 }
 
 // Valid reports whether s is a genuine minted OperatorScope rather than the inert
@@ -77,9 +85,19 @@ type OperatorScope struct {
 // reachable solely through a seam NewOperatorSeam produced. A zero-value
 // OperatorScope (nil witness) and a scope minted from a zero-value OperatorSeam
 // (nil witness) both fail here. Operator-only methods call Valid before acting as
-// the runtime backstop to the compile-time seal.
+// the runtime backstop to the compile-time seal. It keys ONLY on the sealed witness
+// pointer and never reads the stamped identity, so the identity is not part of the
+// seal — a forged scope carrying any identity still fails here.
 func (s OperatorScope) Valid() bool {
 	return s.w == genuineOperatorWitness
+}
+
+// Identity returns the host-attested operator identity stamped onto the scope at
+// mint. The kill-switch Engine reads it to record the audit actor (actor.user = who
+// acted) for every privileged operator action. The inert zero-value scope reports
+// the zero Identity, matching its invalid witness.
+func (s OperatorScope) Identity() state.Identity {
+	return s.id
 }
 
 // ServiceScope is the capability the gateway ingress holds. Service methods
@@ -122,15 +140,19 @@ func NewOperatorSeam() OperatorSeam {
 	return OperatorSeam{mint: genuineOperatorWitness}
 }
 
-// Mint produces an OperatorScope from the seam's witness. Minting requires
-// POSSESSING an OperatorSeam (it is a method on the seam value), so the capability
-// is strictly by-possession: a package that holds no seam has no way to obtain a
-// scope, and the seam type is the gateway's compile barrier. A genuine seam carries
-// the sealed witness, so the minted scope passes Valid; a forged zero-value seam
-// carries a nil witness, so the minted scope fails Valid (defense in depth behind
-// the compile barrier).
-func (s OperatorSeam) Mint() OperatorScope {
-	return OperatorScope{w: s.mint}
+// Mint produces an OperatorScope from the seam's witness, stamping it with the
+// host-attested operator identity the resolver derived. Minting requires POSSESSING
+// an OperatorSeam (it is a method on the seam value), so the capability is strictly
+// by-possession: a package that holds no seam has no way to obtain a scope, and the
+// seam type is the gateway's compile barrier. A genuine seam carries the sealed
+// witness, so the minted scope passes Valid; a forged zero-value seam carries a nil
+// witness, so the minted scope fails Valid (defense in depth behind the compile
+// barrier). The identity is pure DATA carried alongside the witness — it is copied
+// onto the scope but never consulted by Valid, so passing any identity through a
+// forged seam still yields an invalid scope; the seal is the witness, not the
+// identity.
+func (s OperatorSeam) Mint(identity state.Identity) OperatorScope {
+	return OperatorScope{w: s.mint, id: identity}
 }
 
 // ServiceScopeFor mints a ServiceScope stamped with the sealed service witness. No

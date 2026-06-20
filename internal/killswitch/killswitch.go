@@ -105,11 +105,16 @@ func (e *Engine) RevokeOne(ctx context.Context, scope ingress.OperatorScope, key
 	}
 
 	// Audit FIRST, fail-closed: the record must be durable before the deny is
-	// authored. A write failure denies the revoke and authors nothing.
+	// authored. A write failure denies the revoke and authors nothing. The audit
+	// actor (actor.user) is WHO ACTED — the host-attested operator stamped onto the
+	// scope at mint (peer-cred for admin/CLI, SOAR principal for SOAR), never a
+	// request-body hint (NFR-SEC-43).
 	rec := audit.Record{
 		Action:  audit.ActionRevokeOne,
 		Channel: ingress.ChannelOperator.String(),
 		Key:     key,
+		Caller:  scope.Identity().Caller,
+		Tenant:  scope.Identity().Tenant,
 		Reason:  reason,
 	}
 	if err := e.audit.Emit(ctx, rec); err != nil {
@@ -153,10 +158,13 @@ func (e *Engine) RevokeAll(ctx context.Context, scope ingress.OperatorScope, rea
 
 	// Audit FIRST, fail-closed: a DENY-ALL is the most privileged op; its record must
 	// be durable before the posture is engaged. The Key is empty (this targets every
-	// session, not one).
+	// session, not one). The audit actor (actor.user) is WHO ACTED — the host-attested
+	// operator stamped onto the scope at mint, never a request-body hint (NFR-SEC-43).
 	rec := audit.Record{
 		Action:  audit.ActionRevokeAll,
 		Channel: ingress.ChannelOperator.String(),
+		Caller:  scope.Identity().Caller,
+		Tenant:  scope.Identity().Tenant,
 		Reason:  reason,
 	}
 	if err := e.audit.Emit(ctx, rec); err != nil {
@@ -259,11 +267,15 @@ func (e *Engine) LiftDeny(ctx context.Context, scope ingress.OperatorScope, key,
 	}
 
 	// Audit FIRST, fail-closed: the edit's record must be durable before the deny is
-	// lifted. A write failure denies the edit and clears nothing.
+	// lifted. A write failure denies the edit and clears nothing. The audit actor
+	// (actor.user) is WHO ACTED — the host-attested operator stamped onto the scope at
+	// mint, never a request-body hint (NFR-SEC-43).
 	rec := audit.Record{
 		Action:  audit.ActionEditDenylist,
 		Channel: ingress.ChannelOperator.String(),
 		Key:     key,
+		Caller:  scope.Identity().Caller,
+		Tenant:  scope.Identity().Tenant,
 		Reason:  reason,
 	}
 	if err := e.audit.Emit(ctx, rec); err != nil {
@@ -294,13 +306,17 @@ func (e *Engine) OverrideQuota(ctx context.Context, scope ingress.OperatorScope,
 	}
 
 	// Audit FIRST, fail-closed: the override's record must be durable before any
-	// counter moves. The audit Key carries the dimension for correlation; the
-	// identity rides the Caller/Tenant fields.
+	// counter moves. The audit actor (actor.user) is WHO ACTED — the host-attested
+	// OPERATOR who issued the override (scope.Identity), NOT the quota TARGET
+	// (key.Identity, the tenant whose counter moves). The target is the OBJECT of the
+	// action, not its subject; stamping it as the actor would mislabel the override's
+	// author as its victim. The Charge below still targets key, so the target cell is
+	// correct; only the audit actor source is the operator (NFR-SEC-43).
 	rec := audit.Record{
 		Action:  audit.ActionOverrideQuota,
 		Channel: ingress.ChannelOperator.String(),
-		Caller:  key.Identity.Caller,
-		Tenant:  key.Identity.Tenant,
+		Caller:  scope.Identity().Caller,
+		Tenant:  scope.Identity().Tenant,
 		Reason:  reason,
 	}
 	if err := e.audit.Emit(ctx, rec); err != nil {
@@ -322,8 +338,12 @@ func (e *Engine) OverrideQuota(ctx context.Context, scope ingress.OperatorScope,
 // CLI channels authenticate at the operator ingress instead, so every channel is
 // authenticated before authoring a revoke.
 type SOARVerifier interface {
-	// Verify returns nil only when sig is a valid signature over payload from the
-	// SOAR principal; any other outcome returns ErrSOARUnverified (or a wrapped
-	// cause). The context is first per repo convention.
-	Verify(ctx context.Context, payload, sig []byte) error
+	// Verify returns the verified SOAR PRINCIPAL identity and a nil error only when
+	// sig is a valid signature over payload from that principal; any other outcome
+	// returns the zero Identity and ErrSOARUnverified (or a wrapped cause). The
+	// principal is the AUTHORITY for a SOAR-driven revoke (P2-R2): it — not the
+	// unix-socket peer that delivered the webhook — is the audit actor, so the
+	// operator adapter mints the OperatorScope with this identity. The context is
+	// first per repo convention.
+	Verify(ctx context.Context, payload, sig []byte) (state.Identity, error)
 }

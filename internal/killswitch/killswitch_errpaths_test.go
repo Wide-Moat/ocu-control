@@ -135,7 +135,7 @@ func newFaultEngine(t *testing.T) (*killswitch.Engine, *faultStore, *audit.Recor
 	cust := registry.NewCustodian(fs)
 	sink := audit.NewRecordingFake()
 	eng := killswitch.NewEngine(fs, cust, &faultProvider{}, clk, sink)
-	scope := ingress.NewOperatorSeam().Mint()
+	scope := ingress.NewOperatorSeam().Mint(operatorID)
 	return eng, fs, sink, scope
 }
 
@@ -242,7 +242,7 @@ func TestRevokeAllForceKillRowError(t *testing.T) {
 	sink := audit.NewRecordingFake()
 	provider := &faultProvider{forceKillErr: errInjected}
 	eng := killswitch.NewEngine(fs, cust, provider, clk, sink)
-	scope := ingress.NewOperatorSeam().Mint()
+	scope := ingress.NewOperatorSeam().Mint(operatorID)
 	ctx := context.Background()
 
 	// Seed a live RESERVED row so the sweep has something to force-kill.
@@ -297,7 +297,7 @@ func TestRevokeAllEnumerationUnsupported(t *testing.T) {
 	cust := registry.NewCustodian(bare)
 	sink := audit.NewRecordingFake()
 	eng := killswitch.NewEngine(bare, cust, &faultProvider{}, clk, sink)
-	scope := ingress.NewOperatorSeam().Mint()
+	scope := ingress.NewOperatorSeam().Mint(operatorID)
 
 	err := eng.RevokeAll(context.Background(), scope, "incident")
 	if !errors.Is(err, registry.ErrEnumerationUnsupported) {

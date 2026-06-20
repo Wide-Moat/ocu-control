@@ -165,10 +165,13 @@ func (h *Handlers) Destroy(ctx context.Context, conn ingress.ConnInfo, sessionHi
 // caller can reach none of this: it holds no seam, so the Mint below would not
 // compile in its package.
 func (h *Handlers) RevokeOne(ctx context.Context, conn ingress.ConnInfo, key, reason string) error {
-	if _, err := h.resolveCaller(ctx, conn); err != nil {
+	caller, err := h.resolveCaller(ctx, conn)
+	if err != nil {
 		return err
 	}
-	scope := h.seam.Mint()
+	// The host-attested socket peer IS the operator for the admin/CLI channel, so the
+	// scope is stamped with caller.Identity — the audit actor is WHO ACTED.
+	scope := h.seam.Mint(caller.Identity)
 	return h.engine.RevokeOne(ctx, scope, key, reason)
 }
 
@@ -176,10 +179,13 @@ func (h *Handlers) RevokeOne(ctx context.Context, conn ingress.ConnInfo, key, re
 // As with RevokeOne the admin/CLI channel authenticates via the attested operator
 // socket and the scope is minted from the held seam after attestation.
 func (h *Handlers) RevokeAll(ctx context.Context, conn ingress.ConnInfo, reason string) error {
-	if _, err := h.resolveCaller(ctx, conn); err != nil {
+	caller, err := h.resolveCaller(ctx, conn)
+	if err != nil {
 		return err
 	}
-	scope := h.seam.Mint()
+	// The attested socket peer is the operator for the admin/CLI channel; the scope
+	// carries caller.Identity as the audit actor.
+	scope := h.seam.Mint(caller.Identity)
 	return h.engine.RevokeAll(ctx, scope, reason)
 }
 
@@ -218,10 +224,13 @@ func (h *Handlers) RevokeAllViaSOAR(ctx context.Context, conn ingress.ConnInfo, 
 // admin/CLI channel authenticates via the attested socket and the scope is minted
 // from the held seam.
 func (h *Handlers) LiftDeny(ctx context.Context, conn ingress.ConnInfo, key, reason string) error {
-	if _, err := h.resolveCaller(ctx, conn); err != nil {
+	caller, err := h.resolveCaller(ctx, conn)
+	if err != nil {
 		return err
 	}
-	scope := h.seam.Mint()
+	// The attested socket peer is the operator for the admin/CLI channel; the scope
+	// carries caller.Identity as the audit actor.
+	scope := h.seam.Mint(caller.Identity)
 	return h.engine.LiftDeny(ctx, scope, key, reason)
 }
 
@@ -229,10 +238,14 @@ func (h *Handlers) LiftDeny(ctx context.Context, conn ingress.ConnInfo, key, rea
 // atomic Charge. The admin/CLI channel authenticates via the attested socket; the
 // scope is minted from the held seam.
 func (h *Handlers) OverrideQuota(ctx context.Context, conn ingress.ConnInfo, key state.QuotaKey, delta, limit int64, reason string) error {
-	if _, err := h.resolveCaller(ctx, conn); err != nil {
+	caller, err := h.resolveCaller(ctx, conn)
+	if err != nil {
 		return err
 	}
-	scope := h.seam.Mint()
+	// The attested socket peer is the OPERATOR who issued the override; the scope
+	// carries caller.Identity as the audit actor (actor.user = who acted), distinct
+	// from the quota TARGET in key that the Engine charges.
+	scope := h.seam.Mint(caller.Identity)
 	return h.engine.OverrideQuota(ctx, scope, key, delta, limit, reason)
 }
 
