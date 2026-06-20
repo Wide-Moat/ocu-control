@@ -147,8 +147,13 @@ func Test_run_CleanBoot_BindsThenServes(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "jwt.key")
 	writeTestKey(t, keyPath)
+	// The operator socket lives under a short OS-temp path, not the (potentially
+	// ~110-byte) t.TempDir(): a Unix socket path over the ~104-byte sockaddr_un
+	// sun_path limit fails to bind with "invalid argument" on darwin and any
+	// long-TMPDIR host, which would make this serving smoke red off CI.
+	sockPath := shortSocketPath(t)
 	args := []string{
-		"-operator-listen", "unix://" + filepath.Join(dir, "operator.sock"),
+		"-operator-listen", "unix://" + sockPath,
 		"-gateway-listen", "127.0.0.1:0",
 		"-runtime-tier", "runc",
 		"-runtime-provider", "docker",
