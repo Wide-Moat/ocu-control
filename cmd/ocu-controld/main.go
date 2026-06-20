@@ -302,6 +302,12 @@ func serve(ctx context.Context, cfg config) error {
 			_ = opListener.Close()
 			return err
 		}
+		// Both listeners are bound and accepting: tell systemd the unit is ready.
+		// This is the last step of the readiness hook, so READY=1 is sent only on a
+		// clean boot — a bind failure above returns before this line and the daemon
+		// never reports ready (under Type=notify systemd then times the start out, as
+		// the unit intends). A no-op when not run under systemd.
+		notifyReady()
 		return nil
 	})
 
@@ -460,7 +466,11 @@ func serveListeners(ctx context.Context, op *operator.Listener, gw *gateway.List
 	select {
 	case <-ctx.Done():
 		// Signal-driven stop: not an error. Both loops are still running; the bounded
-		// drain below waits for them after closeBoth.
+		// drain below waits for them after closeBoth. Tell systemd the graceful stop
+		// has begun BEFORE the listeners finish draining — exactly once, and only on a
+		// host-initiated SIGINT/SIGTERM, never on the serve-error arm below (a crash is
+		// not a graceful stop). A no-op when not run under systemd.
+		notifyStopping()
 	case serveErr = <-errCh:
 		// A serve loop failed (or cleanly exited) before any signal; one goroutine has
 		// already reported, so only the other remains to drain.
