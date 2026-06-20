@@ -573,6 +573,92 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		}
 	})
 
+	t.Run("LiveSessions returns exactly the RESERVED and ACTIVE rows, never RELEASED", func(t *testing.T) {
+		// LiveSessions is the optional live-enumeration capability the boot reconciler
+		// and the kill-switch force-kill-every step drive (registry.LiveLister). It is
+		// asserted here against the same state.Store both legs build, so the in-memory
+		// leg and the Postgres leg are held to one snapshot contract: the live set is
+		// exactly the RESERVED+ACTIVE rows, and a RELEASED tombstone is excluded so a
+		// reconciler never tries to reclaim capacity already returned.
+		s := newFixture()
+		lister, ok := s.(liveLister)
+		if !ok {
+			t.Fatalf("Store %T does not implement LiveSessions: the boot reconciler cannot enumerate live rows, so a healthy host dies at boot", s)
+		}
+
+		// k-reserved stays RESERVED; k-active is committed to ACTIVE; k-released is
+		// reserved then released to the tombstone. Only the first two are live.
+		mustReserve(ctx, t, s, "k-reserved", owner)
+		mustReserve(ctx, t, s, "k-active", owner)
+		mustCommit(ctx, t, s, "k-active", owner)
+		mustReserve(ctx, t, s, "k-released", owner)
+		mustRelease(ctx, t, s, "k-released", owner)
+
+		live, err := lister.LiveSessions(ctx)
+		if err != nil {
+			t.Fatalf("LiveSessions: unexpected error %v", err)
+		}
+
+		byKey := make(map[string]state.SessionRow, len(live))
+		for _, row := range live {
+			if _, dup := byKey[row.Key]; dup {
+				t.Fatalf("LiveSessions returned a duplicate row for key %q", row.Key)
+			}
+			byKey[row.Key] = row
+		}
+		if len(byKey) != 2 {
+			t.Fatalf("LiveSessions: want exactly 2 live rows (RESERVED+ACTIVE), got %d (%+v)", len(byKey), live)
+		}
+		if r, ok := byKey["k-reserved"]; !ok || r.State != state.StateReserved {
+			t.Fatalf("LiveSessions must include the RESERVED row k-reserved, got %+v", live)
+		}
+		if r, ok := byKey["k-active"]; !ok || r.State != state.StateActive {
+			t.Fatalf("LiveSessions must include the ACTIVE row k-active, got %+v", live)
+		}
+		if _, ok := byKey["k-released"]; ok {
+			t.Fatalf("LiveSessions must EXCLUDE the RELEASED tombstone k-released, got %+v", live)
+		}
+		// The returned rows carry the host-derived owner so the reconciler can release
+		// a crashed RESERVED row by its own identity without a re-derivation.
+		if got := byKey["k-reserved"]; got.Owner != owner {
+			t.Fatalf("LiveSessions row must carry the host-derived owner: want %v, got %v", owner, got.Owner)
+		}
+	})
+
+	t.Run("LiveSessions on a store with no live rows is the empty set, not an error", func(t *testing.T) {
+		// A clean host (no reservations, or only released tombstones) must enumerate
+		// to the empty set with a nil error, so the boot reconciler proceeds to bind
+		// rather than treating "no orphans" as a failure.
+		s := newFixture()
+		lister, ok := s.(liveLister)
+		if !ok {
+			t.Fatalf("Store %T does not implement LiveSessions", s)
+		}
+		mustReserve(ctx, t, s, "gone", owner)
+		mustRelease(ctx, t, s, "gone", owner)
+
+		live, err := lister.LiveSessions(ctx)
+		if err != nil {
+			t.Fatalf("LiveSessions on a clean host: unexpected error %v", err)
+		}
+		if len(live) != 0 {
+			t.Fatalf("LiveSessions with only a RELEASED tombstone: want the empty set, got %+v", live)
+		}
+	})
+
+	t.Run("LiveSessions on a cancelled context fails closed with ErrStoreUnavailable", func(t *testing.T) {
+		s := newFixture()
+		lister, ok := s.(liveLister)
+		if !ok {
+			t.Fatalf("Store %T does not implement LiveSessions", s)
+		}
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := lister.LiveSessions(cancelled); !errors.Is(err, state.ErrStoreUnavailable) {
+			t.Fatalf("LiveSessions on cancelled ctx: want ErrStoreUnavailable, got %v", err)
+		}
+	})
+
 	t.Run("a cancelled context fails closed with ErrStoreUnavailable", func(t *testing.T) {
 		s := newFixture()
 		cancelled, cancel := context.WithCancel(context.Background())
@@ -614,6 +700,18 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 			t.Fatalf("ReadQuota on cancelled ctx: want ErrStoreUnavailable, got %v", err)
 		}
 	})
+}
+
+// liveLister is the optional live-session enumeration capability the boot
+// reconciler and the kill-switch force-kill-every step drive (mirroring
+// registry.LiveLister). The conformance suite asserts both Store legs satisfy it
+// rather than importing the registry package, so the one behavioural contract —
+// the live set is exactly the RESERVED+ACTIVE rows — is held in the shared suite
+// where every leg already runs. The signature MUST match the production
+// LiveSessions method so a leg that drifts (a wrong return shape) stops satisfying
+// the type assertion and the suite fails loudly.
+type liveLister interface {
+	LiveSessions(ctx context.Context) ([]state.SessionRow, error)
 }
 
 // mustReserve reserves key for owner and fails the test on any error.

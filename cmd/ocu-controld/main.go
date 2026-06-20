@@ -27,7 +27,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
@@ -88,7 +90,22 @@ var (
 )
 
 func main() {
-	if err := run(context.Background(), os.Args[1:]); err != nil {
+	// The root context is cancelled on SIGINT/SIGTERM, so a host-initiated daemon
+	// stop unwinds the serve loops, runs the deferred listener Close (unlinking the
+	// operator socket), and returns cleanly. This is the HOST-side daemon stop —
+	// distinct from the per-session runtime finalizer, which runs below the seam
+	// under context.WithoutCancel and is never cancelled by this signal. The
+	// kill-switch-first boot ordering and the bind-after-ready invariant are
+	// untouched: the signal only cancels the serve phase that runs strictly AFTER a
+	// successful Boot.
+	//
+	// stop() is called BEFORE os.Exit (not via defer): a deferred call does not run
+	// after os.Exit, so the signal handler is unregistered explicitly on both the
+	// clean and the error path.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	err := run(ctx, os.Args[1:])
+	stop()
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "ocu-controld:", err)
 		os.Exit(1)
 	}
@@ -190,7 +207,11 @@ func serve(ctx context.Context, cfg config) error {
 		return fmt.Errorf("boot: load storage-jwt signer: %w", err)
 	}
 
-	provider, err := providerOf(cfg.runtimeProvider, tier, revoker)
+	// The docker finalizer step 3 scrubs the per-session handoff root under the SAME
+	// base the handoff Stager (compose, below) writes under, so the host-owned
+	// credential tree is reclaimed on teardown. The base is a deployment-fixed host
+	// config value, never a per-request body field.
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase)
 	if err != nil {
 		return err
 	}
@@ -224,7 +245,17 @@ func serve(ctx context.Context, cfg config) error {
 	// posture durable" structural, not incidental.
 	seq.SetOnReady(func(hookCtx context.Context) error {
 		if err := mgr.Reconcile(hookCtx); err != nil {
-			return fmt.Errorf("boot: reconcile orphans: %w", err)
+			// Belt-and-braces fence on top of the two shipped LiveSessions impls: if
+			// the bound Store somehow does not support live-session enumeration, the
+			// orphan-reclaim sweep cannot run, but a daemon on a host with no orphans
+			// must still reach a serving state. Skip the reclaim with a loud WARN in
+			// that single case ONLY; EVERY other reconcile error stays fail-closed (a
+			// real substrate or store fault must never bind a half-reconciled daemon).
+			if errors.Is(err, registry.ErrEnumerationUnsupported) {
+				fmt.Fprintln(os.Stderr, "ocu-controld: WARNING: state store does not support live-session enumeration; skipping orphan reclaim (NFR-SEC-01: no new authority granted, but crashed RESERVED rows are not reclaimed this boot)")
+			} else {
+				return fmt.Errorf("boot: reconcile orphans: %w", err)
+			}
 		}
 		if err := opListener.Bind(); err != nil {
 			return err
@@ -329,27 +360,69 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 	return mgr, eng
 }
 
-// serveListeners runs both bound listeners until ctx is cancelled, returning the
-// first serve error. A clean ctx-driven shutdown returns nil. It closes both
-// listeners on exit so neither socket survives the daemon.
-func serveListeners(ctx context.Context, op *operator.Listener, gw *gateway.Listener) error {
-	defer func() {
-		_ = op.Close()
-		_ = gw.Close()
-	}()
+// drainTimeout bounds how long serveListeners waits for both Serve loops to
+// unwind after a signal-driven ctx cancel before it closes the listeners and
+// returns anyway. A wedged Serve goroutine can never strand the daemon stop: the
+// deferred Close runs and the process exits regardless. It is generous because a
+// clean drain is near-instant (each Serve closes its own *http.Server on
+// ctx.Done) and the bound exists only as a backstop.
+const drainTimeout = 10 * time.Second
 
+// serveListeners runs both bound listeners until ctx is cancelled or a Serve loop
+// errors. A SIGINT/SIGTERM cancels ctx, both Serve loops unwind, and this returns
+// nil (a signal stop is not an error); a Serve error before any signal is
+// returned as-is. On EITHER exit it closes both listeners — operator first, so the
+// privileged socket is unlinked before the gateway port is released — so neither
+// socket survives the daemon, and it waits (bounded by drainTimeout) for both
+// Serve goroutines to finish so the close ordering is observable rather than racing
+// the goroutines' own teardown.
+func serveListeners(ctx context.Context, op *operator.Listener, gw *gateway.Listener) error {
 	errCh := make(chan error, 2)
 	go func() { errCh <- op.Serve(ctx) }()
 	go func() { errCh <- gw.Serve(ctx) }()
 
-	// Return the first non-nil serve error (or nil on a clean shutdown of the first
-	// listener to exit); the deferred Close stops the other.
+	closeBoth := func() {
+		// Operator-first teardown: the privileged Unix socket is unlinked before the
+		// gateway TCP port is released, mirroring the bind ordering (operator before
+		// gateway) so a restart re-binds the operator plane cleanly.
+		_ = op.Close()
+		_ = gw.Close()
+	}
+
+	// Wait for the first event: a clean ctx-driven shutdown (the signal path) or the
+	// first non-nil serve error. On the signal path the Serve loops are already
+	// unwinding (each closes its own server on ctx.Done); on the error path the
+	// other loop is stopped by closeBoth.
+	var (
+		serveErr error
+		drained  int // Serve goroutines that have already returned a value.
+	)
 	select {
 	case <-ctx.Done():
-		return nil
-	case err := <-errCh:
-		return err
+		// Signal-driven stop: not an error. Both loops are still running; the bounded
+		// drain below waits for them after closeBoth.
+	case serveErr = <-errCh:
+		// A serve loop failed (or cleanly exited) before any signal; one goroutine has
+		// already reported, so only the other remains to drain.
+		drained = 1
 	}
+
+	// Stop accepting on both listeners, then wait (bounded) for the remaining Serve
+	// goroutines to return so the drain is complete before the daemon exits.
+	closeBoth()
+	drain, cancel := context.WithTimeout(context.WithoutCancel(ctx), drainTimeout)
+	defer cancel()
+	for drained < 2 {
+		select {
+		case <-errCh:
+			drained++
+		case <-drain.Done():
+			// A wedged Serve goroutine must not strand the daemon stop: both listeners
+			// are already closed, so return regardless.
+			return serveErr
+		}
+	}
+	return serveErr
 }
 
 // handoffBase is the host-owned directory under which the handoff Stager writes
@@ -505,13 +578,18 @@ func workloadProfileOf(s string) (admission.WorkloadProfile, error) {
 // -runtime-provider string, bound to the deployment-wide tier. docker builds the
 // real env-configured Docker provider; k8s returns the (NotImplemented) k8s
 // provider. The tier is fixed at construction and can never be weakened by a
-// request.
-func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker) (runtime.RuntimeProvider, error) {
+// request. stagerBase is the deployment-fixed handoff root the docker finalizer
+// step 3 scrubs (base/<SessionName>); it is the SAME base the handoff.Stager is
+// constructed with, so teardown re-derives the credential-bearing handoff tree
+// purely from the host-derived SessionName.
+func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, stagerBase string) (runtime.RuntimeProvider, error) {
 	switch name {
 	case "docker":
 		// The shared Revoker is the below-seam finalizer step-1 (revoke session JWT)
-		// target; the same instance the Signer records mints against.
-		p, err := docker.NewDockerProvider(tier, docker.Deps{Revoker: revoker})
+		// target; the same instance the Signer records mints against. StagerBase is the
+		// finalizer step-3 (handoff-root scrub) base — the SAME path the handoff Stager
+		// writes under, so teardown reclaims the host-owned credential tree.
+		p, err := docker.NewDockerProvider(tier, docker.Deps{Revoker: revoker, StagerBase: stagerBase})
 		if err != nil {
 			return nil, fmt.Errorf("boot: construct docker provider: %w", err)
 		}

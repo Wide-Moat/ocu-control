@@ -121,12 +121,24 @@ type Revoker interface {
 
 // Provider is the Docker RuntimeProvider. It holds the SDK behind the dockerAPI
 // seam and the deployment-wide isolation tier it was constructed bound to (the
-// tier is not per-request — requirement 5). It owns NO session state; teardown
-// re-derives every resource name purely from the Sandbox's SessionName.
+// tier is not per-request — requirement 5). It owns NO per-session state; teardown
+// re-derives every resource name purely from the Sandbox's SessionName, including
+// the host-owned handoff root the finalizer scrubs in step 3, which is a pure
+// function of SessionName under the deployment-fixed stagerBase.
 type Provider struct {
-	api     dockerAPI
-	tier    runtime.RuntimeTier
+	api  dockerAPI
+	tier runtime.RuntimeTier
+	// revoker is the below-seam Storage-JWT revocation index finalizer step 1
+	// targets. nil leaves step 1 a host-side no-op (the step still runs in order).
 	revoker Revoker
+	// stagerBase is the deployment-fixed host directory under which the create-path
+	// handoff stager writes each per-session 0700 root (base/<SessionName>). It is a
+	// PROVIDER CONSTRUCTION value — never a per-request body field (NFR-SEC-43) — so
+	// finalizer step 3 (zeroTmpfs) re-derives base/<sess.Name> purely from the
+	// host-derived SessionName and scrubs the credential-bearing tree. An empty
+	// stagerBase (the minimal shelf where no handoff base is wired) leaves step 3 a
+	// host-side no-op, exactly as a nil revoker leaves step 1.
+	stagerBase string
 }
 
 var (
@@ -147,6 +159,14 @@ type Deps struct {
 	// calls. nil leaves step-1 the prior host-side no-op (the step still runs in
 	// order); the daemon wires the shared *cred.Revoker here.
 	Revoker Revoker
+	// StagerBase is the deployment-fixed host directory under which the create-path
+	// handoff stager writes each per-session 0700 root. The daemon wires the SAME
+	// base it constructs the handoff.Stager with, so finalizer step 3 (zeroTmpfs)
+	// scrubs base/<SessionName> — the host-owned credential-bearing handoff tree. It
+	// is a provider-construction value, NEVER a per-request body field (NFR-SEC-43).
+	// Empty leaves step 3 a host-side no-op (the minimal shelf), exactly as a nil
+	// Revoker leaves step 1.
+	StagerBase string
 }
 
 // NewDockerProvider builds the Docker provider bound to the deployment-wide
@@ -163,7 +183,7 @@ func NewDockerProvider(tier runtime.RuntimeTier, deps Deps) (*Provider, error) {
 		}
 		api = cli
 	}
-	return &Provider{api: api, tier: tier, revoker: deps.Revoker}, nil
+	return &Provider{api: api, tier: tier, revoker: deps.Revoker, stagerBase: deps.StagerBase}, nil
 }
 
 // networkName is the pure function from session name to per-session bridge name,

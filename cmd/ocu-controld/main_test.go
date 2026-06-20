@@ -10,6 +10,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/cred"
+	"github.com/Wide-Moat/ocu-control/internal/ingress/gateway"
+	"github.com/Wide-Moat/ocu-control/internal/ingress/operator"
 )
 
 // writeTestKey writes a valid Ed25519 PKCS8 signing key to path so the boot-time
@@ -219,6 +222,131 @@ func Test_run_BadSigningKeyFailsClosedBeforeBind(t *testing.T) {
 	if _, statErr := os.Stat(filepath.Join(dir, "operator.sock")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("a fail-closed signer-load abort left an operator socket (stat err=%v); want no socket", statErr)
 	}
+}
+
+// Test_serveListeners_SignalDrainsAndUnlinksSocket proves the HOST-side daemon-stop
+// drain: a cancelled root context (the SIGINT/SIGTERM path) makes serveListeners
+// stop accepting on both listeners, drain both Serve loops, and unlink the operator
+// Unix socket — returning nil (a signal stop is not an error). Before the fix the
+// root context was never cancelled, so the Serve loops never drained and the socket
+// was never unlinked. This exercises serveListeners directly so it needs no Docker
+// daemon for the orphan sweep.
+func Test_serveListeners_SignalDrainsAndUnlinksSocket(t *testing.T) {
+	t.Parallel()
+	sock := shortSocketPath(t)
+
+	op := operator.NewListener(sock, operator.Deps{})
+	gw := gateway.NewListener("127.0.0.1:0", gateway.Deps{})
+	if err := op.Bind(); err != nil {
+		t.Fatalf("operator Bind: %v", err)
+	}
+	if err := gw.Bind(); err != nil {
+		t.Fatalf("gateway Bind: %v", err)
+	}
+
+	// The operator socket exists while serving.
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("operator socket must exist after Bind: %v", err)
+	}
+	// The gateway TCP port is accepting connections while serving.
+	gwAddr := gw.Addr()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveListeners(ctx, op, gw) }()
+
+	// Give the Serve loops a moment to come up, prove the gateway is reachable, then
+	// cancel the root context (the signal path).
+	waitFor(t, func() bool {
+		c, err := net.DialTimeout("tcp", gwAddr, 200*time.Millisecond)
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	})
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveListeners on a cancelled (signal) context must return nil, got: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("serveListeners did not drain within 15s of ctx cancel")
+	}
+
+	// The operator socket is unlinked: the deferred Close ran on the signal path.
+	if _, err := os.Stat(sock); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("operator socket must be unlinked after a signal-driven drain (stat err=%v); want not-exist", err)
+	}
+	// The gateway port is released: a dial now fails.
+	if c, err := net.DialTimeout("tcp", gwAddr, 200*time.Millisecond); err == nil {
+		_ = c.Close()
+		t.Fatal("gateway port must be released after the drain; a dial still succeeded")
+	}
+}
+
+// Test_serveListeners_ServeErrorReturnsAndCloses proves the error path: when a Serve
+// loop fails before any signal, serveListeners returns that error AND still closes
+// both listeners (the operator socket is unlinked) so a failure leaves no half-open
+// listener. A never-bound operator listener makes op.Serve return immediately.
+func Test_serveListeners_ServeErrorReturnsAndCloses(t *testing.T) {
+	t.Parallel()
+	sock := shortSocketPath(t)
+
+	// op is bound (its socket exists); gw is NOT bound, so gw.Serve returns an error
+	// immediately, driving the error path of serveListeners.
+	op := operator.NewListener(sock, operator.Deps{})
+	gw := gateway.NewListener("127.0.0.1:0", gateway.Deps{})
+	if err := op.Bind(); err != nil {
+		t.Fatalf("operator Bind: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- serveListeners(context.Background(), op, gw) }()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("serveListeners with an unbound gateway must return the serve error, got nil")
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("serveListeners did not return within 15s on a serve error")
+	}
+
+	// Both listeners were closed on the error path: the operator socket is unlinked.
+	if _, err := os.Stat(sock); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("operator socket must be unlinked after a serve-error close (stat err=%v); want not-exist", err)
+	}
+}
+
+// shortSocketPath returns a Unix-socket path SHORT enough for the platform's
+// sun_path limit (~104 bytes on darwin), which a deeply-nested t.TempDir() path can
+// exceed. It creates a short-named dir directly under the OS temp root and removes
+// the whole tree on cleanup, so the bound socket never leaks.
+func shortSocketPath(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "ocu")
+	if err != nil {
+		t.Fatalf("mkdir short temp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return filepath.Join(dir, "op.sock")
+}
+
+// waitFor polls cond up to 5s, failing the test if it never becomes true. It lets a
+// drain test wait on a real readiness condition instead of a fixed sleep.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("condition not met within 5s")
 }
 
 // Test_run_Version returns the version with no boot.

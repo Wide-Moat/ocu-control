@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
@@ -97,7 +99,10 @@ func (t *teardown) finalize(parent context.Context, sess runtime.Sandbox, grace 
 	//    against the real Envoy SDS; the host-side route binding is dropped now.
 	step2DropEgress := t.dropEgress(base, sess.Egress)
 
-	// 3. Zero tmpfs/scratch (host reclamation of the per-session scratch).
+	// 3. Zero the host-owned per-session scratch: scrub the credential-bearing
+	//    handoff root (base/<sess.Name>) BEFORE the kill in step 5, so the weak
+	//    Storage-JWT mount-config and the rest of the handoff tree never outlive
+	//    the session on host disk (NFR-SEC-65).
 	step3ZeroTmpfs := t.zeroTmpfs(base, sess)
 
 	// 4. Unmount the data scope (host reclamation). Phase-4 TODO: unmount the real
@@ -159,14 +164,78 @@ func (t *teardown) dropEgress(_ context.Context, _ runtime.EgressBinding) error 
 	return nil
 }
 
-// zeroTmpfs is finalizer step 3: zero the per-session tmpfs/scratch. Under Docker
-// the bounded /tmp tmpfs is destroyed with the container at force-remove (step 5),
-// so the host-side scratch reclamation is satisfied by that removal; this step is
-// the explicit ordered placeholder for any scratch the host owns outside the
-// container's own tmpfs. The step EXISTS and runs in order now.
-func (t *teardown) zeroTmpfs(_ context.Context, _ runtime.Sandbox) error {
-	// TODO(phase-4): zero any host-owned scratch outside the container tmpfs. The
-	// container's own /tmp tmpfs is reclaimed by the force-remove in step 5.
+// zeroTmpfs is finalizer step 3: scrub the host-owned per-session scratch OUTSIDE
+// the container's own tmpfs. The container's bounded /tmp tmpfs is reclaimed by
+// the force-remove in step 5, but the create-path handoff stager wrote a 0700
+// host-owned root (base/<SessionName>) holding container_info.json, the pushed
+// mount-config that CARRIES the weak Storage-JWT, and the 0700 sock dir. That tree
+// is exactly the host-owned scratch this step zeroes, so the credential-bearing
+// files never outlive the session on host disk.
+//
+// It re-derives the root PURELY from sess.Name under the provider's deployment-fixed
+// stagerBase (base/<sess.Name>) — the SAME provenance networkName(sess.Name)/
+// containerName(sess.Name) use, and the SAME path handoff.Stager builds (its SockDir
+// is base/<name>/sock) — so the step takes no body hint and needs no provider
+// per-session state (requirement 5, NFR-SEC-43). An empty stagerBase (the minimal
+// shelf where no handoff base is wired) leaves the step a host-side no-op, exactly
+// as a nil revoker leaves step 1.
+//
+// It is IDEMPOTENT and proves STRICT ZERO-RESIDUE because this is a CREDENTIAL
+// scrub: it removes the tree recursively, then re-stats the path. An already-gone
+// root (os.RemoveAll succeeds, the path does not exist) is a satisfied no-op on ANY
+// input state — full handoff root, partially-torn-down, already-empty, or absent.
+// But if ANYTHING remains after the recursive removal (a race with another writer
+// re-creating a file), that is a FINALIZER ERROR collected into the errors.Join, NOT
+// a swallowed no-op — a credential file that survived the scrub must surface.
+func (t *teardown) zeroTmpfs(base context.Context, sess runtime.Sandbox) error {
+	if t.p.stagerBase == "" {
+		// No handoff base wired (the minimal shelf): nothing host-owned to scrub. The
+		// step still runs in order; it is simply a no-op here.
+		return nil
+	}
+	_ = base // the scrub is a local-filesystem operation; the ctx is unused but the
+	// step keeps the shared finalizer signature so its ordering is uniform.
+
+	// Re-derive the per-session handoff root purely from the host-derived SessionName
+	// under the deployment-fixed base — the same join handoff.Stager uses, so the
+	// finalizer and the create path agree on the path without the row persisting it.
+	root := filepath.Join(t.p.stagerBase, string(sess.Name))
+	return scrubHandoffRoot(root)
+}
+
+// removeAll is the recursive-removal primitive scrubHandoffRoot drives, indirected
+// through a package var so an internal test can inject a remover that "succeeds"
+// without removing — the only way to deterministically exercise the strict
+// zero-residue branch (a writer racing the scrub), since a real TOCTOU race is not
+// reproducible. In production it is os.RemoveAll, never reassigned outside a test,
+// mirroring the handoff package's createTemp/chmod indirection.
+var removeAll = os.RemoveAll
+
+// scrubHandoffRoot removes the per-session handoff tree recursively and PROVES
+// strict zero-residue: this is a CREDENTIAL scrub, so it is not "rm -rf and ignore
+// the error". It removes the tree, then re-stats the path. An already-gone root
+// (os.RemoveAll succeeds and the path does not exist) is a satisfied no-op on ANY
+// input state — a full handoff root, a partially-torn-down one, an already-empty
+// one, or an absent one. A removal error is surfaced. And if ANYTHING remains after
+// the recursive removal (the path is still present), that is a FINALIZER ERROR — a
+// credential file that survived the scrub must surface into the finalizer's
+// errors.Join, never be swallowed.
+func scrubHandoffRoot(root string) error {
+	// Remove the whole tree recursively. os.RemoveAll treats an already-gone path as
+	// success, so a re-run (or a never-staged session) is an idempotent no-op.
+	if err := removeAll(root); err != nil {
+		return fmt.Errorf("docker: scrub handoff root %q: %w", root, err)
+	}
+
+	// STRICT ZERO-RESIDUE: after the recursive removal the path must hold EXACTLY
+	// zero files. Re-stat: an os.ErrNotExist is the satisfied state (the credential
+	// tree is gone). Anything else — the path still present, or a stat fault — is a
+	// finalizer error, never a swallowed no-op.
+	if _, err := os.Lstat(root); err == nil {
+		return fmt.Errorf("docker: handoff root %q still present after scrub: %w", root, runtime.ErrTeardown)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("docker: verify handoff root %q scrubbed: %w", root, err)
+	}
 	return nil
 }
 

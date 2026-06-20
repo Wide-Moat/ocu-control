@@ -372,6 +372,51 @@ func (s *store) LookupSession(ctx context.Context, key string) (state.SessionRow
 	return row, nil
 }
 
+// LiveSessions returns every reservation row currently in StateReserved or
+// StateActive — the live set the boot reconciler reclaims from and the
+// kill-switch force-kill-every step enumerates. It is the optional
+// live-enumeration capability the registry.LiveLister seam type-asserts the Store
+// to; the frozen Store interface is not widened by it.
+//
+// It is a SNAPSHOT read: no advisory lock is taken (per the seam doc — the
+// reconciler tolerates a row mutating under it, since a now-RELEASED row it tries
+// to reclaim is an idempotent no-op). The SELECT keys on the same SMALLINT state
+// codes the rest of this file uses (int16(state.StateReserved) /
+// int16(state.StateActive)), so the enumeration shares one state<->column mapping
+// with Reserve/Commit/Release and cannot drift from them. Each row is
+// materialized through the SAME scanRow column set/order LookupSession uses
+// (key, owner_tenant, owner_caller, state, and the COALESCE of container_name to
+// the empty string); the durable reserved_at column is not part of the Go
+// SessionRow and is not
+// selected. A transient driver failure is wrapped state.ErrStoreUnavailable,
+// fail-closed, exactly as the other read paths wrap pgx errors.
+func (s *store) LiveSessions(ctx context.Context) ([]state.SessionRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, '')
+		 FROM sessions WHERE state IN ($1, $2)`,
+		int16(state.StateReserved), int16(state.StateActive))
+	if err != nil {
+		return nil, unavailable("live-sessions: query", err)
+	}
+	defer rows.Close()
+
+	live := make([]state.SessionRow, 0)
+	for rows.Next() {
+		row, serr := scanRow(rows)
+		if serr != nil {
+			// A row that scans to an out-of-range state, or a transient scan fault,
+			// is fail-closed evidence the reconciler must treat as a refusal, never
+			// a partial-and-trusted enumeration.
+			return nil, unavailable("live-sessions: scan", serr)
+		}
+		live = append(live, row)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, unavailable("live-sessions: iterate", err)
+	}
+	return live, nil
+}
+
 // SetDeny writes a durable deny entry and engages it immediately. Re-setting an
 // already-set scope/key is idempotent: the row is upserted with the new
 // operator context. The global kill-switch normalizes its key to empty so it

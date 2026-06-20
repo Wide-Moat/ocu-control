@@ -165,16 +165,75 @@ func TestLookupForCallerForeignOwnerIndistinguishable(t *testing.T) {
 	}
 }
 
-// TestReservedAndActiveKeysUnsupported proves the fail-closed branch: the frozen
-// in-memory Store does not implement LiveLister, so ReservedAndActiveKeys returns
-// ErrEnumerationUnsupported rather than an empty slice — RevokeAll must refuse
-// rather than claim it force-killed every row.
+// nonListerStore wraps a state.Store but does NOT promote LiveSessions: it embeds
+// the state.Store INTERFACE, whose method set carries no LiveSessions, so the
+// concrete *nonListerStore does not satisfy registry.LiveLister even though the
+// underlying value (the in-memory store) now does. It models a hypothetical Store
+// leg that has not opted into live enumeration, so the fail-closed branch stays
+// covered after both shipped legs grew the capability.
+type nonListerStore struct {
+	state.Store
+}
+
+// TestReservedAndActiveKeysUnsupported proves the fail-closed branch is intact for
+// a Store that does NOT implement LiveLister: ReservedAndActiveKeys returns
+// ErrEnumerationUnsupported rather than an empty slice, so RevokeAll refuses rather
+// than claiming it force-killed every row. Both SHIPPED legs (in-memory, Postgres)
+// now implement LiveSessions — that is proven by the store conformance suite — so
+// this case wraps the in-memory store in a non-promoting shim to keep the
+// fail-closed branch under test.
 func TestReservedAndActiveKeysUnsupported(t *testing.T) {
 	t.Parallel()
-	c, _ := newCustodian(t)
+	inner := state.NewInMemory(state.NewFakeClock(regStart))
+	c := registry.NewCustodian(&nonListerStore{Store: inner})
 	_, err := c.ReservedAndActiveKeys(context.Background())
 	if !errors.Is(err, registry.ErrEnumerationUnsupported) {
 		t.Fatalf("ReservedAndActiveKeys on non-enumerating Store: error %v, want ErrEnumerationUnsupported", err)
+	}
+}
+
+// TestReservedAndActiveKeysShippedInMemory proves the in-memory leg's LiveSessions
+// lights up ReservedAndActiveKeys with no change above the Custodian: a custodian
+// over the real shipped in-memory store enumerates the live RESERVED+ACTIVE rows
+// (not the ErrEnumerationUnsupported path the no-lister shim still exercises). This
+// is the boot-reconcile unblock — the daemon no longer dies on a healthy host.
+func TestReservedAndActiveKeysShippedInMemory(t *testing.T) {
+	t.Parallel()
+	c, store := newCustodian(t)
+	ctx := context.Background()
+	owner := state.Identity{Tenant: "t", Caller: "c"}
+
+	reserved := registry.DeriveKey(owner, "handle-reserved")
+	active := registry.DeriveKey(owner, "handle-active")
+	released := registry.DeriveKey(owner, "handle-released")
+	if _, err := c.Reserve(ctx, reserved, owner); err != nil {
+		t.Fatalf("Reserve reserved: %v", err)
+	}
+	if _, err := c.Reserve(ctx, active, owner); err != nil {
+		t.Fatalf("Reserve active: %v", err)
+	}
+	if _, err := c.Commit(ctx, active, owner); err != nil {
+		t.Fatalf("Commit active: %v", err)
+	}
+	if _, err := c.Reserve(ctx, released, owner); err != nil {
+		t.Fatalf("Reserve released: %v", err)
+	}
+	if _, err := c.Release(ctx, released, owner); err != nil {
+		t.Fatalf("Release released: %v", err)
+	}
+	_ = store
+
+	rows, err := c.ReservedAndActiveKeys(ctx)
+	if err != nil {
+		t.Fatalf("ReservedAndActiveKeys on the shipped in-memory store: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("ReservedAndActiveKeys: want 2 live rows (RESERVED+ACTIVE), got %d (%+v)", len(rows), rows)
+	}
+	for _, r := range rows {
+		if r.State == state.StateReleased {
+			t.Fatalf("ReservedAndActiveKeys must exclude the RELEASED tombstone, got %+v", rows)
+		}
 	}
 }
 

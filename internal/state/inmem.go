@@ -306,6 +306,39 @@ func (m *memStore) Release(ctx context.Context, key string, owner Identity) (Ses
 	return row, nil
 }
 
+// LiveSessions returns a snapshot of every reservation row currently in
+// StateReserved or StateActive — the live set the boot reconciler reclaims from
+// and the kill-switch force-kill-every step enumerates. It is the optional
+// live-enumeration capability the registry.LiveLister seam type-asserts the Store
+// to; the frozen Store interface is not widened by it.
+//
+// It takes rowMu only for the brief scan and copies each matching row into a
+// freshly-allocated slice, so the returned snapshot neither aliases the row map
+// nor holds the lock past the copy — matching the locking discipline of the
+// other read paths in this file, which never hold rowMu across a side effect. A
+// RELEASED tombstone is not live and is excluded, so a reconciler never tries to
+// reclaim a row whose capacity was already returned. A cancelled context fails
+// closed with ErrStoreUnavailable, exactly as every other method does.
+func (m *memStore) LiveSessions(ctx context.Context) ([]SessionRow, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+
+	m.rowMu.Lock()
+	defer m.rowMu.Unlock()
+
+	// Copy out under the lock: the returned slice is independent of the map, so a
+	// later mutation cannot mutate a row the caller already read, and the lock is
+	// released the instant the scan completes (the defer unlocks on return).
+	live := make([]SessionRow, 0, len(m.rows))
+	for _, row := range m.rows {
+		if row.State == StateReserved || row.State == StateActive {
+			live = append(live, row)
+		}
+	}
+	return live, nil
+}
+
 // LookupSession reads the current row for key without the key stripe, race-safe
 // under rowMu. It returns ErrReservationNotFound when no row exists.
 func (m *memStore) LookupSession(ctx context.Context, key string) (SessionRow, error) {

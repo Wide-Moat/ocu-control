@@ -285,15 +285,26 @@ func TestRevokeOneForceReleaseRowError(t *testing.T) {
 	}
 }
 
+// nonEnumerableStore wraps a state.Store but does NOT promote LiveSessions: it
+// embeds the state.Store INTERFACE, whose method set carries no LiveSessions, so
+// the concrete *nonEnumerableStore does not satisfy registry.LiveLister even though
+// the underlying in-memory value now does. It models a hypothetical Store leg that
+// has not opted into live enumeration, keeping the RevokeAll fail-closed branch
+// under test after both shipped legs grew the capability.
+type nonEnumerableStore struct {
+	state.Store
+}
+
 // TestRevokeAllEnumerationUnsupported covers the RevokeAll enumerate error branch: a
 // Store with no live-row enumeration surfaces ErrEnumerationUnsupported rather than
-// silently treating an empty list as "no live rows".
+// silently treating an empty list as "no live rows". Both SHIPPED legs (in-memory,
+// Postgres) now implement LiveSessions — proven by the store conformance suite — so
+// this case wraps the in-memory store in a non-promoting shim to keep the
+// fail-closed branch exercised.
 func TestRevokeAllEnumerationUnsupported(t *testing.T) {
 	t.Parallel()
 	clk := state.NewFakeClock(ksStart)
-	// A bare in-memory Store (NOT wrapped by listerStore) does not implement the
-	// LiveLister capability, so ReservedAndActiveKeys fails closed.
-	bare := state.NewInMemory(clk)
+	bare := &nonEnumerableStore{Store: state.NewInMemory(clk)}
 	cust := registry.NewCustodian(bare)
 	sink := audit.NewRecordingFake()
 	eng := killswitch.NewEngine(bare, cust, &faultProvider{}, clk, sink)
