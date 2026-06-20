@@ -263,3 +263,5 @@ jobs:
         env:
           OCU_CANON_DIR: canon
         run: bash scripts/check-contract-identity.sh
+      - name: embedded seccomp profile pin
+        run: bash scripts/check-seccomp-pin.sh

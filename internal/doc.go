@@ -20,11 +20,22 @@
 //	                           posture and engage DENY-ALL before any listener
 //	                           binds, fail-closed on an unavailable store, and the
 //	                           /healthz readiness gate.
+//	internal/runtime         — the RuntimeProvider seam: one coarse Materialize +
+//	                           the canon-fixed teardown pair + Reconcile, behind a
+//	                           substrate-neutral descriptor. The k8s and Firecracker
+//	                           backends are NotImplemented stubs.
+//	internal/runtime/docker  — the v1 Docker backend (the only package that imports
+//	                           the Docker SDK): the HOST-01 hardened HostConfig, the
+//	                           embedded deny-default seccomp profile, the atomic
+//	                           Materialize with rollback, and the NFR-SEC-65 ordered
+//	                           teardown finalizer.
+//	internal/runtimemap      — the single mapping between state.Identity and the
+//	                           runtime seam's leaf-local Identity, with a
+//	                           compile-time field-parity guard.
 //
 // Lands as the later phases fill in (each behind a narrow seam, per
 // component-02):
 //
-//	internal/runtime      — the RuntimeProvider seam (Docker is the v1 backend)
 //	internal/admission    — the workload-trust-profile × runtime-tier matrix,
 //	                        run fail-closed at the top of Create
 //	internal/ingress      — the two listeners (operator + gateway), distinct

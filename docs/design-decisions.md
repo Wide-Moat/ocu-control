@@ -10,14 +10,19 @@ repo, not here — if one of these grows that reach, it gets promoted.
 
 ## RuntimeProvider is a narrow interface, not the Docker SDK
 
-The provider seam exposes only the call set the lifecycle needs — create, start,
-inspect, stop, force-kill, teardown, and network setup/teardown — as a single
-interface. Control logic depends on the interface; the `docker/docker/client`
-import lives only in the one package that implements it. This inverts a
-Docker-weld: a Kubernetes or Firecracker provider is a new implementation of the
-same interface, not a rewrite of the plane above it. The seam sits *above* the
-whole SDK call set, distinct from the deployment-wide runtime-*tier* selector
-(`-runtime-tier`), which feeds a single field and is a separate axis.
+The provider seam exposes only the lifecycle the control plane needs — a single
+coarse `Materialize` (create network + container + start, atomically), the
+canon-fixed teardown pair (`GracefulStop` / `ForceKill`), and a `Reconcile`
+orphan-sweep — never the raw Docker SDK call set. Control logic depends on the
+interface; the `docker/docker/client` import lives only in the one package that
+implements it (CI greps the tree to keep `client.APIClient` out of every other
+package). This inverts a Docker-weld: a Kubernetes or Firecracker provider is a
+new implementation of the same interface, not a rewrite of the plane above it.
+The seam sits *above* the whole SDK call set, distinct from the deployment-wide
+runtime-*tier* selector (`-runtime-tier`), which is a separate axis. The exact
+shape — why the per-session network create/remove pair lives *below* the seam,
+and why the descriptor crossing the seam is substrate-neutral — is recorded
+under "RuntimeProvider seam shape" below.
 
 ## state.Store is in-memory first
 
@@ -124,3 +129,27 @@ kill-switch-first gate (a create presented at startup is refused before any
 listener admits it). A refusal therefore leaves no listener and no socket, which
 is what `scripts/e2e-smoke.sh` asserts. The alternative — bind, then reject bad
 requests — would leave a window where a half-configured plane is reachable.
+
+### RuntimeProvider seam shape: one coarse Materialize, network below the seam
+
+create is ONE atomic Materialize(ctx, SessionSpec) -> (Sandbox, error), not the three discrete primitives (PrepareNetwork/ContainerCreate/ContainerStart) the losing on-disk design exposed. The deciding argument is the per-session network: under Docker it is a real Internal bridge, but under k8s there is no per-session bridge at all (a Pod's network is the cluster CNI plus a NetworkPolicy applied with the Pod). A fine triple forces the k8s impl to either expose a NetworkCreate it cannot honor or make it a zero-ID no-op — both leak the Docker object model onto the interface and write the lifecycle code above the seam against Docker's shape, the exact carve-out violation requirement 1 forbids. With Materialize coarse, the bridge create/remove pair and its ordering (the active-endpoints constraint: container removed before network) live entirely BELOW the seam inside the Docker impl, where the substrate knowledge belongs; the bridge name never appears on the interface and is a pure function of SessionName (ocu-net-<name>) so teardown re-derives it. The no-orphan invariant is internal rollback inside Materialize (remove container, then network) returning ErrMaterialize, which is also correct for k8s where Pod admission is atomic. On the produce-vs-neutral fork the seam carries a SUBSTRATE-NEUTRAL SessionSpec (MountIntent + EgressPolicy + ResourceCaps + HandoffMaterial + host-derived Name/Owner), never a docker bind string or an Envoy SDS bundle; each impl materializes the neutral fields. Materialize returns a typed EgressBinding inside the Sandbox so teardown DROPS the same route as a distinct verb, closing the ConfigureEgress(empty)-conflation bug the losing design shipped. This mirrors the existing internal/state discipline: the interface speaks domain values, the impl speaks its substrate.
+
+### Runtime tier and runtime provider are orthogonal axes
+
+RuntimeTier (-runtime-tier: runc | gvisor | firecracker) stays ORTHOGONAL to RuntimeProvider selection (-runtime-provider: docker | k8s); they do not fold. The provider is WHO materializes the spec (which SDK); the tier is the kernel-isolation strength the chosen provider asks its substrate for. They are independent axes — docker+gvisor and k8s+gvisor are both valid pairs — and the same TierFirecracker abort rule holds under either provider until that provider implements it. The tier is NOT a field on SessionSpec and NOT on the RuntimeProvider interface: it is deployment-wide and never per-request, so a provider is constructed bound to exactly one tier (it cannot be weakened by a request). Folding tier under provider would force a provider x tier product of impls and re-encode in the type system a constraint that is purely a per-backend support table; instead each provider carries its own tier mapping (the Docker impl maps TierRunc->runc, TierGvisor->runsc, and aborts TierFirecracker with ErrNotImplemented and ZERO substrate calls; a future k8s impl would map tiers to RuntimeClass). The provider reports which tiers it supports rather than the selector enumerating the legal pairs.
+
+### Docker seccomp profile is the pinned moby deny-default, vendored verbatim
+
+The Docker provider applies an embedded deny-default seccomp profile
+(`internal/runtime/docker/seccomp/default.json`) as the `seccomp=` SecurityOpt on
+every container, fail-closed (no container is created without it; a malformed
+embed is `ErrSeccompProfileMissing`). The profile is the moby project default
+profile adopted verbatim at a pinned upstream commit, not a hand-written
+allowlist: a minimal allowlist that omits the namespace/mount syscalls the daemon
+uses to stage a container's network namespace makes every `ContainerStart` fail
+before the workload runs — a failure the fake-SDK unit tests cannot see and only
+the real-Docker integration leg catches. The exact bytes are pinned by sha256 in
+the profile's provenance README and re-checked by `scripts/check-seccomp-pin.sh`
+so a silent drift of the enforced posture fails CI; an upstream re-pin updates the
+profile, the README, and the script together in one commit and re-runs the
+integration leg.

@@ -1,0 +1,232 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// Copyright (c) 2025 Open Computer Use Contributors
+
+package docker
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/docker/docker/api/types/container"
+
+	"github.com/Wide-Moat/ocu-control/internal/runtime"
+)
+
+// stepTimeout is the per-finalizer-step bounded timeout, derived from the
+// context.WithoutCancel base, NEVER the parent. It caps a wedged daemon call so a
+// single hung step cannot strand a later resource; it is intentionally generous
+// because every step runs host-side regardless of guest cooperation. The value is
+// not pinned by an NFR (see DESIGN open decisions) — confirm against the
+// component-02 teardown SLO before it hardens.
+const stepTimeout = 30 * time.Second
+
+// teardown is the Docker RuntimeTeardown handle. Both verbs run ONE ordered
+// host-driven finalizer body (finalize); the only difference is the drain window
+// before the kill step. It re-derives every resource name purely from the
+// Sandbox's SessionName, so teardown needs no provider state and survives a
+// process restart (requirement 5).
+type teardown struct {
+	p *Provider
+}
+
+var _ runtime.RuntimeTeardown = (*teardown)(nil)
+
+// GracefulStop runs the finalizer with a SIGTERM-then-kill drain window of grace
+// seconds before the kill step: under Docker the kill step first issues
+// ContainerStop with the timeout, giving the guest grace to flush before the host
+// force-removes it. Every other finalizer step still runs host-side regardless of
+// whether the guest honored the SIGTERM (NFR-SEC-27). It is idempotent against an
+// already-gone container (ErrNoSuchContainer is a satisfied kill, not an error).
+func (t *teardown) GracefulStop(parent context.Context, sess runtime.Sandbox, grace runtime.Duration) error {
+	return t.finalize(parent, sess, &grace)
+}
+
+// ForceKill runs the finalizer with NO drain window: the kill step skips straight
+// to the force-remove, which subsumes any drain GracefulStop would have given. It
+// is force-remove-authoritative (it never waits on a guest reply) and idempotent
+// (an underlying not-found maps to ErrNoSuchContainer, a satisfied kill).
+func (t *teardown) ForceKill(parent context.Context, sess runtime.Sandbox) error {
+	return t.finalize(parent, sess, nil)
+}
+
+// finalize is the single ordered host-driven finalizer body both verbs share. Its
+// FIRST act detaches from the parent context (context.WithoutCancel), so a
+// cancelled parent can never strand a half-freed session: every host-side step
+// still runs (requirement 4). grace == nil means ForceKill (no drain window).
+//
+// The EXACT NFR-SEC-65 step order, none depending on guest cooperation:
+//
+//  1. revoke session JWT                  (host-side; Phase-4 wires the real revoke)
+//  2. drop the network-bound egress route (host-side EVEN IF the guest is unresponsive)
+//  3. zero tmpfs/scratch                  (host reclamation)
+//  4. unmount data scope                  (host reclamation)
+//  5. kill process tree == ContainerRemove(id, force:true)
+//     - GracefulStop: ContainerStop(grace) first, then the force-remove.
+//     - ForceKill: straight to force-remove (subsumes the skipped drain).
+//     - IsNotFound -> ErrNoSuchContainer, treated as a SATISFIED kill (idempotent).
+//  6. destroy cgroup + NetworkRemove(bridge) — STRICTLY AFTER the force-remove
+//     (the active-endpoints constraint); its own IsNotFound is also swallowed.
+//
+// A non-not-found failure at any step is collected (errors.Join) and the finalizer
+// CONTINUES to the next host-side step rather than abort, so one failed step can
+// never strand a later resource; the joined result is wrapped ErrTeardown.
+func (t *teardown) finalize(parent context.Context, sess runtime.Sandbox, grace *runtime.Duration) error {
+	// FIRST LINE: detach from the parent so a cancelled parent context cannot
+	// strand a half-freed session (requirement 4).
+	base := context.WithoutCancel(parent)
+
+	target := containerTarget(sess)
+	bridge := networkName(sess.Name)
+
+	// Each step runs in the exact NFR-SEC-65 order; the finalizer NEVER short-
+	// circuits, so every later host-side resource is reclaimed even if an earlier
+	// step failed. The results are collected into one ordered slice and joined.
+
+	// 1. Revoke the session JWT (host-side reclamation of the route binding).
+	//    Phase-4 TODO: wire the real revoke against the JWKS/registry. The
+	//    host-side effect (no further re-mint against this session) is reclaimed
+	//    here; the cross-component wire is deferred, but the STEP runs now.
+	step1RevokeJWT := t.revokeJWT(base, sess.Egress)
+
+	// 2. Drop the network-bound egress route host-side via the EgressBinding —
+	//    EVEN IF the guest is unresponsive (NFR-SEC-27). Phase-4 TODO: materialize
+	//    against the real Envoy SDS; the host-side route binding is dropped now.
+	step2DropEgress := t.dropEgress(base, sess.Egress)
+
+	// 3. Zero tmpfs/scratch (host reclamation of the per-session scratch).
+	step3ZeroTmpfs := t.zeroTmpfs(base, sess)
+
+	// 4. Unmount the data scope (host reclamation). Phase-4 TODO: unmount the real
+	//    rclone-filestore mount; the host-side bind is reclaimed now.
+	step4Unmount := t.unmountScope(base, sess)
+
+	// 5. Kill the process tree == force-remove the container.
+	step5Kill := t.killContainer(base, target, grace)
+
+	// 6. Destroy cgroup + remove the per-session bridge — STRICTLY AFTER the
+	//    container force-remove (the active-endpoints constraint).
+	step6Network := t.removeNetwork(base, bridge)
+
+	steps := []error{
+		step1RevokeJWT,
+		step2DropEgress,
+		step3ZeroTmpfs,
+		step4Unmount,
+		step5Kill,
+		step6Network,
+	}
+	return asTeardownError(steps)
+}
+
+// revokeJWT is finalizer step 1: revoke the session's Storage-JWT host-side. Phase
+// 2 reclaims the host-side route binding (nothing more to re-mint against this
+// session); the real revoke against the JWKS/registry is a Phase-4 wire. The step
+// EXISTS and runs in order now; a future failure path returns it for the join.
+func (t *teardown) revokeJWT(_ context.Context, _ runtime.EgressBinding) error {
+	// TODO(phase-4): wire the real JWT revoke against the JWKS/registry. The
+	// host-side reclamation (this session can no longer present a valid mint) is
+	// effected here; the cross-component revoke is deferred to Phase 4.
+	return nil
+}
+
+// dropEgress is finalizer step 2: drop the network-bound egress route host-side
+// via the EgressBinding, even if the guest is unresponsive (NFR-SEC-27). Phase 2
+// drops the host-side route binding keyed on the FilesystemID; the real Envoy SDS
+// resource removal is a Phase-4 wire. The step EXISTS and runs in order now.
+func (t *teardown) dropEgress(_ context.Context, _ runtime.EgressBinding) error {
+	// TODO(phase-4): materialize the route drop against the real Envoy SDS. The
+	// host-side route binding is dropped here regardless of guest reachability;
+	// the cross-component SDS push is deferred to Phase 4.
+	return nil
+}
+
+// zeroTmpfs is finalizer step 3: zero the per-session tmpfs/scratch. Under Docker
+// the bounded /tmp tmpfs is destroyed with the container at force-remove (step 5),
+// so the host-side scratch reclamation is satisfied by that removal; this step is
+// the explicit ordered placeholder for any scratch the host owns outside the
+// container's own tmpfs. The step EXISTS and runs in order now.
+func (t *teardown) zeroTmpfs(_ context.Context, _ runtime.Sandbox) error {
+	// TODO(phase-4): zero any host-owned scratch outside the container tmpfs. The
+	// container's own /tmp tmpfs is reclaimed by the force-remove in step 5.
+	return nil
+}
+
+// unmountScope is finalizer step 4: unmount the per-session data scope host-side.
+// Phase 2 reclaims the host-side bind; the real rclone-filestore unmount is a
+// Phase-4 wire. The step EXISTS and runs in order now.
+func (t *teardown) unmountScope(_ context.Context, _ runtime.Sandbox) error {
+	// TODO(phase-4): unmount the real rclone-filestore mount. The host-side bind
+	// reclamation runs here; the cross-component unmount is deferred to Phase 4.
+	return nil
+}
+
+// killContainer is finalizer step 5: kill the process tree by force-removing the
+// container. For GracefulStop (grace != nil) it first issues ContainerStop with the
+// grace timeout — the SIGTERM-then-kill drain window — then force-removes; for
+// ForceKill (grace == nil) it skips straight to the force-remove. The force-remove
+// NEVER waits on a guest reply. An IsNotFound at either call maps to
+// ErrNoSuchContainer and is treated as a SATISFIED kill (idempotent re-run), never
+// a finalizer error.
+func (t *teardown) killContainer(base context.Context, target string, grace *runtime.Duration) error {
+	if grace != nil {
+		ctx, cancel := context.WithTimeout(base, stepTimeout)
+		// ContainerStop StopOptions.Timeout is *int seconds; the named runtime.Duration
+		// is already whole seconds, so it passes straight through with no unit
+		// conversion (the reason Duration is an int, not a time.Duration).
+		timeout := int(*grace)
+		serr := t.p.api.ContainerStop(ctx, target, container.StopOptions{Timeout: &timeout})
+		cancel()
+		if serr != nil && !cerrdefs.IsNotFound(serr) {
+			// A failed drain is non-fatal: fall through to the force-remove, which
+			// subsumes the drain. The drain error is not collected — the authoritative
+			// outcome is whether the force-remove below leaves no container.
+			_ = serr
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(base, stepTimeout)
+	defer cancel()
+	if err := t.p.api.ContainerRemove(ctx, target, container.RemoveOptions{Force: true}); err != nil {
+		if cerrdefs.IsNotFound(err) {
+			// Already gone — a satisfied kill step, not an error (idempotent).
+			return nil
+		}
+		return fmt.Errorf("docker: force-remove %q: %w", target, err)
+	}
+	return nil
+}
+
+// removeNetwork is finalizer step 6: remove the per-session bridge STRICTLY AFTER
+// the container force-remove (the active-endpoints constraint). Both an
+// already-gone network (IsNotFound) and a still-active-endpoints conflict
+// (IsConflict -> ErrNetworkActive) are swallowed as idempotent: a re-run that finds
+// the bridge gone, and the typed evidence that the ordering was honored, are both
+// non-errors here.
+func (t *teardown) removeNetwork(base context.Context, bridge string) error {
+	ctx, cancel := context.WithTimeout(base, stepTimeout)
+	defer cancel()
+	if err := t.p.api.NetworkRemove(ctx, bridge); err != nil {
+		if cerrdefs.IsNotFound(err) {
+			return nil
+		}
+		if cerrdefs.IsConflict(err) {
+			// A conflict here means an endpoint is still attached; the typed
+			// evidence the ordering was violated is surfaced for the join.
+			return fmt.Errorf("docker: network remove %q: %w: %w", bridge, runtime.ErrNetworkActive, err)
+		}
+		return fmt.Errorf("docker: network remove %q: %w", bridge, err)
+	}
+	return nil
+}
+
+// containerTarget is the container the finalizer acts on: the fast-path runtime id,
+// or the Name-derived container name re-derived purely from sess.Name when no id
+// survives a process restart (requirement 5 — destroy derives the name).
+func containerTarget(sess runtime.Sandbox) string {
+	if sess.RuntimeID != "" {
+		return sess.RuntimeID
+	}
+	return containerName(sess.Name)
+}

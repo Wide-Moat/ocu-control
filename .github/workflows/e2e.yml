@@ -70,6 +70,19 @@ jobs:
         env:
           OCU_CONTROL_BIN: ${{ github.workspace }}/ocu-controld
         run: go test -run 'Integration|E2E' ./... -v -timeout 600s
+      # The RuntimeProvider Docker integration leg drives the REAL Docker daemon
+      # the ubuntu-latest runner ships (no mock): it materializes a hardened
+      # container and asserts the HOST-01 posture via inspect, exercises the
+      # GracefulStop drain window and the ForceKill backstop, and proves the
+      # embedded seccomp profile actually lets a container start (a placeholder
+      # profile that blocks the netns syscalls passes the fake-SDK unit tests but
+      # fails here — which is the whole point of running the real daemon). The
+      # daemon is local to the runner, so the HOST-01 bind sources resolve from
+      # t.TempDir without OCU_RUNTIME_IT_STAGE_DIR.
+      - name: run the RuntimeProvider Docker integration leg (real daemon)
+        env:
+          OCU_RUNTIME_IT: "1"
+        run: go test -run 'TestIT' ./internal/runtime/docker/ -v -timeout 600s
 
   # docker-build catches go.mod / Dockerfile toolchain drift on every PR and
   # push to main — the class of bug where go.mod advances past the builder

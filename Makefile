@@ -35,7 +35,7 @@ GREMLINS_VERSION := v0.6.0
 # artifact.
 COVERAGE_FLOOR := 91
 
-.PHONY: help build bin test test-race cover spdx contract identity schema vet fmt \
+.PHONY: help build bin test test-race cover spdx contract identity seccomp schema vet fmt \
         staticcheck lint mutation check
 
 # ── help ────────────────────────────────────────────────────────────────────
@@ -179,6 +179,9 @@ schema: ## Compile every vendored JSON-Schema contract with ajv (structural vali
 identity: ## Assert no retired maintainer address in tracked files
 	bash scripts/check-doc-identity.sh
 
+seccomp: ## Assert the embedded Docker seccomp profile matches its pinned digest
+	bash scripts/check-seccomp-pin.sh
+
 # ── check (one-command pre-push gate) ────────────────────────────────────────
 #
 # Runs every gate that CI runs on a PR, in dependency order.
@@ -188,4 +191,4 @@ identity: ## Assert no retired maintainer address in tracked files
 # Those exclusions match CI's own gating model: the plain `test` job also
 # loud-skips the gated legs.
 
-check: fmt vet staticcheck lint spdx contract identity test ## Full local gate (pre-push)
+check: fmt vet staticcheck lint spdx contract identity seccomp test ## Full local gate (pre-push)
