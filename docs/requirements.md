@@ -12,7 +12,7 @@ source of truth. The full PRD lives in `.planning/` (gitignored, local-only).
 
 | # | Rule | Source | Verification |
 |---|---|---|---|
-| 1 | Every route to create or manage a session enters through Control; no MCP-surface route resolves to a lifecycle/denylist/kill-switch route, and no rendered manifest grants the gateway a route to the operator ingress | NFR-SEC-52 | IaC-policy assertion |
+| 1 | Every route to create or manage a session enters through Control; no MCP-surface route resolves to a lifecycle/denylist/kill-switch route, and no rendered manifest grants the gateway a route to the operator ingress | NFR-SEC-52 | held by topology (operator = UDS, gateway = loopback, no Service/Ingress/NodePort); default-deny NetworkPolicy + policy-as-code CI gate is a fast-follow ([#1](https://github.com/Wide-Moat/ocu-control/issues/1)) |
 | 2 | The host dials the guest; the guest never dials Control. The kill-switch is a host-initiated stop — an unreachable control channel grants the guest no new authority | NFR-SEC-01 | unit + e2e |
 | 3 | Kill-switch-first boot: denylist and kill-switch state load and DENY-ALL engages before any listener admits a create | NFR-SEC-01 | e2e (pre-bind refusal) |
 | 4 | A body-supplied session/tenant/`container_name` id is a hint, never the authority; the binding is host-derived from the runtime-attested caller identity | NFR-SEC-43 | property-test (forge-another-session) |
