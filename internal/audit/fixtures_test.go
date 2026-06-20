@@ -22,6 +22,7 @@ func TestPrivilegedActionsIsClosedEnum(t *testing.T) {
 		audit.ActionEditDenylist,
 		audit.ActionOverrideQuota,
 		audit.ActionRetentionPolicy,
+		audit.ActionResumeGlobal,
 		audit.ActionCreateRejected,
 	}
 	got := audit.PrivilegedActions()
@@ -68,6 +69,7 @@ func TestSEC45ActionsSubsetAndContents(t *testing.T) {
 		audit.ActionOverrideQuota:   true,
 		audit.ActionDestroy:         true,
 		audit.ActionRetentionPolicy: true,
+		audit.ActionResumeGlobal:    true,
 	}
 	got := audit.SEC45Actions()
 	if len(got) != len(want) {
@@ -80,6 +82,15 @@ func TestSEC45ActionsSubsetAndContents(t *testing.T) {
 		if !audit.IsPrivileged(a) {
 			t.Fatalf("SEC45Actions() contains non-privileged action %v", a)
 		}
+	}
+}
+
+// TestActionResumeGlobalString pins the wire label of the new operator
+// global-deny LIFT action.
+func TestActionResumeGlobalString(t *testing.T) {
+	t.Parallel()
+	if got := audit.ActionResumeGlobal.String(); got != "resume_global" {
+		t.Fatalf("ActionResumeGlobal.String() = %q, want resume_global", got)
 	}
 }
 

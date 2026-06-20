@@ -189,6 +189,22 @@ func (h *Handlers) RevokeAll(ctx context.Context, conn ingress.ConnInfo, reason 
 	return h.engine.RevokeAll(ctx, scope, reason)
 }
 
+// ResumeAll lifts the deployment-wide DENY-ALL — the operator-only in-band
+// counterpart to RevokeAll. As with RevokeAll the admin/CLI channel authenticates
+// via the attested operator socket and the scope is minted from the held seam after
+// attestation; a gateway-shaped caller holds no seam, so the Mint below would not
+// compile in its package, and no gateway route reaches this handler (NFR-SEC-52).
+func (h *Handlers) ResumeAll(ctx context.Context, conn ingress.ConnInfo, reason string) error {
+	caller, err := h.resolveCaller(ctx, conn)
+	if err != nil {
+		return err
+	}
+	// The attested socket peer is the operator for the admin/CLI channel; the scope
+	// carries caller.Identity as the audit actor.
+	scope := h.seam.Mint(caller.Identity)
+	return h.engine.ResumeAll(ctx, scope, reason)
+}
+
 // RevokeOneViaSOAR is the SOAR-webhook revoke path: it runs verify-then-mint, so
 // the OperatorScope exists ONLY after the SOAR signature is verified. The
 // connection itself is still attested (the webhook arrives on the operator

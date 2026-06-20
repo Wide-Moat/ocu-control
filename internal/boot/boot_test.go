@@ -115,22 +115,35 @@ func Test_Boot_FailClosed_StoreUnavailable(t *testing.T) {
 	}
 }
 
-// Test_AdmitCreate_KillSwitchFirst is the end-to-end kill-switch-first refusal
-// through the real Store: after a clean Boot (which engaged ScopeGlobal),
-// AdmitCreate is refused with state.ErrKillSwitchEngaged and writes no row (the
-// no-orphan property — LookupSession returns ErrReservationNotFound).
-func Test_AdmitCreate_KillSwitchFirst(t *testing.T) {
+// Test_AdmitCreate_DurableGlobalDenyRestored is the durable-restore proof
+// (mandate (b) at the unit layer): an OPERATOR-AUTHORED deployment-wide DENY-ALL
+// engaged before the last shutdown is seeded into the Store, LoadDeny restores it
+// on a clean Boot, and AdmitCreate is then refused with state.ErrKillSwitchEngaged
+// and writes no row (the no-orphan property — LookupSession returns
+// ErrReservationNotFound). The refusal is caused by the restored operator posture,
+// never a fabricated boot-time deny.
+func Test_AdmitCreate_DurableGlobalDenyRestored(t *testing.T) {
 	t.Parallel()
 	store, clk := newInMem()
-	seq := boot.New(store, clk)
 
+	// Seed the operator-authored global kill-switch BEFORE boot — the durable
+	// posture an operator engaged before the last shutdown.
+	if err := store.SetDeny(context.Background(), state.DenyEntry{
+		Scope:  state.ScopeGlobal,
+		Reason: "operator drill",
+		Since:  clk.Now(),
+	}); err != nil {
+		t.Fatalf("seed operator ScopeGlobal deny: %v", err)
+	}
+
+	seq := boot.New(store, clk)
 	if err := seq.Boot(context.Background()); err != nil {
 		t.Fatalf("Boot() returned error: %v", err)
 	}
 
 	err := seq.AdmitCreate(context.Background(), "k", owner)
 	if err == nil {
-		t.Fatal("AdmitCreate() succeeded with the kill-switch engaged; want a refusal")
+		t.Fatal("AdmitCreate() succeeded with the operator-authored kill-switch restored; want a refusal")
 	}
 	if !errors.Is(err, state.ErrKillSwitchEngaged) {
 		t.Fatalf("AdmitCreate() error does not match state.ErrKillSwitchEngaged: %v", err)
@@ -142,20 +155,22 @@ func Test_AdmitCreate_KillSwitchFirst(t *testing.T) {
 	}
 }
 
-// Test_AdmitCreate_NegativeControl proves the refusal is caused by the engaged
-// posture, not an unconditional branch: a Sequencer built without the boot
-// kill-switch admits the create and a RESERVED row exists afterward.
-func Test_AdmitCreate_NegativeControl(t *testing.T) {
+// Test_AdmitCreate_CleanBootAdmits is the clean-boot positive (mandate (a) at the
+// unit layer): with NO operator-authored deny seeded, a clean Boot restores an
+// empty posture and AdmitCreate SUCCEEDS, leaving a RESERVED row. This is the
+// proof the daemon is no longer inert — there is no fabricated boot-time global
+// deny to refuse every create forever.
+func Test_AdmitCreate_CleanBootAdmits(t *testing.T) {
 	t.Parallel()
 	store, clk := newInMem()
-	seq := boot.New(store, clk, boot.WithoutBootKillSwitch())
+	seq := boot.New(store, clk)
 
 	if err := seq.Boot(context.Background()); err != nil {
 		t.Fatalf("Boot() returned error: %v", err)
 	}
 
 	if err := seq.AdmitCreate(context.Background(), "k", owner); err != nil {
-		t.Fatalf("AdmitCreate() refused with no kill-switch engaged: %v", err)
+		t.Fatalf("AdmitCreate() refused on a clean boot with no operator deny: %v", err)
 	}
 
 	row, lookErr := store.LookupSession(context.Background(), "k")

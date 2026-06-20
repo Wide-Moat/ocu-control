@@ -156,8 +156,9 @@ type OCSFEvent struct {
 
 // activityFor maps a privileged audit.Action onto its OCSF activity_id and a
 // human-readable activity_name. Create-commit is Create(1); destroy is Delete(4);
-// the revoke / denylist-edit / quota-override / retention-policy actions are
-// state-mutating operator controls that map to Update(3); a create-rejected is a
+// the revoke / denylist-edit / quota-override / retention-policy / resume-global
+// actions are state-mutating operator controls that map to Update(3); a
+// create-rejected is a
 // refusal that produced no resource and so maps to Other(99) by an explicit case;
 // an unknown action falls to Other(99) so a forgotten arm surfaces as an explicit
 // Other rather than a silent mislabel. The name always reflects the Action.String
@@ -169,7 +170,8 @@ func activityFor(a audit.Action) (uint8, string) {
 	case audit.ActionDestroy:
 		return activityDelete, a.String()
 	case audit.ActionRevokeOne, audit.ActionRevokeAll,
-		audit.ActionEditDenylist, audit.ActionOverrideQuota, audit.ActionRetentionPolicy:
+		audit.ActionEditDenylist, audit.ActionOverrideQuota, audit.ActionRetentionPolicy,
+		audit.ActionResumeGlobal:
 		return activityUpdate, a.String()
 	case audit.ActionCreateRejected:
 		// A refused create produced no resource, so it has no CRUD slot: it maps to

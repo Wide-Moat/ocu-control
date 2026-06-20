@@ -331,6 +331,71 @@ func TestLiftDenyClearFailure(t *testing.T) {
 	}
 }
 
+// TestResumeAllAuditFailureDeniesAndKeepsDeny covers the ResumeAll audit-first
+// fail-closed branch: with the sink faulted, ResumeAll returns ErrAuditWriteFailed
+// and does NOT clear the global deny — a still-seeded ScopeGlobal entry survives, so
+// the durable posture and the trail never disagree.
+func TestResumeAllAuditFailureDeniesAndKeepsDeny(t *testing.T) {
+	t.Parallel()
+	eng, fs, sink, scope := newFaultEngine(t)
+	ctx := context.Background()
+
+	// Seed an operator-authored global deny that the faulted resume must NOT clear.
+	if err := fs.SetDeny(ctx, state.DenyEntry{Scope: state.ScopeGlobal, Reason: "engaged"}); err != nil {
+		t.Fatalf("seed global deny: %v", err)
+	}
+	sink.SetFault(true, errors.New("sink down"))
+
+	if err := eng.ResumeAll(ctx, scope, "all-clear"); !errors.Is(err, audit.ErrAuditWriteFailed) {
+		t.Fatalf("ResumeAll with faulted audit = %v; want ErrAuditWriteFailed", err)
+	}
+
+	// The global deny survives the denied resume.
+	deny, err := fs.LoadDeny(ctx)
+	if err != nil {
+		t.Fatalf("LoadDeny: %v", err)
+	}
+	found := false
+	for _, d := range deny {
+		if d.Scope == state.ScopeGlobal {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("ResumeAll with a faulted audit cleared the global deny; it must survive a denied resume. entries=%v", deny)
+	}
+}
+
+// TestResumeAllClearFailure covers the ResumeAll ClearDeny error branch: the audit
+// succeeds, then the durable clear fails and the injected store fault propagates.
+func TestResumeAllClearFailure(t *testing.T) {
+	t.Parallel()
+	eng, fs, _, scope := newFaultEngine(t)
+	fs.mu.Lock()
+	fs.failClearDeny = true
+	fs.mu.Unlock()
+
+	err := eng.ResumeAll(context.Background(), scope, "all-clear")
+	if !errors.Is(err, errInjected) {
+		t.Fatalf("ResumeAll with failing ClearDeny = %v; want the injected store fault", err)
+	}
+}
+
+// TestResumeAllInvalidScope covers the ResumeAll scope-invalid backstop to the
+// compile-time seal: a forged zero-value scope is refused before any audit or clear.
+func TestResumeAllInvalidScope(t *testing.T) {
+	t.Parallel()
+	eng, _, sink, _ := newFaultEngine(t)
+	var forged ingress.OperatorScope // zero value: Valid() is false
+
+	if err := eng.ResumeAll(context.Background(), forged, "x"); !errors.Is(err, killswitch.ErrScopeInvalid) {
+		t.Fatalf("ResumeAll with a forged scope = %v; want ErrScopeInvalid", err)
+	}
+	if sink.Len() != 0 {
+		t.Fatalf("ResumeAll with a forged scope audited %d records; want 0", sink.Len())
+	}
+}
+
 // TestOverrideQuotaInvalidScope covers the OverrideQuota scope-invalid backstop.
 func TestOverrideQuotaInvalidScope(t *testing.T) {
 	t.Parallel()

@@ -13,9 +13,10 @@
 #   1. a missing required flag is NAMED in the refusal text;
 #   2. an unknown -runtime-tier is refused, never silently defaulted;
 #   3. an unknown -runtime-provider is refused, never silently defaulted;
-#   4. KILL-SWITCH-FIRST: a create presented at startup is refused loudly
-#      end-to-end before any listener binds (NFR-SEC-01), and no socket is
-#      bound on the refusal.
+#   4. KILL-SWITCH-FIRST ORDERING: a create presented BEFORE the boot sequencer
+#      loads the durable deny posture is refused loudly by the transient
+#      not-loaded gate (NFR-SEC-01), end-to-end through the real boot + Store
+#      path, before any listener binds, and no socket is bound on the refusal.
 #   5. MANIFEST FLAG VALIDATION: each shipped deploy manifest's exact serving
 #      argv (docker-compose, k8s, systemd) clears flag validation against the
 #      real binary — it never exits on a missing/invalid REQUIRED flag. The
@@ -115,8 +116,9 @@ echo "$out" | grep -q "unknown workload profile" || {
   fail=1
 }
 
-# 4. KILL-SWITCH-FIRST — a create presented at startup is refused loudly,
-#    naming NFR-SEC-01, before any listener binds; and no socket exists.
+# 4. KILL-SWITCH-FIRST ORDERING — a create presented BEFORE the deny posture is
+#    loaded is refused loudly by the transient not-loaded gate, naming NFR-SEC-01,
+#    before any listener binds; and no socket exists.
 code=0
 out=$("$BIN" "${valid_args[@]}" -create-on-start 2>&1) || code=$?
 echo "$out"
@@ -133,10 +135,11 @@ if ls "$tmp"/*.sock >/dev/null 2>&1; then
   fail=1
 fi
 
-# 4b. The kill-switch-first refusal now flows through the REAL boot + Store
+# 4b. The kill-switch-first ordering refusal flows through the REAL boot + Store
 #     path. An explicit empty -state-dsn (the in-memory minimal-shelf default)
-#     must refuse identically, documenting the default and confirming the
-#     create-on-start path exercises the live boot sequencer, not a stub branch.
+#     must refuse the pre-load create identically, documenting the default and
+#     confirming the create-on-start path exercises the live boot sequencer's
+#     transient not-loaded gate, not a stub branch.
 code=0
 out=$("$BIN" "${valid_args[@]}" -state-dsn "" -create-on-start 2>&1) || code=$?
 echo "$out"

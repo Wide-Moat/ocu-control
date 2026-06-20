@@ -56,6 +56,13 @@ const (
 	// that drives it) is a deferred follow-up; the enum value exists now so the audit
 	// classification is closed over every privileged action the fixture names.
 	ActionRetentionPolicy
+	// ActionResumeGlobal is an operator LIFT of the deployment-wide DENY-ALL — the
+	// in-band counterpart to ActionRevokeAll. It is an operator state-mutating
+	// action (the SEC-45 family), audited fail-closed before the durable global
+	// deny is cleared. It is inserted BEFORE ActionCreateRejected so the latter
+	// stays the last enum arm and the exhaustiveness boundary proof
+	// (lastAction + the "audit_action_unknown" one-past-the-end value) holds.
+	ActionResumeGlobal
 	// ActionCreateRejected is a session create REFUSED at a pre-side-effect deny
 	// stage (admission, quota, or the kill-switch/denylist re-check). It is the
 	// system-initiated rejection record NFR-SEC-46/72 require: the deny itself is
@@ -84,6 +91,8 @@ func (a Action) String() string {
 		return "override_quota"
 	case ActionRetentionPolicy:
 		return "retention_policy"
+	case ActionResumeGlobal:
+		return "resume_global"
 	case ActionCreateRejected:
 		return "create_rejected"
 	default:

@@ -4,22 +4,29 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/x509"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Wide-Moat/ocu-control/internal/boot"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
+	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/ingress/gateway"
 	"github.com/Wide-Moat/ocu-control/internal/ingress/operator"
+	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
 // writeTestKey writes a valid Ed25519 PKCS8 signing key to path so the boot-time
@@ -101,10 +108,12 @@ func Test_run_UnknownRuntimeProvider(t *testing.T) {
 }
 
 // Test_run_KillSwitchFirst drives -create-on-start through the REAL boot path
-// with the default in-memory store: boot engages the deployment-wide
-// kill-switch, AdmitCreate refuses through a real Store.Reserve, and run()
-// surfaces the refusal wrapped under errKillSwitchFirst with the load-bearing
-// NFR-SEC-01 substring.
+// with the default in-memory store: a create presented BEFORE Boot loads the deny
+// posture is refused by the transient not-loaded gate (boot.ErrNotReady), and
+// run() surfaces that pre-load refusal wrapped under errKillSwitchFirst with the
+// load-bearing NFR-SEC-01 substring. The hook then confirms a clean-store create
+// is admitted after load (the daemon is not inert), but it is the ordering refusal
+// that the smoke greps.
 func Test_run_KillSwitchFirst(t *testing.T) {
 	t.Parallel()
 	args := append(validArgs(), "-create-on-start")
@@ -121,8 +130,8 @@ func Test_run_KillSwitchFirst(t *testing.T) {
 }
 
 // Test_run_KillSwitchFirst_ExplicitInMemory documents that an explicit empty
-// -state-dsn (the in-memory default) refuses identically, mirroring the smoke's
-// explicit-empty assertion.
+// -state-dsn (the in-memory default) refuses the pre-load create identically,
+// mirroring the smoke's explicit-empty assertion of the transient ordering gate.
 func Test_run_KillSwitchFirst_ExplicitInMemory(t *testing.T) {
 	t.Parallel()
 	args := append(validArgs(), "-state-dsn", "", "-create-on-start")
@@ -187,6 +196,287 @@ func Test_run_CleanBoot_BindsThenServes(t *testing.T) {
 		t.Fatalf("run() on a clean boot returned %v; want nil on a ctx-driven shutdown", err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("run() did not return within 10s after ctx cancel")
+	}
+}
+
+// attestingResolver attests every operator connection with a fixed host-derived
+// identity, standing in for SO_PEERCRED (Linux-only) so a create over the wire
+// reaches the deny gate (Store.Reserve) rather than stopping at the darwin
+// unattested wall. Identity is still host-derived from transport facts here (a
+// fixed test identity), never from a request body — exactly the production
+// contract the peer-cred resolver satisfies on Linux.
+type attestingResolver struct{ id state.Identity }
+
+func (r attestingResolver) Resolve(_ context.Context, _ ingress.ConnInfo) (ingress.AuthenticatedCaller, error) {
+	return ingress.AuthenticatedCaller{Identity: r.id, Channel: ingress.ChannelOperator}, nil
+}
+
+// composeServeDaemon builds the daemon EXACTLY as serve() does — the real Store,
+// the real compose() lifecycle Manager + kill-switch Engine, the real boot
+// Sequencer, and an operator Listener bound off the readiness hook — but with the
+// injected resolver so the full ingress→admit→reserve path runs cross-platform. It
+// returns the bound listener (its Handlers expose the in-process create surface for
+// typed-error assertions) and a unix HTTP client. seedGlobalDeny, when true, seeds
+// an OPERATOR-AUTHORED ScopeGlobal deny into the Store BEFORE boot, so LoadDeny
+// restores it (mandate (b)). The docker provider is constructed but the backend is
+// absent in CI, so a create that PASSES the deny gate fails later at Materialize —
+// which is exactly the "got past the deny gate" evidence mandate (a) asserts.
+func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, *http.Client, context.CancelFunc) {
+	t.Helper()
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "jwt.key")
+	writeTestKey(t, keyPath)
+	sockPath := shortSocketPath(t)
+	cfg := config{
+		operatorListen:  "unix://" + sockPath,
+		gatewayListen:   "127.0.0.1:0",
+		runtimeTier:     "runc",
+		runtimeProvider: "docker",
+		workloadProfile: "trusted_operator",
+		jwtSigningKey:   keyPath,
+		jwtAlg:          "eddsa",
+		auditSink:       filepath.Join(dir, "audit.jsonl"),
+	}
+	clk := state.SystemClock()
+	store, err := openStore(context.Background(), cfg.stateDSN, clk)
+	if err != nil {
+		t.Fatalf("openStore: %v", err)
+	}
+	if seedGlobalDeny {
+		// The durable posture an operator engaged before the last shutdown.
+		if err := store.SetDeny(context.Background(), state.DenyEntry{
+			Scope:  state.ScopeGlobal,
+			Reason: "operator drill",
+			Since:  clk.Now(),
+		}); err != nil {
+			t.Fatalf("seed operator ScopeGlobal deny: %v", err)
+		}
+	}
+	tier, err := runtimeTierOf(cfg.runtimeTier)
+	if err != nil {
+		t.Fatalf("runtimeTierOf: %v", err)
+	}
+	profile, err := workloadProfileOf(cfg.workloadProfile)
+	if err != nil {
+		t.Fatalf("workloadProfileOf: %v", err)
+	}
+	signer, revoker, err := buildSigner(cfg, clk)
+	if err != nil {
+		t.Fatalf("buildSigner: %v", err)
+	}
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase)
+	if err != nil {
+		t.Fatalf("providerOf: %v", err)
+	}
+	mgr, eng := compose(store, clk, provider, profile, tier, signer, nullCloser{}, cfg)
+	seam := ingress.NewOperatorSeam()
+	seq := boot.New(store, clk)
+	op := operator.NewListener(sockPath, operator.Deps{
+		Manager:  mgr,
+		Engine:   eng,
+		Healthz:  seq.Healthz(),
+		Resolver: attestingResolver{id: state.Identity{Tenant: "op", Caller: "uid:1000"}},
+		Seam:     seam,
+	})
+	seq.SetOnReady(func(context.Context) error { return op.Bind() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := seq.Boot(ctx); err != nil {
+		cancel()
+		t.Fatalf("Boot: %v", err)
+	}
+	t.Cleanup(func() { _ = op.Close() })
+	go func() { _ = op.Serve(ctx) }()
+
+	client := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, "unix", sockPath)
+		},
+	}}
+	waitDaemonReady(t, client)
+	return op, client, cancel
+}
+
+// waitDaemonReady polls /healthz on the bound operator socket until it answers 200.
+func waitDaemonReady(t *testing.T, client *http.Client) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get("http://unix/healthz")
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("operator listener did not become ready within 5s")
+}
+
+// Test_CleanBootCreate_PastDenyGate is the LOAD-BEARING proof the inert-daemon bug
+// is fixed (mandate (a)): the real daemon is composed exactly as serve() does, boots
+// clean through a bound operator listener with NO operator-authored deny, and a
+// create driven through the bound socket gets PAST the deny gate. Under the old
+// boot-time global deny this was refused forever with ErrKillSwitchEngaged; now the
+// only thing that fails is the absent docker backend at Materialize. The assertion
+// is therefore: the create is NOT refused by the kill-switch/denylist deny gate —
+// neither state.ErrKillSwitchEngaged nor state.ErrSessionDenied — and either it
+// succeeds (a backend is present) or it fails LATER for a non-deny reason.
+func Test_CleanBootCreate_PastDenyGate(t *testing.T) {
+	t.Parallel()
+	op, client, cancel := composeServeDaemon(t, false)
+	defer cancel()
+
+	// In-process typed-error proof: the create reaches Reserve and is NOT refused by
+	// the deny gate. On a host with no docker it fails later at Materialize; on a host
+	// with docker it may succeed. Either way the deny sentinels must be absent.
+	_, createErr := op.Handlers().Create(context.Background(), ingress.ConnInfo{Channel: ingress.ChannelOperator}, operator.CreateRequest{
+		SessionHint: "clean-boot", Image: "img", ControlPubKey: make([]byte, 32),
+	})
+	if errors.Is(createErr, state.ErrKillSwitchEngaged) {
+		t.Fatalf("clean-boot create refused by ErrKillSwitchEngaged — the inert-daemon bug is NOT fixed: %v", createErr)
+	}
+	if errors.Is(createErr, state.ErrSessionDenied) {
+		t.Fatalf("clean-boot create refused by ErrSessionDenied on a clean store: %v", createErr)
+	}
+	t.Logf("clean-boot create reached past the deny gate (err beyond the gate = %v)", createErr)
+
+	// Over-the-wire proof: the bound operator listener admits the request to the
+	// create pipeline. A 201 (backend present) or a 409 whose cause is the absent
+	// backend are both "past the deny gate"; the typed-error assertion above is the
+	// authoritative deny-gate check, since the wire status cannot carry the cause.
+	var buf bytes.Buffer
+	_ = json.NewEncoder(&buf).Encode(map[string]any{
+		"session_hint": "clean-boot-wire", "image": "img", "control_pub_key": make([]byte, 32),
+	})
+	resp, err := client.Post("http://unix/v1alpha/sessions", "application/json", &buf)
+	if err != nil {
+		t.Fatalf("create over the wire: %v", err)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	t.Logf("over-the-wire clean-boot create status=%d body=%s", resp.StatusCode, string(bytes.TrimSpace(raw)))
+}
+
+// Test_PersistedGlobalDeny_RefusesUntilResume is the durable-restore real-binary
+// proof (mandate (b)+(c)): an operator-authored ScopeGlobal deny seeded before boot
+// is restored by LoadDeny, so a create through the bound listener is REFUSED with
+// state.ErrKillSwitchEngaged — proving the operator-engaged deny survives a restart
+// and still works. It then lifts the deny in-band over the wire via the new
+// /v1alpha/resume/all operator route and proves a subsequent create PROCEEDS past
+// the deny gate.
+func Test_PersistedGlobalDeny_RefusesUntilResume(t *testing.T) {
+	t.Parallel()
+	op, client, cancel := composeServeDaemon(t, true)
+	defer cancel()
+
+	// The restored operator deny refuses the create at the gate.
+	_, createErr := op.Handlers().Create(context.Background(), ingress.ConnInfo{Channel: ingress.ChannelOperator}, operator.CreateRequest{
+		SessionHint: "denied", Image: "img", ControlPubKey: make([]byte, 32),
+	})
+	if !errors.Is(createErr, state.ErrKillSwitchEngaged) {
+		t.Fatalf("create with a restored operator global deny = %v; want ErrKillSwitchEngaged (durable restore)", createErr)
+	}
+
+	// Lift the global deny in-band over the wire via the new operator resume route.
+	resp, err := client.Post("http://unix/v1alpha/resume/all", "application/json", bytes.NewReader([]byte(`{"reason":"drill over"}`)))
+	if err != nil {
+		t.Fatalf("POST resume/all: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("resume/all over the wire = %d; want 200", resp.StatusCode)
+	}
+
+	// A subsequent create now proceeds past the deny gate.
+	_, afterErr := op.Handlers().Create(context.Background(), ingress.ConnInfo{Channel: ingress.ChannelOperator}, operator.CreateRequest{
+		SessionHint: "after-resume", Image: "img", ControlPubKey: make([]byte, 32),
+	})
+	if errors.Is(afterErr, state.ErrKillSwitchEngaged) {
+		t.Fatalf("create after ResumeAll still refused by ErrKillSwitchEngaged — the in-band lift did not take: %v", afterErr)
+	}
+	t.Logf("create after in-band resume reached past the deny gate (err beyond the gate = %v)", afterErr)
+}
+
+// Test_serveCreateOnStart_PersistedGlobalDenyRefusesAfterLoad covers the
+// serveCreateOnStart post-load refusal branch (mandate (b) at the cmd layer): with an
+// operator-authored ScopeGlobal deny seeded before the hook runs, the pre-load gate
+// still refuses first (transient ordering), then after LoadDeny restores the durable
+// deny the post-load AdmitCreate is refused with state.ErrKillSwitchEngaged — proving
+// the restored operator posture is enforced through the real create-on-start path,
+// not a fabricated boot-time deny.
+func Test_serveCreateOnStart_PersistedGlobalDenyRefusesAfterLoad(t *testing.T) {
+	t.Parallel()
+	clk := state.SystemClock()
+	store := state.NewInMemory(clk)
+	if err := store.SetDeny(context.Background(), state.DenyEntry{
+		Scope:  state.ScopeGlobal,
+		Reason: "operator drill",
+		Since:  clk.Now(),
+	}); err != nil {
+		t.Fatalf("seed operator ScopeGlobal deny: %v", err)
+	}
+
+	err := serveCreateOnStart(context.Background(), store, clk)
+	if err == nil {
+		t.Fatal("serveCreateOnStart with a restored global deny returned nil; want a refusal")
+	}
+	// The post-load AdmitCreate is refused by the restored operator deny.
+	if !errors.Is(err, state.ErrKillSwitchEngaged) {
+		t.Fatalf("serveCreateOnStart post-load error = %v; want state.ErrKillSwitchEngaged (durable restore enforced)", err)
+	}
+}
+
+// Test_serveCreateOnStart_CleanBootAdmitsAfterLoad covers the serveCreateOnStart
+// happy path explicitly at the unit layer: the pre-load gate refuses (NFR-SEC-01),
+// then a clean Boot loads an empty posture and the post-load AdmitCreate SUCCEEDS, so
+// the hook returns the pre-load ordering refusal wrapped under errKillSwitchFirst —
+// proving the daemon is not inert.
+func Test_serveCreateOnStart_CleanBootAdmitsAfterLoad(t *testing.T) {
+	t.Parallel()
+	clk := state.SystemClock()
+	store := state.NewInMemory(clk)
+
+	err := serveCreateOnStart(context.Background(), store, clk)
+	if !errors.Is(err, errKillSwitchFirst) {
+		t.Fatalf("serveCreateOnStart on a clean store = %v; want the pre-load errKillSwitchFirst refusal", err)
+	}
+	if !strings.Contains(err.Error(), "NFR-SEC-01") {
+		t.Fatalf("serveCreateOnStart error %q does not name NFR-SEC-01", err)
+	}
+	if !errors.Is(err, boot.ErrNotReady) {
+		t.Fatalf("serveCreateOnStart pre-load refusal does not wrap boot.ErrNotReady: %v", err)
+	}
+}
+
+// loadDenyFaultStore wraps an in-memory Store but faults LoadDeny with a wrapped
+// ErrStoreUnavailable, so the serveCreateOnStart Boot-error branch (the fail-closed
+// abort after the pre-load gate already refused) is exercised without a real outage.
+type loadDenyFaultStore struct{ state.Store }
+
+func (loadDenyFaultStore) LoadDeny(context.Context) ([]state.DenyEntry, error) {
+	return nil, state.ErrStoreUnavailable
+}
+
+// Test_serveCreateOnStart_BootFailIsSurfaced covers the serveCreateOnStart Boot-error
+// branch: the pre-load gate refuses first (transient ordering), then LoadDeny faults
+// so Boot returns the fail-closed boot.ErrNotReady, which serveCreateOnStart surfaces
+// as-is (never masking a store outage behind the ordering refusal).
+func Test_serveCreateOnStart_BootFailIsSurfaced(t *testing.T) {
+	t.Parallel()
+	clk := state.SystemClock()
+	store := loadDenyFaultStore{Store: state.NewInMemory(clk)}
+
+	err := serveCreateOnStart(context.Background(), store, clk)
+	if !errors.Is(err, boot.ErrNotReady) {
+		t.Fatalf("serveCreateOnStart with a faulted LoadDeny = %v; want boot.ErrNotReady (fail-closed Boot surfaced)", err)
+	}
+	if !errors.Is(err, state.ErrStoreUnavailable) {
+		t.Fatalf("serveCreateOnStart Boot-fail error does not preserve state.ErrStoreUnavailable: %v", err)
 	}
 }
 

@@ -206,6 +206,49 @@ func TestRevokeAllForceKillsJustReservedRow(t *testing.T) {
 	}
 }
 
+// TestResumeAllLiftsGlobalDenyAndAudits proves the operator in-band lift (mandate
+// (c) at the Engine level): with a deployment-wide DENY-ALL engaged (via RevokeAll),
+// a fresh Reserve is refused; ResumeAll then lifts it so a subsequent Reserve
+// succeeds, and the lift is audited FIRST with the OPERATOR identity as the actor.
+func TestResumeAllLiftsGlobalDenyAndAudits(t *testing.T) {
+	t.Parallel()
+	h := newEngineHarness()
+	ctx := context.Background()
+
+	// Engage DENY-ALL, then confirm a fresh Reserve is refused with the kill-switch
+	// sentinel — the bar ResumeAll must lift.
+	if err := h.engine.RevokeAll(ctx, h.scope, "incident"); err != nil {
+		t.Fatalf("RevokeAll: %v", err)
+	}
+	if _, err := h.cust.Reserve(ctx, registry.DeriveKey(owner, "during-deny"), owner); !errors.Is(err, state.ErrKillSwitchEngaged) {
+		t.Fatalf("Reserve during DENY-ALL = %v; want ErrKillSwitchEngaged", err)
+	}
+
+	// Lift the global deny in-band.
+	if err := h.engine.ResumeAll(ctx, h.scope, "all-clear"); err != nil {
+		t.Fatalf("ResumeAll: %v", err)
+	}
+
+	// A fresh Reserve now succeeds — the deployment-wide bar is gone.
+	if _, err := h.cust.Reserve(ctx, registry.DeriveKey(owner, "after-resume"), owner); err != nil {
+		t.Fatalf("Reserve after ResumeAll = %v; want success (global deny lifted)", err)
+	}
+
+	// The lift was audited with the OPERATOR identity as the actor (never the row
+	// owner), under the resume_global action.
+	rec, ok := recordFor(h.audit, audit.ActionResumeGlobal)
+	if !ok {
+		t.Fatal("ResumeAll did not emit an ActionResumeGlobal record")
+	}
+	if rec.Caller != operatorID.Caller || rec.Tenant != operatorID.Tenant {
+		t.Fatalf("resume_global actor = {%q,%q}, want the operator {%q,%q}",
+			rec.Tenant, rec.Caller, operatorID.Tenant, operatorID.Caller)
+	}
+	if rec.Key != "" {
+		t.Fatalf("resume_global Key = %q, want empty (a global lift targets every session)", rec.Key)
+	}
+}
+
 // TestRevokeOneAuthorsSessionDenyAndForceKills proves RevokeOne denylists exactly the
 // targeted session and force-kills its live row.
 func TestRevokeOneAuthorsSessionDenyAndForceKills(t *testing.T) {

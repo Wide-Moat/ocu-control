@@ -9,12 +9,14 @@
 // and enforces (enforcement is not in this package).
 //
 // Two reaches, one engine. RevokeOne denylists a single session key (ScopeSession);
-// RevokeAll engages DENY-ALL (ScopeGlobal) and force-kills EVERY live row. Both are
-// AUDIT-FIRST and fail-closed: the audit Record is emitted BEFORE the deny is
-// authored, and if the AuditSink fails the revoke is DENIED and no deny entry is
-// written — the audit trail can never lag the effect it records. The force-kill step
-// MUST include RESERVED rows, not only ACTIVE ones, so a just-reserved-not-yet-
-// committed session cannot survive a DENY-ALL.
+// RevokeAll engages DENY-ALL (ScopeGlobal) and force-kills EVERY live row; ResumeAll
+// is the symmetric in-band counterpart to RevokeAll — the operator-only lift of the
+// deployment-wide DENY-ALL. All are AUDIT-FIRST and fail-closed: the audit Record is
+// emitted BEFORE the durable posture is mutated, and if the AuditSink fails the
+// action is DENIED and the posture is left untouched — the audit trail can never lag
+// the effect it records. The force-kill step MUST include RESERVED rows, not only
+// ACTIVE ones, so a just-reserved-not-yet-committed session cannot survive a
+// DENY-ALL.
 //
 // SOAR verify-then-mint. The operator adapter runs SOARVerifier.Verify BEFORE it
 // mints the OperatorScope, so an unverifiable SOAR signature yields no scope and
@@ -198,6 +200,49 @@ func (e *Engine) RevokeAll(ctx context.Context, scope ingress.OperatorScope, rea
 		}
 	}
 	return firstErr
+}
+
+// ResumeAll is the operator-only in-band LIFT of the deployment-wide DENY-ALL
+// (ScopeGlobal) — the symmetric counterpart to RevokeAll. It is AUDIT-FIRST and
+// fail-closed: the Record (ActionResumeGlobal) is emitted BEFORE the global deny is
+// cleared, and an AuditSink failure DENIES the resume so the durable posture and the
+// audit trail can never disagree. The scope parameter is the operator capability the
+// gateway cannot obtain; the Valid check is the runtime backstop to the compile-time
+// seal. An operator who engaged a global kill-switch lifts it ONLY through this path
+// — it is never folded into a per-session denylist edit (that is LiftDeny, which
+// lifts ScopeSession only and refuses an empty key). There is no force-kill sweep:
+// ResumeAll only lifts the durable bar, and Reserve consults the same Store, so the
+// restored admit-posture is enforced implicitly. reason is operator-supplied context
+// for the audit trail.
+func (e *Engine) ResumeAll(ctx context.Context, scope ingress.OperatorScope, reason string) error {
+	if !scope.Valid() {
+		return ErrScopeInvalid
+	}
+
+	// Audit FIRST, fail-closed: the lift's record must be durable before the global
+	// deny is cleared. A write failure denies the resume and clears nothing. The Key
+	// is empty (a global lift targets every session, exactly like RevokeAll). The
+	// audit actor (actor.user) is WHO ACTED — the host-attested operator stamped onto
+	// the scope at mint, never a request-body hint (NFR-SEC-43).
+	rec := audit.Record{
+		Action:  audit.ActionResumeGlobal,
+		Channel: ingress.ChannelOperator.String(),
+		Caller:  scope.Identity().Caller,
+		Tenant:  scope.Identity().Tenant,
+		Reason:  reason,
+	}
+	if err := e.audit.Emit(ctx, rec); err != nil {
+		return fmt.Errorf("killswitch: resume-all audit: %w", err)
+	}
+
+	// Lift the deployment-wide DENY-ALL. The empty key is the documented ScopeGlobal
+	// key; ClearDeny is idempotent against an absent entry, so a double resume (or a
+	// resume with no global deny engaged) is a harmless no-op that still records the
+	// attempted operator action.
+	if err := e.store.ClearDeny(ctx, state.ScopeGlobal, ""); err != nil {
+		return fmt.Errorf("killswitch: resume-all clear: %w", err)
+	}
+	return nil
 }
 
 // forceKillKey reclaims the substrate for a single session key on the RevokeOne path.

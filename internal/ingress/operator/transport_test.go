@@ -283,6 +283,73 @@ func TestOperatorTransportRevokeOneAndAll(t *testing.T) {
 	}
 }
 
+// TestOperatorTransportResumeAll drives the new resume verb over the wire: after a
+// RevokeAll engages DENY-ALL, a /v1alpha/resume/all POST lifts it (200), proving the
+// operator-only resume route is reachable on the operator socket and the minted
+// OperatorScope flows from the held seam through to the killswitch Engine. A create
+// after the resume then succeeds (201), proving the in-band lift took effect.
+func TestOperatorTransportResumeAll(t *testing.T) {
+	t.Parallel()
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+
+	// Engage DENY-ALL, then a create is refused (409).
+	code, _ := postJSON(t, client, "/v1alpha/revoke/all", map[string]any{"reason": "incident"})
+	if code != http.StatusOK {
+		t.Fatalf("revoke/all = %d; want 200", code)
+	}
+	code, _ = postJSON(t, client, "/v1alpha/sessions", map[string]any{
+		"session_hint": "blocked", "image": "img", "control_pub_key": make([]byte, 32),
+	})
+	if code != http.StatusConflict {
+		t.Fatalf("create during DENY-ALL = %d; want 409", code)
+	}
+
+	// Lift the global deny in-band.
+	code, _ = postJSON(t, client, "/v1alpha/resume/all", map[string]any{"reason": "all-clear"})
+	if code != http.StatusOK {
+		t.Fatalf("resume/all over the wire = %d; want 200", code)
+	}
+
+	// A create now succeeds.
+	code, body := postJSON(t, client, "/v1alpha/sessions", map[string]any{
+		"session_hint": "after-resume", "image": "img", "control_pub_key": make([]byte, 32),
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("create after resume/all = %d; want 201", code)
+	}
+	if body["key"] == nil || body["key"].(string) == "" {
+		t.Fatalf("create-after-resume response missing host-derived key: %v", body)
+	}
+}
+
+// TestOperatorTransportResumeAllEdges drives the resume route's method-not-allowed
+// (GET → 405) and unattested (refusing resolver → 401) edges, mirroring the
+// revoke/all route-edge tests so writeRevokeError is exercised on the resume path.
+func TestOperatorTransportResumeAllEdges(t *testing.T) {
+	t.Parallel()
+
+	// Method-not-allowed: GET on the POST-only resume route.
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+	resp, err := client.Get("http://unix/v1alpha/resume/all")
+	if err != nil {
+		t.Fatalf("GET resume/all: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET resume/all = %d; want 405", resp.StatusCode)
+	}
+
+	// Unattested: a refusing resolver makes resume/all 401.
+	_, refusingClient, _ := boundOperator(t, fixedResolver{refuse: true}, nil)
+	code, _ := postJSON(t, refusingClient, "/v1alpha/resume/all", map[string]any{"reason": "x"})
+	if code != http.StatusUnauthorized {
+		t.Fatalf("unattested resume/all = %d; want 401", code)
+	}
+}
+
 // TestOperatorTransportUnattestedRefused drives the fail-closed transport path: a
 // resolver that refuses (modelling an unattested connection — exactly what the real
 // SO_PEERCRED path produces when the kernel attests nothing) makes a create return

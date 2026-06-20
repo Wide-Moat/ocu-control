@@ -68,6 +68,7 @@ func SEC45Actions() []Action {
 		ActionOverrideQuota,   // operator quota override
 		ActionDestroy,         // operator-initiated teardown (state-mutating)
 		ActionRetentionPolicy, // retention-policy change (deferred wire surface)
+		ActionResumeGlobal,    // operator global-deny LIFT (symmetric to RevokeAll)
 	}
 }
 

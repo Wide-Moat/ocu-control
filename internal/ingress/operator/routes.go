@@ -16,7 +16,8 @@ import (
 )
 
 // registerRoutes mounts the minimal operator HTTP surface onto mux: create,
-// destroy, and the two revoke verbs. Each handler pulls the per-connection
+// destroy, the two revoke verbs, and the resume verb (the in-band lift of the
+// deployment-wide DENY-ALL). Each handler pulls the per-connection
 // host-attested ConnInfo the ConnContext hook stashed and drives the matching
 // Handlers method, so the transport reuses the exact in-process surface the tests
 // drive directly. The bodies are a minimal JSON shape sufficient to exercise
@@ -97,6 +98,24 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		}
 		writeStatus(w, http.StatusOK, "deny-all engaged")
 	})
+
+	mux.HandleFunc("/v1alpha/resume/all", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		conn := connInfoFromRequest(r)
+		var body resumeAllBody
+		if err := decodeJSON(r, &body); err != nil {
+			writeStatus(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+		if err := h.ResumeAll(r.Context(), conn, body.Reason); err != nil {
+			writeRevokeError(w, err)
+			return
+		}
+		writeStatus(w, http.StatusOK, "deny-all lifted")
+	})
 }
 
 // createBody is the minimal JSON create request. SessionHint and the runtime
@@ -133,6 +152,13 @@ type revokeOneBody struct {
 }
 
 type revokeAllBody struct {
+	Reason string `json:"reason"`
+}
+
+// resumeAllBody is the minimal resume request body: the operator-supplied reason
+// for the in-band lift of the deployment-wide DENY-ALL. An empty body decodes to
+// the zero value (an empty reason), exactly like revoke/all.
+type resumeAllBody struct {
 	Reason string `json:"reason"`
 }
 

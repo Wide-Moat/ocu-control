@@ -9,20 +9,20 @@
 // runs the kill-switch-first boot.
 //
 // serve() is the composition root. It opens the state.Store (in-memory or
-// Postgres), runs Boot — which loads the durable deny posture and engages
-// DENY-ALL before any listener binds — constructs the Storage-JWT signer, the
-// RuntimeProvider behind the seam, and the durable OCSF audit sink, composes the
-// lifecycle Manager and the kill-switch Engine, and binds the operator and
-// gateway listeners ONLY off the boot readiness hook (so a bind is reachable
-// only after the deny posture is durable). It then serves until the
-// signal-driven shutdown.
+// Postgres), runs Boot — which loads the durable deny posture (and serves exactly
+// the operator-authored deny it restored) before any listener binds — constructs
+// the Storage-JWT signer, the RuntimeProvider behind the seam, and the durable
+// OCSF audit sink, composes the lifecycle Manager and the kill-switch Engine, and
+// binds the operator and gateway listeners ONLY off the boot readiness hook (so a
+// bind is reachable only after the deny posture is durable). It then serves until
+// the signal-driven shutdown.
 //
 // Boot is fail-closed throughout: an unreachable store, a missing signing key,
 // or an unopenable audit sink aborts before any listener binds. -create-on-start
-// is the pre-bind smoke hook: a create presented at startup flows through the
-// real Boot and Store path and is refused against the engaged kill-switch
-// (NFR-SEC-01) without registering the bind hook, so no socket is ever bound on
-// the refusal.
+// is the pre-bind kill-switch-first ORDERING smoke hook: a create presented
+// BEFORE Boot loads the deny posture is refused by the transient not-loaded gate
+// (NFR-SEC-01), then a create AFTER a clean Boot is admitted — all without
+// registering the bind hook, so no socket is ever bound on the refusal.
 package main
 
 import (
@@ -69,7 +69,7 @@ var (
 	errUnknownProvider        = errors.New("unknown runtime provider")
 	errUnknownWorkloadProfile = errors.New("unknown workload profile")
 	errUnknownJWTAlg          = errors.New("unknown jwt signing algorithm")
-	errKillSwitchFirst        = errors.New("kill-switch engaged before listener bind: create refused (NFR-SEC-01)")
+	errKillSwitchFirst        = errors.New("kill-switch-first: create before deny posture loaded refused (NFR-SEC-01)")
 )
 
 // knownRuntimeTiers and knownRuntimeProviders are the closed enumerations the
@@ -159,9 +159,9 @@ func openStore(ctx context.Context, dsn string, clk state.Clock) (state.Store, e
 // serve runs the kill-switch-first boot sequence after the static gates have
 // passed, then composes the lifecycle layer and the two-listener ingress and
 // binds both listeners — but ONLY off the boot readiness hook, strictly after
-// Boot has loaded the durable deny posture and engaged the deployment-wide
-// kill-switch. An unreachable store at boot is fail-closed: serve returns and
-// binds nothing.
+// Boot has loaded the durable deny posture (and restored exactly the
+// operator-authored deny it holds). An unreachable store at boot is fail-closed:
+// serve returns and binds nothing.
 //
 // The composition wires the deployment-fixed profile and tier into the lifecycle
 // Manager (neither is per-request), constructs the kill-switch Engine and both
@@ -170,12 +170,13 @@ func openStore(ctx context.Context, dsn string, clk state.Clock) (state.Store, e
 // so the kill-switch is unreachable from the gateway as a compile fact.
 //
 // With -create-on-start (the smoke hook), a create is presented through the real
-// Sequencer.AdmitCreate path BEFORE any bind hook is registered: the engaged
-// kill-switch makes Store.Reserve refuse with state.ErrKillSwitchEngaged, which
-// serve re-wraps under errKillSwitchFirst so the operator-facing refusal still
-// names NFR-SEC-01. Because this path returns before the bind hook is installed,
-// the create-on-start refusal binds no socket — the e2e smoke asserts exactly
-// that no socket exists on the refusal.
+// Sequencer.AdmitCreate path BEFORE any bind hook is registered AND before Boot
+// loads the deny posture: the transient not-loaded gate refuses it with
+// boot.ErrNotReady, which serve re-wraps under errKillSwitchFirst so the
+// operator-facing refusal still names NFR-SEC-01. The hook then loads the posture
+// and confirms a clean-store create is admitted (the daemon is not inert). Because
+// this path returns before the bind hook is installed, the create-on-start path
+// binds no socket — the e2e smoke asserts exactly that no socket exists.
 func serve(ctx context.Context, cfg config) error {
 	clk := state.SystemClock()
 
@@ -318,27 +319,48 @@ func serve(ctx context.Context, cfg config) error {
 	return serveListeners(ctx, opListener, gwListener)
 }
 
-// serveCreateOnStart drives the kill-switch-first create smoke hook end-to-end
-// through the real boot + Store path and refuses pre-bind. It registers NO
-// readiness bind hook, so the refusal binds no socket — the e2e smoke asserts
-// exactly that. The refusal's typed cause is state.ErrKillSwitchEngaged from the
-// boot-engaged global posture; it is re-wrapped under errKillSwitchFirst so the
-// load-bearing NFR-SEC-01 text holds.
+// serveCreateOnStart drives the kill-switch-FIRST ORDERING smoke hook end-to-end
+// through the real boot + Store path and binds NO socket — the e2e smoke asserts
+// exactly that no listener exists on the refusal. It demonstrates the REAL
+// kill-switch-first invariant: a create presented BEFORE Boot loads the durable
+// deny posture is refused fail-closed by the transient not-loaded gate (the
+// daemon grants no authority in the un-loaded window), and a create AFTER a clean
+// Boot with no operator-authored deny is admitted normally — proving the daemon is
+// not inert. The pre-load refusal's typed cause is boot.ErrNotReady; it is
+// re-wrapped under errKillSwitchFirst so the load-bearing NFR-SEC-01 text holds.
 func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock) error {
 	seq := boot.New(store, clk)
-	if err := seq.Boot(ctx); err != nil {
-		return err
-	}
 	owner := state.Identity{Tenant: "smoke-tenant", Caller: "smoke-caller"}
-	if err := seq.AdmitCreate(ctx, "create-on-start", owner); err != nil {
-		if errors.Is(err, state.ErrKillSwitchEngaged) {
-			return fmt.Errorf("%w: %v", errKillSwitchFirst, err)
-		}
+
+	// BEFORE Boot: the transient not-loaded gate refuses the create fail-closed, so
+	// no create slips through the un-loaded window. This is the kill-switch-first
+	// ordering the smoke proves — a refusal lifted by the load itself, never a
+	// fabricated boot-time global deny.
+	if err := seq.AdmitCreate(ctx, "create-on-start", owner); err == nil {
+		return errors.New("boot: create admitted before the deny posture loaded (kill-switch-first ordering violated)")
+	} else if !errors.Is(err, boot.ErrNotReady) {
 		return err
+	} else {
+		// Re-wrap the pre-load refusal under the NFR-SEC-01 sentinel the smoke greps,
+		// preserving the typed boot.ErrNotReady cause in the chain so a caller can
+		// match either the operator-facing sentinel or the transient-gate cause.
+		preLoad := fmt.Errorf("%w: %w", errKillSwitchFirst, err)
+		// Now LOAD the durable posture and prove a clean-store create is admitted —
+		// the daemon is not inert. A non-nil Boot is a fail-closed abort (surfaced
+		// as-is); an operator-authored global deny restored by LoadDeny would refuse
+		// the create below with state.ErrKillSwitchEngaged, which is the correct
+		// durable-restore behaviour and also surfaced as-is.
+		if err := seq.Boot(ctx); err != nil {
+			return err
+		}
+		if err := seq.AdmitCreate(ctx, "create-on-start", owner); err != nil {
+			return fmt.Errorf("boot: clean-boot create-on-start refused after load: %w", err)
+		}
+		// The ordering proof is the load-bearing smoke assertion: report the pre-load
+		// refusal so the daemon exits 1 naming NFR-SEC-01, having also confirmed the
+		// post-load admit succeeds (no socket was ever bound — no onReady hook ran).
+		return preLoad
 	}
-	// An admitted create here would be a kill-switch-first violation: unreachable
-	// because Boot always engages the global posture.
-	return errors.New("boot: create admitted despite kill-switch-first posture (invariant violated)")
 }
 
 // compose builds the lifecycle Manager and the kill-switch Engine over the shared
