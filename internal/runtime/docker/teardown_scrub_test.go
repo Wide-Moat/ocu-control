@@ -100,6 +100,68 @@ func TestTeardownStep3ScrubsHandoffRoot(t *testing.T) {
 	}
 }
 
+// TestTeardownStep3ScrubsArbitraryGuestDroppedResidue proves the step-3 scrub is a
+// WHOLE-TREE removal, not a credential-file allowlist. The per-session handoff root
+// holds the guest-writable 0700 sock dir (the guest creates its exec/control sockets
+// there), so a guest with in-sandbox root can drop ARBITRARY files and subtrees under
+// the root — not only the sock files and the host-written mount-config. If the scrub
+// only removed the files Control itself wrote, that guest-dropped residue would
+// outlive the session on host-visible disk. This test stages the normal credential
+// tree PLUS arbitrary guest-dropped residue (a stray file in the sock dir and a
+// guest-created subdirectory with content) and asserts the ENTIRE root is gone after
+// teardown — making "scrub removes everything under the root, not an allowlist" an
+// explicit, proven invariant. It is the no-gap counterpart to the sandbox plane's
+// no-overlap assertion: between the two halves of the NFR-SEC-65 finalizer there is
+// neither a seam nor a double-free of the handoff root.
+func TestTeardownStep3ScrubsArbitraryGuestDroppedResidue(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	const name = runtime.SessionName("sess-guest-residue")
+	root := stageHandoffRoot(t, base, name)
+
+	// The guest (in-sandbox root) drops arbitrary residue the host never wrote: a
+	// stray file directly in the guest-writable 0700 sock dir, and a whole subtree the
+	// guest created. Neither is a file Control staged, so a credential-allowlist scrub
+	// would leave them behind.
+	guestResidue := map[string][]byte{
+		"sock/garbage-from-guest.dat": []byte("arbitrary bytes the guest wrote"),
+		"junk/nested/leftover.bin":    []byte("a guest-created subtree with content"),
+	}
+	for rel, data := range guestResidue {
+		full := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(full), 0o700); err != nil {
+			t.Fatalf("stage guest residue dir for %q: %v", rel, err)
+		}
+		if err := os.WriteFile(full, data, 0o600); err != nil {
+			t.Fatalf("stage guest residue %q: %v", rel, err)
+		}
+	}
+
+	fake := newFakeAPI()
+	p, err := NewDockerProvider(runtime.TierRunc, Deps{API: fake, StagerBase: base})
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	sess := runtime.Sandbox{
+		Name:      name,
+		RuntimeID: "ctr-guest-residue",
+		Egress:    runtime.EgressBinding{Name: name, FilesystemID: "fs-1"},
+		Tier:      runtime.TierRunc,
+	}
+
+	if err := p.Teardown().ForceKill(context.Background(), sess); err != nil {
+		t.Fatalf("ForceKill: %v", err)
+	}
+
+	// The WHOLE tree is gone — the guest-dropped file and subtree included, not just
+	// the host-written credential files. A surviving root (or any guest residue under
+	// it) would mean the scrub is allowlist-scoped, which is exactly the leak this
+	// proves absent.
+	if _, err := os.Lstat(root); !os.IsNotExist(err) {
+		t.Fatalf("handoff root (with guest-dropped residue) must be fully removed (stat err=%v); want not-exist", err)
+	}
+}
+
 // TestTeardownStep3GracefulStopScrubs proves the scrub runs on the GracefulStop verb
 // too (both verbs share one finalize body), so a cooperative Destroy reclaims the
 // host-owned credential tree exactly as a force-kill does.
