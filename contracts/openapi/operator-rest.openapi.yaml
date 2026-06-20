@@ -388,12 +388,14 @@ components:
           description: >-
             Host-enforced posture: true => RO input, false => RW sink. The agent cannot
             flip it.
-        cache_seconds:
+        cache_duration_s:
           type: integer
           minimum: 0
           description: >-
-            Per-mount local-VFS freshness window in whole seconds (short for RO inputs,
-            long for the RW sink).
+            Per-mount local-VFS freshness window in whole seconds (the VFS dir-cache
+            time; short for RO inputs, long for the RW sink). Named to match the canon
+            mount-config CacheDurationSeconds shape, so MountIntent is byte-consistent
+            across this REST surface and the session-setup gRPC surface.
       x-ocu-design: >-
         auth_token is INTENTIONALLY ABSENT: in the create request the caller does not
         supply the weak Storage-JWT — Control mints it and pushes it on the separate

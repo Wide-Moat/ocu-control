@@ -9,11 +9,15 @@
 # IN_SCOPE below, so it can never silently drift as the tree grows.
 #
 # IN SCOPE (shipped source that must carry the SPDX header):
-#   *.go                      — daemon source
-#   *.sh                      — shell tooling
-#   .github/workflows/*.yml   — CI workflow definitions
-#   Dockerfile                — the shipped build recipe
-#   contrib/systemd/*.service — the shipped systemd unit
+#   *.go                       — daemon source
+#   *.sh                       — shell tooling
+#   .github/workflows/*.yml    — CI workflow definitions
+#   Dockerfile                 — the shipped build recipe
+#   contrib/systemd/*.service  — the shipped systemd unit
+#   contracts/openapi/*.yaml   — the OpenAPI 3.1 wire surfaces this repo defines,
+#                                plus their redocly lint config; YAML comment SPDX.
+#   contracts/proto/**/*.proto — the gRPC wire surfaces this repo defines; // SPDX.
+#   contracts/proto/buf.yaml   — the proto module/lint config; YAML comment SPDX.
 #
 # DELIBERATELY OUT OF SCOPE (documented so the omission is a decision, not a
 # gap):
@@ -41,6 +45,9 @@ readonly -a IN_SCOPE=(
   '.github/workflows/*.yml'
   'Dockerfile'
   'contrib/systemd/*.service'
+  'contracts/openapi/*.yaml'
+  'contracts/proto/*.yaml'
+  'contracts/proto/**/*.proto'
 )
 
 misses=()

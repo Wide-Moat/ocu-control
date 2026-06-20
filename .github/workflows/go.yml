@@ -221,20 +221,46 @@ jobs:
       - name: govulncheck
         run: govulncheck ./...
 
-  # schema compiles every vendored JSON-Schema contract with ajv: a structural
-  # validity gate distinct from the byte-identity gate below. A schema that no
-  # longer compiles (a bad re-vendor, a malformed $ref) fails here even if the
-  # canon checkout is absent.
+  # schema is the structural-validity gate for every contract this repo carries,
+  # distinct from the byte-identity gate below. It compiles the vendored
+  # JSON-Schema contracts with ajv, lints the draft OpenAPI 3.1 surfaces this repo
+  # defines (#205) with redocly, and lints the draft session-setup proto with buf.
+  # A contract that no longer parses (a bad re-vendor, a malformed $ref, a broken
+  # OpenAPI ref, a proto lint regression) fails here even if the canon checkout is
+  # absent — so a draft surface cannot rot before it is frozen upstream.
   schema:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: ajv compile the vendored schemas
+      - name: ajv compile the vendored JSON-Schema contracts
         run: |
           npx --yes ajv-cli@5.0.0 compile --spec=draft2020 --strict=false \
             -s contracts/control/control-rpc.schema.json \
             -s contracts/exec/exec-channel.schema.json \
             -s contracts/storage/mount-config.schema.json
+      # The draft operator-REST and SOAR-revoke surfaces (#205 define-surface).
+      # The redocly config disables exactly two recommended-ruleset opinions that
+      # conflict with sourced design choices (the host-local UDS surface declares
+      # no servers block; the filesystem_id XOR memory_store_id not/required idiom),
+      # documented in contracts/openapi/redocly.yaml — never an OpenAPI 3.1 rule.
+      - name: redocly lint the draft OpenAPI surfaces
+        run: |
+          npx --yes @redocly/cli@1.34.2 lint --config contracts/openapi/redocly.yaml \
+            contracts/openapi/operator-rest.openapi.yaml \
+            contracts/openapi/soar-revoke.openapi.yaml
+      # The draft session-setup gRPC surface (#205 define-surface). buf lint also
+      # underpins the additive-only breaking-change gate the contract evolves under
+      # (NFR-IC-04); this step keeps the proto lint-clean from commit one. buf is
+      # installed via go install (Go is already provisioned for the Go jobs), so the
+      # step pulls in no third-party action — one fewer supply-chain edge to pin.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: install buf
+        run: go install github.com/bufbuild/buf/cmd/buf@v1.50.0
+      - name: buf lint the draft session-setup proto
+        working-directory: contracts/proto
+        run: buf lint
 
   checks:
     runs-on: ubuntu-latest
