@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: rpc-version
+
+# RPC-surface versioning gate (NFR-IC-04): a breaking change to the control-plane
+# operator/gateway RPC wire surface requires a MAJOR version bump + a deprecation
+# header. This job runs the committed scripts/rpc-version-check.sh, which diffs the
+# current wire surface against the PR merge base with buf (proto) / oasdiff (OpenAPI).
+#
+# The operator-REST / proto WIRE schemas are a deferred follow-up (#205): the v1
+# control plane ships its wire surface as the FROZEN JSON-Schema contracts under
+# contracts/, which buf/oasdiff cannot breaking-diff. Until the proto/OpenAPI
+# schemas land, the check SKIPS with a notice (exit 0) so the gate is wired and green
+# from commit 1, then enforces automatically the moment a diffable surface is
+# committed. See docs/rpc-versioning.md for the full policy and the migration TODO.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rpc-version-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  rpc-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          # Full history so the merge base is fetchable for the breaking-change diff.
+          fetch-depth: 0
+      - name: resolve the base ref for the surface diff
+        id: base
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="origin/${{ github.base_ref }}"
+          else
+            base="HEAD^"
+          fi
+          echo "ref=$base" >> "$GITHUB_OUTPUT"
+          echo "rpc-version base ref: $base"
+      - name: rpc-surface breaking-change gate (buf/oasdiff, skip-until-schemas)
+        run: bash scripts/rpc-version-check.sh "${{ steps.base.outputs.ref }}"

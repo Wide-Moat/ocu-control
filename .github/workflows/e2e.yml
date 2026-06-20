@@ -105,8 +105,13 @@ jobs:
       # Postgres state.Store AND the REAL Docker daemon together — admission →
       # quota → reserve → stage-handoff → materialize a real container → commit →
       # bind, then a host-driven destroy that removes the container and tombstones
-      # the row. The daemon is local to the runner, so the HOST-01 bind sources
-      # resolve from t.TempDir (no OCU_RUNTIME_IT_STAGE_DIR needed).
+      # the row. The same test additionally drives the Phase-4 mount-config push
+      # (asserting the rendered config landed on the handoff bind before materialize,
+      # carrying the weak Bearer and no backend cred) and the Phase-5 chain-linked
+      # OCSF audit (a validatable create→destroy spine with the no-minted-token-in-
+      # event grep). The daemon is local to the runner, so the HOST-01 bind sources
+      # resolve from t.TempDir (no OCU_RUNTIME_IT_STAGE_DIR needed). Release-gating:
+      # no continue-on-error.
       - name: run the lifecycle create→destroy e2e (real Postgres + real Docker)
         env:
           OCU_TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/ocu_control_test?sslmode=disable

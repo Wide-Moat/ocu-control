@@ -47,6 +47,13 @@ const (
 	ActionEditDenylist
 	// ActionOverrideQuota is an operator quota override.
 	ActionOverrideQuota
+	// ActionRetentionPolicy is an operator/SOAR retention-policy change. It is a
+	// state-mutating operator action named explicitly in the SEC-45 privileged-action
+	// fixture; it has its own enum arm so the exhaustiveness property can prove no
+	// privileged action escapes the audit wrap. Its wire surface (the operator route
+	// that drives it) is a deferred follow-up; the enum value exists now so the audit
+	// classification is closed over every privileged action the fixture names.
+	ActionRetentionPolicy
 )
 
 // String renders the Action for the audit record and for diagnostics. An
@@ -67,6 +74,8 @@ func (a Action) String() string {
 		return "edit_denylist"
 	case ActionOverrideQuota:
 		return "override_quota"
+	case ActionRetentionPolicy:
+		return "retention_policy"
 	default:
 		return "audit_action_unknown"
 	}

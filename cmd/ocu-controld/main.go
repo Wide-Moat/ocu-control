@@ -31,7 +31,7 @@ import (
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
-	"github.com/Wide-Moat/ocu-control/internal/audit"
+	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
 	"github.com/Wide-Moat/ocu-control/internal/boot"
 	"github.com/Wide-Moat/ocu-control/internal/controlrpc"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
@@ -275,15 +275,23 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 
 // compose builds the lifecycle Manager and the kill-switch Engine over the shared
 // Store, Clock, and Provider. The minimal-shelf collaborators — an in-tree
-// handoff Stager, an audit RecordingFake (the real OCSF serializer is a later
-// phase; the fail-closed branch ships now), and a deployment Limits — are bound
-// here. profile and tier are deployment-fixed and flow onto the Manager as fixed
-// fields; CreateInput carries neither.
+// handoff Stager, the OCSF chain audit sink over the NullSink default writer
+// (chain computed in-process, nothing durably persisted by default), and a
+// deployment Limits — are bound here. profile and tier are deployment-fixed and
+// flow onto the Manager as fixed fields; CreateInput carries neither.
 func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, cfg config) (*lifecycle.Manager, *killswitch.Engine) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
 	stager := handoff.NewStager(handoffBase)
-	sink := audit.NewRecordingFake()
+	// The real OCSF chain sink: it serializes each privileged audit.Record to a
+	// faithful OCSF event, assigns a per-source monotonic sequence, and hash-chains
+	// the spine — all on the success path, BEFORE the privileged action is
+	// acknowledged (fail-closed). The DEFAULT durable writer is ocsf.NullSink: the
+	// chain is computed and validatable in-process, but nothing is durably persisted
+	// (zero external dependency, the minimal-shelf rule). A real EventWriter (a file
+	// appender, a WORM/bus client) slots in behind the same EventWriter contract with
+	// no change to any Emit call site — only this writer argument changes.
+	sink := ocsf.NewChainSink(clk, ocsf.NullSink{}, "control")
 
 	// The advisory control-RPC dialer mints its per-dial exec JWT through the same
 	// Storage-JWT custodian Signer (the narrow MintExecJWT seam, never the signing

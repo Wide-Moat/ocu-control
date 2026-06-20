@@ -137,6 +137,7 @@ func TestActionString(t *testing.T) {
 		{audit.ActionRevokeAll, "revoke_all"},
 		{audit.ActionEditDenylist, "edit_denylist"},
 		{audit.ActionOverrideQuota, "override_quota"},
+		{audit.ActionRetentionPolicy, "retention_policy"},
 		{audit.Action(250), "audit_action_unknown"},
 	}
 	for _, c := range cases {
