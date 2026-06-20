@@ -35,7 +35,7 @@ GREMLINS_VERSION := v0.6.0
 # artifact.
 COVERAGE_FLOOR := 91
 
-.PHONY: help build bin test test-race cover spdx contract identity seccomp schema vet fmt \
+.PHONY: help build bin dev-secrets test test-race cover spdx contract identity seccomp schema vet fmt \
         staticcheck lint mutation check
 
 # ── help ────────────────────────────────────────────────────────────────────
@@ -44,6 +44,7 @@ help: ## Print this target list
 	@printf '\nUsage:  make <target>\n\n'
 	@printf '  %-20s  %s\n' build       "CGO_ENABLED=0 go build ./..."
 	@printf '  %-20s  %s\n' bin         "Build the daemon into build/ocu-controld (gitignored)"
+	@printf '  %-20s  %s\n' dev-secrets "Generate the dev Storage-JWT signing key (idempotent; never overwrites)"
 	@printf '  %-20s  %s\n' test        "go test ./...  (e2e legs loud-skip without OCU_CONTROL_BIN)"
 	@printf '  %-20s  %s\n' test-race   "go test -race ./..."
 	@printf '  %-20s  %s\n' cover       "Coverage floor ($(COVERAGE_FLOOR)%%) over ./internal/..."
@@ -67,6 +68,24 @@ build: ## Build all packages (static, no cgo) — mirrors e2e.yml build step
 bin: ## Build the daemon into build/ocu-controld (gitignored — never the repo root)
 	mkdir -p build
 	CGO_ENABLED=0 go build -trimpath -o build/ocu-controld ./cmd/ocu-controld
+
+# ── dev-secrets ───────────────────────────────────────────────────────────────
+#
+# Materialize the local development Storage-JWT signing key so the first-run
+# quickstart and the compose default mount source actually boot — the daemon is
+# fail-closed on a missing -jwt-signing-key, and deploy/docker-compose.yml
+# defaults the mount to ./deploy/dev-secrets/storage-jwt-signing.key, which is
+# not in a fresh checkout. The generator targets the DEFAULT eddsa alg and is
+# idempotent: a re-run never overwrites an existing key (it prints a notice). The
+# whole deploy/dev-secrets/ dir is gitignored so a dev key is never staged.
+#
+# It runs the key-gen via the build-ignored cmd wrapper (over internal/devsecrets
+# — the same code the test exercises) with the explicit-file form, because the
+# //go:build ignore tag hides the cmd from package-form `go run ./cmd/devsecrets`.
+# This is a DEV key only; production provisions the signing key out of band.
+
+dev-secrets: ## Generate the dev Storage-JWT signing key (idempotent; never overwrites)
+	go run cmd/devsecrets/main.go deploy/dev-secrets/storage-jwt-signing.key
 
 # ── test ────────────────────────────────────────────────────────────────────
 #

@@ -20,7 +20,19 @@
 # real file that MUST exist at runtime (there is no daemon-default key): the
 # daemon aborts fail-closed at boot without it. The volume mount below points it
 # at OCU_JWT_SIGNING_KEY (default ./deploy/dev-secrets/storage-jwt-signing.key);
-# supply your own secret source there before `up`.
+# supply your own secret source there before `up`. To materialize the defaulted
+# dev key from the repo root (idempotent — never overwrites), run:
+#
+#   make dev-secrets
+#
+# or the byte-compatible openssl equivalent:
+#
+#   openssl genpkey -algorithm ed25519 \
+#     -out deploy/dev-secrets/storage-jwt-signing.key \
+#     && chmod 600 deploy/dev-secrets/storage-jwt-signing.key
+#
+# This is a DEV key (default eddsa alg); production provisions the key out of
+# band. The deploy/dev-secrets/ dir is gitignored so a dev key is never staged.
 #
 # Posture notes:
 # - The root filesystem is read-only; the writable surfaces are the audit sink

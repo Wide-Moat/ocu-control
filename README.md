@@ -55,6 +55,26 @@ Build the daemon (static, no cgo):
 make bin   # writes build/ocu-controld
 ```
 
+Generate the Storage-JWT signing key the daemon mounts. `-jwt-signing-key` names
+a real file that must exist at boot — there is no daemon-default key, so without
+it the daemon refuses to boot fail-closed:
+
+```
+make dev-secrets   # writes deploy/dev-secrets/storage-jwt-signing.key (0600, idempotent)
+```
+
+`make dev-secrets` is idempotent: a re-run never overwrites an existing key. The
+openssl equivalent produces a byte-compatible PKCS8-PEM Ed25519 key:
+
+```
+openssl genpkey -algorithm ed25519 -out deploy/dev-secrets/storage-jwt-signing.key \
+  && chmod 600 deploy/dev-secrets/storage-jwt-signing.key
+```
+
+This is a DEV key for the default `eddsa` alg; a production deployment provisions
+its signing key out of band (the key is never committed — `deploy/dev-secrets/`
+is gitignored).
+
 Run it with the required flags the boot validator demands — omit any one and
 the daemon refuses to boot fail-closed:
 
@@ -76,7 +96,7 @@ build/ocu-controld \
   `untrusted` — the deployment-declared trust profile keying the admission
   matrix.
 - `-jwt-signing-key` names a real file that must exist at runtime; there is no
-  daemon-default key.
+  daemon-default key. Generate the dev key with `make dev-secrets`.
 - `-audit-sink` names a writable path backed by a durable, fsync-on-write OCSF
   trail. `none`/`null` selects the non-durable sink behind a loud WARN.
 - `-state-dsn` is empty by default (the in-memory minimal shelf); a non-empty
