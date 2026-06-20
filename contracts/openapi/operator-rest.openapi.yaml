@@ -320,18 +320,14 @@ components:
           description: >-
             Human-readable handle hint. It seeds the host-minted handle for correlation;
             it NEVER becomes the host-derived session key (NFR-SEC-43).
-        image:
-          type: string
-          minLength: 1
-          description: >-
-            Sandbox container image reference the provider runs.
-          x-ocu-open-questions: >-
-            PIN-PENDING reconciliation: this operator create carries `image` (mirroring the
-            in-process operator/gateway CreateRequest), but the gatekeeper-frozen gateway
-            (proto) CreateRequest {workload_trust_profile, mount_intent, egress_policy,
-            resource_caps} does NOT carry it. Whether `image` is a deployment-pinned ref
-            (per ADR-0020 image provisioning) or a create-time hint is unresolved — flagged
-            for the gatekeeper, neither silently kept nor dropped.
+        # x-ocu-reserved: image — held PIN-PENDING, not a live field. ADR-0020
+        # (sandbox image provisioning) is status `proposed — stub`; its Open
+        # Question #4 — does an image_ref/image_tier ride this create surface, or
+        # is it deployment-pinned off the workload class and off the wire entirely
+        # — is unresolved. The frozen gateway proto CreateRequest holds the same
+        # field as `reserved 6; reserved "image"`. OpenAPI has no `reserved`
+        # primitive, so the field is withheld here and re-added as an additive
+        # change once ADR-0020 closes. Do not add it back before then.
         mount:
           $ref: '#/components/schemas/MountIntent'
         egress:
@@ -602,16 +598,15 @@ components:
             maxLength 256 mirrors the NFR-SEC-51 BoundedReason.message default; retunable,
             not source-pinned.
 
-# Reconciliation points flagged for the gatekeeper at freeze time.
-x-ocu-open-questions:
+# Gatekeeper resolutions recorded at freeze time.
+x-ocu-notes:
   - >-
-    PIN-PENDING: the operator (and in-process gateway) CreateRequest carries `image` (a
-    sandbox image ref); the gatekeeper-frozen gateway proto CreateRequest
-    {workload_trust_profile, mount_intent, egress_policy, resource_caps} does not. Resolve
-    whether `image` is a deployment-pinned ref (ADR-0020 image provisioning) or a
-    create-time hint — do not silently add or drop it.
+    `image` is withheld (x-ocu-reserved on CreateRequest), not a live field, pending
+    ADR-0020 Open Question #4. The frozen gateway proto holds the same field as
+    `reserved 6`. It re-enters as an additive change once ADR-0020 closes — not before.
   - >-
     The operator transport's security scheme is modelled as `mutualTLS` because OpenAPI has
     no native "verified UDS peer-cred" scheme; the v1 substrate is a host-owned 0700
-    operator socket with SO_PEERCRED, not network mTLS (ADR-0004). Confirm the carrier at
-    freeze.
+    operator socket with SO_PEERCRED, not network mTLS (ADR-0004). The `mutualTLS` keyword
+    is the nearest OpenAPI primitive for a mutually-authenticated local transport; the
+    carrier is the host-owned UDS, which is also why no `servers` block is declared.

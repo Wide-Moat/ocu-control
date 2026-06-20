@@ -251,16 +251,21 @@ jobs:
       # The draft session-setup gRPC surface (#205 define-surface). buf lint also
       # underpins the additive-only breaking-change gate the contract evolves under
       # (NFR-IC-04); this step keeps the proto lint-clean from commit one. buf is
-      # installed via go install (Go is already provisioned for the Go jobs), so the
-      # step pulls in no third-party action — one fewer supply-chain edge to pin.
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-      - name: install buf
-        run: go install github.com/bufbuild/buf/cmd/buf@v1.50.0
+      # the PINNED v1.34.0 release the canon contracts-lint job runs — fetched as a
+      # release binary, so no third-party action is in the supply chain and the lint
+      # ruleset is byte-identical to canon's. Pinning the exact version matters: the
+      # category names changed across buf majors (the v1 `STANDARD` category is
+      # unknown to a later line and would silently lint zero rules), so the gate must
+      # run the same buf the canon freeze validated against.
       - name: buf lint the draft session-setup proto
-        working-directory: contracts/proto
-        run: buf lint
+        run: |
+          set -euo pipefail
+          curl -sSL -o /tmp/buf \
+            "https://github.com/bufbuild/buf/releases/download/v1.34.0/buf-$(uname -s)-$(uname -m)"
+          chmod +x /tmp/buf
+          cd contracts/proto
+          /tmp/buf lint
+          /tmp/buf build -o /dev/null
 
   checks:
     runs-on: ubuntu-latest
