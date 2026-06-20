@@ -9,6 +9,8 @@ import (
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/audit"
+	"github.com/Wide-Moat/ocu-control/internal/cred"
+	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/runtimemap"
@@ -114,7 +116,89 @@ func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compen
 	}, nil
 }
 
-// stageMaterialize (S6) builds the substrate-neutral SessionSpec and calls
+// stageMintStorageJWT (S6) mints the weak, edge-only Storage-JWT for the session's
+// mount, keyed on the HOST-DERIVED session key (never a body hint, NFR-SEC-43).
+// The Signer records the jti against that key on the shared Revoker, so the
+// below-seam finalizer step-1 (which re-derives the same key from the session row)
+// can revoke this exact mint. The minted Token stays a secret on the create state
+// and is revealed only at the single mountcfg.Marshal boundary in the next stage —
+// it never widens the frozen runtime.MountIntent.AuthToken string seam. The stage
+// has NO compensator: a minted-but-unused token simply expires, and the revoke is
+// the finalizer's job (a lifecycle-level revoke would race the ordered finalizer).
+// When the Signer is absent (the Phase-3 minimal shelf), the stage is a clean
+// no-op so the base pipeline still runs.
+func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (compensator, error) {
+	if m.signer == nil {
+		return nil, nil
+	}
+	scope := m.storageScope
+	tok, err := m.signer.MintStorageJWT(ctx, cred.StorageMintReq{
+		// SessionKey is the host-derived registry key; it seeds the jti and is the
+		// value the Revoker indexes the binding under, so a teardown re-deriving the
+		// same key from the session row finds the jti. It is NEVER a body hint.
+		SessionKey:   st.key.String(),
+		FilesystemID: st.in.Mount.FilesystemID,
+		Workspace:    scope.Workspace,
+		Org:          scope.Org,
+		Authz: cred.AuthorizationMetadata{
+			Scope:        scope.Scope,
+			Intent:       scope.Intent,
+			Downloadable: scope.Downloadable,
+		},
+	})
+	if err != nil {
+		// A refused mint (missing/invalid scope) fails the create closed before any
+		// mount-config reaches the bind; nothing external was effected, so no
+		// compensator is owed.
+		return nil, err
+	}
+	st.storageToken = tok
+	return nil, nil
+}
+
+// stageRenderPushMount (S7) renders the frozen-schema mount-config carrying the
+// freshly minted weak Storage-JWT, marshals it (the single Reveal boundary that
+// materializes the raw token into the host-only push bytes), and pushes it into the
+// host-owned handoff bind. Because it runs BEFORE stageMaterialize, the config is on
+// the bind before the in-guest mount client boots (the must-fix ordering). Its
+// compensator is provisioning.Scrub, which removes the pushed config host-side; the
+// scrub is idempotent so it never races the finalizer's own scrub-trigger. When the
+// Signer/Push are absent (the Phase-3 minimal shelf), the stage is a clean no-op.
+func stageRenderPushMount(ctx context.Context, m *Manager, st *createState) (compensator, error) {
+	if m.signer == nil || m.push == nil {
+		return nil, nil
+	}
+	mounts := []runtime.MountIntent{st.in.Mount}
+	tokens := []cred.Token{st.storageToken}
+	cfg, err := mountcfg.Render(m.serviceURL, m.caCertPEM, mounts, tokens, m.mountDefaults)
+	if err != nil {
+		// A render refusal (bad scope, missing token, malformed service_url/ca_cert)
+		// fails the create closed before anything lands on the bind; no compensator.
+		return nil, fmt.Errorf("lifecycle: render mount-config: %w", err)
+	}
+	cfgBytes, err := cfg.Marshal()
+	if err != nil {
+		return nil, fmt.Errorf("lifecycle: marshal mount-config: %w", err)
+	}
+	pushed, err := m.push.Push(ctx, st.staged, cfgBytes)
+	if err != nil {
+		// Push is fail-closed and rolls back its own partial temp file, so nothing
+		// half-written survives and no compensator is owed.
+		return nil, fmt.Errorf("lifecycle: push mount-config: %w", err)
+	}
+	st.pushed = pushed
+	pusher := m.push
+	return func(cctx context.Context) error {
+		// Scrub removes the host-side config (idempotent against an already-gone file),
+		// so an unwind leaves no pushed credential on the bind.
+		if err := pusher.Scrub(cctx, pushed); err != nil {
+			return fmt.Errorf("lifecycle: unwind scrub mount-config: %w", err)
+		}
+		return nil
+	}, nil
+}
+
+// stageMaterialize (S8) builds the substrate-neutral SessionSpec and calls
 // Materialize. The provider does its OWN internal rollback on a partial create and
 // returns ErrMaterialize (no orphan below the seam). On success it pushes a
 // force-kill teardown as the compensator (force-remove-authoritative, idempotent).

@@ -43,8 +43,11 @@ import (
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/audit"
+	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/handoff"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
+	"github.com/Wide-Moat/ocu-control/internal/provisioning"
 	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
@@ -118,6 +121,68 @@ type ManagerDeps struct {
 	Profile admission.WorkloadProfile
 	// Tier is the deployment-wide isolation tier (fixed).
 	Tier runtime.RuntimeTier
+
+	// Signer is the SOLE Storage-JWT custodian the mint stage calls. It mints the
+	// weak, edge-only Storage-JWT and records its jti against the host-derived
+	// session key on the shared Revoker, so the below-seam finalizer can revoke it.
+	// nil disables the mint+render stages (the Phase-3 minimal shelf), so a
+	// deployment without storage provisioning still runs the base pipeline.
+	Signer *cred.Signer
+	// Push delivers the rendered mount-config into the host-owned handoff bind
+	// BEFORE the in-guest mount client boots, and triggers the scrub on unwind. nil
+	// disables the render+push stage alongside a nil Signer.
+	Push provisioning.Pusher
+	// ServiceURL is the deployment-fixed filestore service_url rendered into every
+	// mount-config (the frozen ^https:// top-level field).
+	ServiceURL string
+	// CACertPEM is the deployment-fixed CA certificate rendered into every
+	// mount-config (the frozen ca_cert_pem top-level field).
+	CACertPEM string
+	// MountDefaults are the deployment-fixed, schema-validated per-mount knobs the
+	// substrate-neutral MountIntent does not carry (VFS cache policy/cap, perm
+	// bits). Host-chosen posture, never a request-body hint.
+	MountDefaults mountcfg.MountDefaults
+	// StorageScope is the deployment-fixed, host-derived scope the Storage-JWT is
+	// minted under (workspace/org/intent/downloadable). It is NEVER sourced from a
+	// request body (NFR-SEC-43).
+	StorageScope StorageScope
+
+	// ControlDialer is the ADVISORY host-dialled control-RPC surface (ADR-0018). On
+	// Destroy the Manager dials it BEFORE the host-driven finalizer to advance the
+	// cooperative SIGTERM phase; the dial is best-effort and its result is swallowed
+	// — the finalizer (NFR-SEC-65) is authoritative and never waits on the reply. A
+	// nil ControlDialer (the Phase-3 minimal shelf, or a deployment without the
+	// control-RPC wire) makes the dial a clean no-op.
+	ControlDialer ControlDialer
+}
+
+// ControlDialer is the NARROW seam the Destroy path reaches the advisory
+// control-RPC Shutdown through. It is satisfied by *controlrpc.Dialer but names
+// only Shutdown, so the lifecycle Manager depends on the one advisory verb, not
+// the whole dialer (and never on the exec-JWT minter behind it). The dial is
+// best-effort: every Shutdown error is non-authoritative for teardown.
+type ControlDialer interface {
+	Shutdown(ctx context.Context, sockDir, containerName string) error
+}
+
+// StorageScope is the deployment-fixed, host-derived scope every Storage-JWT mint
+// carries. Workspace/Org/Intent/Downloadable are provisional alongside iss/aud
+// and are bound once at construction from deployment config plus the host-derived
+// session identity — never from the request body (NFR-SEC-43).
+type StorageScope struct {
+	// Workspace and Org are the deployment-fixed scope axes the egress edge keys
+	// on. Provisional, PIN-PENDING the Phase-7 contract pin.
+	Workspace string
+	Org       string
+	// Scope is the AuthorizationMetadata scope axis; empty means the default
+	// (above-public) scope, under which Downloadable must stay false.
+	Scope string
+	// Intent is the access axis (read|write|preview). The mint refuses an invalid
+	// intent fail-closed.
+	Intent cred.Intent
+	// Downloadable is the third access axis; it defaults false and the mint refuses
+	// a downloadable-true with an empty Scope.
+	Downloadable bool
 }
 
 // Manager owns the create pipeline, the unwind stack, the destroy path, and the
@@ -133,6 +198,19 @@ type Manager struct {
 	stages   []stage // the canon fail-closed ORDER, encoded once as data
 	profile  admission.WorkloadProfile
 	tier     runtime.RuntimeTier
+
+	// Storage-JWT custody + mount-config provisioning (Phase 4). signer/push are nil
+	// on the Phase-3 minimal shelf, which the mint+render stages skip cleanly.
+	signer        *cred.Signer
+	push          provisioning.Pusher
+	serviceURL    string
+	caCertPEM     string
+	mountDefaults mountcfg.MountDefaults
+	storageScope  StorageScope
+
+	// controlDialer is the advisory host-dialled control-RPC surface Destroy nudges
+	// before the authoritative finalizer. nil is a clean no-op.
+	controlDialer ControlDialer
 }
 
 // NewManager constructs a Manager from its deps and binds the canon create order
@@ -149,13 +227,28 @@ func NewManager(deps ManagerDeps) *Manager {
 		audit:    deps.Audit,
 		profile:  deps.Profile,
 		tier:     deps.Tier,
+
+		signer:        deps.Signer,
+		push:          deps.Push,
+		serviceURL:    deps.ServiceURL,
+		caCertPEM:     deps.CACertPEM,
+		mountDefaults: deps.MountDefaults,
+		storageScope:  deps.StorageScope,
+		controlDialer: deps.ControlDialer,
 	}
+	// The mint + render/push stages slot AFTER stageHandoff and BEFORE
+	// stageMaterialize: the host-owned bind must carry the mount-config before
+	// stageMaterialize starts the container, so the in-guest mount client never
+	// boots without it. The no-orphan property test re-derives its fault points
+	// from this slice length, so the new compensators are exercised automatically.
 	m.stages = []stage{
 		{name: "resolveIdentity", run: stageResolveIdentity},
 		{name: "admit", run: stageAdmit},
 		{name: "quotaCharge", run: stageQuotaCharge},
 		{name: "reserve", run: stageReserve},
 		{name: "stageHandoff", run: stageStageHandoff},
+		{name: "mintStorageJWT", run: stageMintStorageJWT},
+		{name: "renderPushMount", run: stageRenderPushMount},
 		{name: "materialize", run: stageMaterialize},
 		{name: "commit", run: stageCommit},
 		{name: "bindContainerName", run: stageBind},
@@ -190,6 +283,14 @@ type createState struct {
 	staged  handoff.Staged
 	spec    runtime.SessionSpec
 	sandbox runtime.Sandbox
+	// storageToken is the freshly minted weak Storage-JWT the render stage carries
+	// into the mount-config. It stays a secret cred.Token on the create state — it
+	// never widens the frozen runtime.MountIntent.AuthToken string seam — and is
+	// revealed only at the single mountcfg.Marshal boundary.
+	storageToken cred.Token
+	// pushed is the host-side handle to the pushed mount-config; its Scrub is the
+	// render stage's compensator and (later) the finalizer's scrub-trigger.
+	pushed provisioning.Pushed
 }
 
 // Create runs the ordered fail-closed pipeline (m.stages) with a LIFO unwind stack.
@@ -321,12 +422,46 @@ func (m *Manager) Destroy(ctx context.Context, caller ingress.AuthenticatedCalle
 		return fmt.Errorf("lifecycle: destroy audit: %w", err)
 	}
 
+	// ADVISORY control-RPC nudge BEFORE the authoritative finalizer (ADR-0018). The
+	// host dials the guest's control UDS to advance the cooperative SIGTERM phase;
+	// the dial is best-effort and its result is SWALLOWED — a gate refusal, an
+	// unattested/empty-name reject, a connect-refused, a timeout, a non-accept reply,
+	// or a guest ControlError can at most nudge the guest, NEVER reorder, substitute,
+	// or mark-complete the finalizer. The host-driven finalizer below (NFR-SEC-65) is
+	// authoritative and never waits on this reply, so an unreachable control channel
+	// grants the guest no new authority (NFR-SEC-01). A nil dialer (Phase-3 minimal
+	// shelf) is a clean no-op.
+	//
+	// SOCKDIR PROVENANCE: the session row does not persist HostSockDir, so it is
+	// re-derived PURELY from the host-derived session key — the SAME pure function the
+	// create-path handoff stager used (handoff.Stager.SockDir(name), base/<name>/sock)
+	// — exactly as the finalizer re-derives every resource name from SessionName. The
+	// body hint never reaches this: name is runtime.SessionName(row.Key), host-derived
+	// (NFR-SEC-43). The container_name the dial binds the exec JWT to is the
+	// host-attested row.ContainerName, never a body value.
+	if m.controlDialer != nil && row.ContainerName != "" {
+		sockDir := m.handoff.SockDir(runtime.SessionName(row.Key))
+		// The error is intentionally swallowed: the advisory dial is non-authoritative
+		// for teardown and the pure-domain Manager holds no transport or logger. The
+		// blank assignment makes the deliberate swallow explicit and greppable, mirroring
+		// the finalizer's own swallow of its non-authoritative drain error.
+		_ = m.controlDialer.Shutdown(ctx, sockDir, row.ContainerName)
+	}
+
 	// Run the host-driven teardown finalizer with a drain window. The finalizer is
 	// detached and bounded internally; a wedged daemon call cannot strand a half-freed
 	// session. ErrNoSuchContainer is idempotent (already-gone), not a failure.
+	// The teardown Sandbox carries the host-derived session key on
+	// Egress.FilesystemID so the below-seam finalizer step-1 (revoke session JWT)
+	// can look up the jti the create-path mint recorded against that same key. The
+	// frozen session row does not persist the real filesystem_id, so the revocation
+	// handle is the session key the create and destroy paths both derive — never a
+	// body hint (NFR-SEC-43; the in-memory Revoker index is the durable record's
+	// later-phase concern).
 	sandbox := runtime.Sandbox{
 		Name:      runtime.SessionName(row.Key),
 		RuntimeID: row.ContainerName,
+		Egress:    runtime.EgressBinding{Name: runtime.SessionName(row.Key), FilesystemID: row.Key},
 		Tier:      m.tier,
 	}
 	if err := m.provider.Teardown().GracefulStop(ctx, sandbox, destroyGrace); err != nil {

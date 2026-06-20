@@ -5,12 +5,14 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 
+	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 )
 
@@ -84,10 +86,10 @@ func (t *teardown) finalize(parent context.Context, sess runtime.Sandbox, grace 
 	// circuits, so every later host-side resource is reclaimed even if an earlier
 	// step failed. The results are collected into one ordered slice and joined.
 
-	// 1. Revoke the session JWT (host-side reclamation of the route binding).
-	//    Phase-4 TODO: wire the real revoke against the JWKS/registry. The
-	//    host-side effect (no further re-mint against this session) is reclaimed
-	//    here; the cross-component wire is deferred, but the STEP runs now.
+	// 1. Revoke the session JWT host-side via the shared monotonic Revoker, keyed
+	//    off the EgressBinding the step already holds. The revoke marks the minted
+	//    jti permanently dead so the egress edge stops honoring it; the mark is
+	//    monotonic, so a wall-clock setback never un-revokes it (NFR-SEC-48).
 	step1RevokeJWT := t.revokeJWT(base, sess.Egress)
 
 	// 2. Drop the network-bound egress route host-side via the EgressBinding —
@@ -120,14 +122,29 @@ func (t *teardown) finalize(parent context.Context, sess runtime.Sandbox, grace 
 	return asTeardownError(steps)
 }
 
-// revokeJWT is finalizer step 1: revoke the session's Storage-JWT host-side. Phase
-// 2 reclaims the host-side route binding (nothing more to re-mint against this
-// session); the real revoke against the JWKS/registry is a Phase-4 wire. The step
-// EXISTS and runs in order now; a future failure path returns it for the join.
-func (t *teardown) revokeJWT(_ context.Context, _ runtime.EgressBinding) error {
-	// TODO(phase-4): wire the real JWT revoke against the JWKS/registry. The
-	// host-side reclamation (this session can no longer present a valid mint) is
-	// effected here; the cross-component revoke is deferred to Phase 4.
+// revokeJWT is finalizer step 1: revoke the session's Storage-JWT host-side via the
+// shared monotonic Revoker. It is keyed off the EgressBinding the step already
+// holds (the host-derived session-key revocation handle carried on
+// Egress.FilesystemID), so the row need not persist the jti. It is idempotent: a
+// re-run of the finalizer revokes an already-dead jti without error, and an
+// EgressBinding whose mint was never recorded (cred.ErrRevokeUnbound) is a
+// satisfied no-op (nothing live to revoke) rather than a finalizer error. A nil
+// Revoker (the Phase-3 minimal shelf) leaves the step a host-side no-op; the step
+// still runs in order.
+func (t *teardown) revokeJWT(base context.Context, bind runtime.EgressBinding) error {
+	if t.p.revoker == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(base, stepTimeout)
+	defer cancel()
+	if err := t.p.revoker.Revoke(ctx, bind); err != nil {
+		if errors.Is(err, cred.ErrRevokeUnbound) {
+			// No minted jti bound to this session (nothing live to revoke) — a
+			// satisfied no-op, not a finalizer failure.
+			return nil
+		}
+		return fmt.Errorf("docker: revoke session jwt: %w", err)
+	}
 	return nil
 }
 

@@ -32,6 +32,13 @@ type config struct {
 	runtimeProvider string // container backend behind the RuntimeProvider seam
 	workloadProfile string // deployment-declared trust profile feeding the admission matrix; never per-request
 	jwtSigningKey   string // path to the Storage-JWT signing key (config/secret mount)
+	jwtAlg          string // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
+	storageIssuer   string // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
+	storageAudience string // provisional Storage-JWT aud (PIN-PENDING)
+	execIssuer      string // provisional exec-JWT iss (PIN-PENDING)
+	execAudience    string // provisional exec-JWT aud (PIN-PENDING)
+	serviceURL      string // filestore service_url rendered into every mount-config
+	caCert          string // path to the CA certificate PEM rendered into every mount-config
 	auditSink       string // OCSF audit fan-in sink
 	stateDSN        string // Postgres DSN for durable state; empty selects the in-memory store
 	create          bool   // a create request presented at startup (smoke hook)
@@ -55,6 +62,13 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker|k8s (required)")
 	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
+	fs.StringVar(&cfg.jwtAlg, "jwt-alg", "eddsa", "Storage-JWT signing algorithm: eddsa|es256 (default eddsa, NFR-SEC-11)")
+	fs.StringVar(&cfg.storageIssuer, "storage-issuer", "", "provisional Storage-JWT issuer (PIN-PENDING; never hardcoded)")
+	fs.StringVar(&cfg.storageAudience, "storage-audience", "", "provisional Storage-JWT audience (PIN-PENDING)")
+	fs.StringVar(&cfg.execIssuer, "exec-issuer", "", "provisional exec-JWT issuer (PIN-PENDING)")
+	fs.StringVar(&cfg.execAudience, "exec-audience", "", "provisional exec-JWT audience (PIN-PENDING)")
+	fs.StringVar(&cfg.serviceURL, "service-url", "", "filestore service_url rendered into every mount-config (https://)")
+	fs.StringVar(&cfg.caCert, "ca-cert", "", "path to the CA certificate PEM rendered into every mount-config")
 	fs.StringVar(&cfg.auditSink, "audit-sink", "", "OCSF audit fan-in sink (required)")
 	fs.StringVar(&cfg.stateDSN, "state-dsn", "", "Postgres DSN for durable state; empty selects the in-memory store (minimal shelf)")
 	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
@@ -114,6 +128,13 @@ func validate(cfg config) error {
 	}
 	if !knownWorkloadProfiles[cfg.workloadProfile] {
 		return fmt.Errorf("%w: %q (choose trusted_operator|internal_workforce|untrusted)", errUnknownWorkloadProfile, cfg.workloadProfile)
+	}
+	// -jwt-alg is a closed enum with a default of eddsa (NFR-SEC-11); an unknown
+	// alg is refused, never coerced. iss/aud/service-url/ca-cert are PROVISIONAL
+	// (PIN-PENDING) and deliberately NOT required — they default to empty and are
+	// not enum-checked, so a deployment without storage provisioning still validates.
+	if !knownJWTAlgs[cfg.jwtAlg] {
+		return fmt.Errorf("%w: %q (choose eddsa|es256)", errUnknownJWTAlg, cfg.jwtAlg)
 	}
 
 	return nil

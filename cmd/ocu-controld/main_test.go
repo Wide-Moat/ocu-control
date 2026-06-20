@@ -5,12 +5,39 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/Wide-Moat/ocu-control/internal/cred"
 )
+
+// writeTestKey writes a valid Ed25519 PKCS8 signing key to path so the boot-time
+// fail-closed Signer load succeeds. The daemon now refuses to start without a real
+// key at -jwt-signing-key (there is no daemon-default key), so any test that reaches
+// serve() must supply one.
+func writeTestKey(t *testing.T, path string) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal pkcs8: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatalf("write key mount: %v", err)
+	}
+}
 
 // validArgs is a fully-valid serving invocation EXCEPT it binds nothing (Phase
 // 1 opens no socket). Individual cases append or perturb one field. The
@@ -115,13 +142,15 @@ func Test_run_KillSwitchFirst_ExplicitInMemory(t *testing.T) {
 func Test_run_CleanBoot_BindsThenServes(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "jwt.key")
+	writeTestKey(t, keyPath)
 	args := []string{
 		"-operator-listen", "unix://" + filepath.Join(dir, "operator.sock"),
 		"-gateway-listen", "127.0.0.1:0",
 		"-runtime-tier", "runc",
 		"-runtime-provider", "docker",
 		"-workload-profile", "trusted_operator",
-		"-jwt-signing-key", filepath.Join(dir, "jwt.key"),
+		"-jwt-signing-key", keyPath,
 		"-audit-sink", filepath.Join(dir, "audit.jsonl"),
 	}
 
@@ -150,6 +179,45 @@ func Test_run_CleanBoot_BindsThenServes(t *testing.T) {
 		t.Fatalf("run() on a clean boot returned %v; want nil on a ctx-driven shutdown", err)
 	case <-time.After(10 * time.Second):
 		t.Fatal("run() did not return within 10s after ctx cancel")
+	}
+}
+
+// Test_run_UnknownJWTAlg asserts an unknown -jwt-alg is refused pre-bind, never
+// coerced to a default; the default eddsa is exercised by the clean-boot test.
+func Test_run_UnknownJWTAlg(t *testing.T) {
+	t.Parallel()
+	args := append(validArgs(), "-jwt-alg", "rsa")
+	err := run(context.Background(), args)
+	if !errors.Is(err, errUnknownJWTAlg) {
+		t.Fatalf("run() with -jwt-alg rsa error does not match errUnknownJWTAlg: %v", err)
+	}
+}
+
+// Test_run_BadSigningKeyFailsClosedBeforeBind asserts a missing/garbage signing key
+// aborts the daemon at boot BEFORE any listener binds: a clean (create-free) boot
+// with a -jwt-signing-key that does not resolve to a valid key returns a wrapped
+// cred.ErrSigningKeyMissing, and no socket is left behind. This is the fail-closed
+// custody invariant — there is no daemon-default key.
+func Test_run_BadSigningKeyFailsClosedBeforeBind(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	args := []string{
+		"-operator-listen", "unix://" + filepath.Join(dir, "operator.sock"),
+		"-gateway-listen", "127.0.0.1:0",
+		"-runtime-tier", "runc",
+		"-runtime-provider", "docker",
+		"-workload-profile", "trusted_operator",
+		"-jwt-signing-key", filepath.Join(dir, "absent.key"), // never written
+		"-audit-sink", filepath.Join(dir, "audit.jsonl"),
+	}
+	err := run(context.Background(), args)
+	if !errors.Is(err, cred.ErrSigningKeyMissing) {
+		t.Fatalf("run() with an absent signing key error does not wrap cred.ErrSigningKeyMissing: %v", err)
+	}
+	// The fail-closed abort happens before the bind hook is installed, so no operator
+	// socket survives the refusal.
+	if _, statErr := os.Stat(filepath.Join(dir, "operator.sock")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("a fail-closed signer-load abort left an operator socket (stat err=%v); want no socket", statErr)
 	}
 }
 

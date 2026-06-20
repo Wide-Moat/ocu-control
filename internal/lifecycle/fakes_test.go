@@ -5,14 +5,150 @@ package lifecycle_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
+	"encoding/pem"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
+	"testing"
+	"time"
 
+	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/handoff"
+	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
+	"github.com/Wide-Moat/ocu-control/internal/provisioning"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
+
+// newTestSigner loads a real cred.Signer over a freshly generated Ed25519 key on a
+// FakeClock, attaches the shared Revoker, and returns both so a test can assert the
+// create-path mint recorded a jti the teardown revoke later marks dead.
+func newTestSigner(t *testing.T, clk state.Clock) (*cred.Signer, *cred.Revoker) {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate ed25519: %v", err)
+	}
+	der, err := x509.MarshalPKCS8PrivateKey(priv)
+	if err != nil {
+		t.Fatalf("marshal pkcs8: %v", err)
+	}
+	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+	path := filepath.Join(t.TempDir(), "signing.key")
+	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+		t.Fatalf("write key mount: %v", err)
+	}
+	signer, err := cred.LoadSignerFromMount(path, clk, cred.Config{
+		Alg:             cred.AlgEdDSA,
+		StorageIssuer:   "https://control.example/provisional",
+		StorageAudience: "egress.provisional",
+		ExecIssuer:      "https://control.example/exec-provisional",
+		ExecAudience:    "guest.exec.provisional",
+		StorageTTL:      15 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("LoadSignerFromMount: %v", err)
+	}
+	revoker := cred.NewRevoker(clk)
+	signer.UseRevoker(revoker)
+	return signer, revoker
+}
+
+// testMountDefaults builds a valid MountDefaults through the validating
+// constructors so Render accepts it.
+func testMountDefaults(t *testing.T) mountcfg.MountDefaults {
+	t.Helper()
+	mode, err := mountcfg.NewVfsCacheMode("writes")
+	if err != nil {
+		t.Fatalf("NewVfsCacheMode: %v", err)
+	}
+	size, err := mountcfg.NewByteSize("256M")
+	if err != nil {
+		t.Fatalf("NewByteSize: %v", err)
+	}
+	dir, err := mountcfg.NewOctal("0700")
+	if err != nil {
+		t.Fatalf("NewOctal(dir): %v", err)
+	}
+	file, err := mountcfg.NewOctal("0600")
+	if err != nil {
+		t.Fatalf("NewOctal(file): %v", err)
+	}
+	return mountcfg.MountDefaults{VfsCacheMode: mode, VfsCacheMaxSize: size, DirPerms: dir, FilePerms: file}
+}
+
+// testServiceURL and testCACert are valid against the frozen top-level patterns
+// (^https:// and the BEGIN CERTIFICATE marker) so Render does not refuse them.
+const (
+	testServiceURL = "https://filestore.example/v1"
+	testCACert     = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n"
+)
+
+// recordingPusher wraps the real filesystem Pusher so the happy path lands a config
+// on the host-owned bind (the no-orphan test asserts the on-disk file is gone after
+// an unwind), while letting a test arm a FAIL on Push to drive the render/push
+// stage fault. It records the surface for the compensator assertion and tracks the
+// last pushed path so a residue check can confirm Scrub removed it.
+type recordingPusher struct {
+	inner provisioning.Pusher
+	mu    sync.Mutex
+
+	pushCalls  int
+	scrubCalls int
+	failPush   bool
+	lastPath   string
+}
+
+func newRecordingPusher() *recordingPusher {
+	return &recordingPusher{inner: provisioning.NewPusher()}
+}
+
+func (p *recordingPusher) Push(ctx context.Context, staged handoff.Staged, cfgBytes []byte) (provisioning.Pushed, error) {
+	p.mu.Lock()
+	p.pushCalls++
+	fail := p.failPush
+	p.mu.Unlock()
+	if fail {
+		return provisioning.Pushed{}, errPushInjected
+	}
+	pushed, err := p.inner.Push(ctx, staged, cfgBytes)
+	if err == nil {
+		p.mu.Lock()
+		p.lastPath = pushed.Path
+		p.mu.Unlock()
+	}
+	return pushed, err
+}
+
+func (p *recordingPusher) Scrub(ctx context.Context, pushed provisioning.Pushed) error {
+	p.mu.Lock()
+	p.scrubCalls++
+	p.mu.Unlock()
+	return p.inner.Scrub(ctx, pushed)
+}
+
+func (p *recordingPusher) counts() (push, scrub int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.pushCalls, p.scrubCalls
+}
+
+// pushedPath returns the host-side path the last successful Push landed at, so a
+// residue assertion can confirm the config file is gone after an unwind.
+func (p *recordingPusher) pushedPath() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastPath
+}
+
+// errPushInjected is the typed fault recordingPusher returns when armed, so the
+// no-orphan test can attribute the render/push-stage failure to the injected fault.
+var errPushInjected = errors.New("fakes: injected push fault")
 
 // recordingProvider is the in-test RuntimeProvider that records every Materialize,
 // ForceKill, GracefulStop, and Reconcile so a no-orphan assertion can prove the
@@ -89,6 +225,15 @@ func (p *recordingProvider) liveCount() int {
 	return len(p.live)
 }
 
+// gracefulStops returns how many GracefulStop calls the finalizer has made, so an
+// ordering assertion can read whether the authoritative teardown ran at a given
+// point relative to the advisory control-RPC dial.
+func (p *recordingProvider) gracefulStops() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.gracefulStopCalls
+}
+
 // recordingTeardown is the finalizer handle the recordingProvider hands out. Each
 // verb removes the sandbox's RuntimeID from the live set (idempotent) and counts the
 // call.
@@ -150,6 +295,12 @@ func (s *faultStager) Unstage(ctx context.Context, st handoff.Staged) error {
 	s.unstageCalls++
 	s.mu.Unlock()
 	return s.inner.Unstage(ctx, st)
+}
+
+// SockDir delegates to the wrapped real Stager so the advisory control-RPC dial on
+// Destroy re-derives the SAME per-session sock path the create path staged.
+func (s *faultStager) SockDir(name runtime.SessionName) string {
+	return s.inner.SockDir(name)
 }
 
 func (s *faultStager) counts() (stage, unstage int) {

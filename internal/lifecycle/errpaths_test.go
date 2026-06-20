@@ -413,6 +413,9 @@ func (s unstageFailStager) Stage(ctx context.Context, name runtime.SessionName, 
 	return s.inner.Stage(ctx, name, pubKey, mounts)
 }
 func (s unstageFailStager) Unstage(context.Context, handoff.Staged) error { return errLcInjected }
+func (s unstageFailStager) SockDir(name runtime.SessionName) string {
+	return s.inner.SockDir(name)
+}
 
 // TestUnwindCompensatorErrorsAreSwallowed covers the error branches inside the
 // stageReserve (Release), stageStageHandoff (Unstage), and stageMaterialize

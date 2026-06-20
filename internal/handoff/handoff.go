@@ -97,6 +97,14 @@ type Stager interface {
 	// already-gone root returns nil, so the create unwind and a later reconcile may
 	// both call it. An empty Root is a no-op.
 	Unstage(ctx context.Context, st Staged) error
+	// SockDir re-derives the per-session 0700 host-owned sock directory PURELY from
+	// the host-derived session name, returning the SAME path Stage created under the
+	// stager's base root. The path is a pure function of name (base/<name>/sock), so
+	// a Destroy path that holds only the session key/name can re-derive the sock dir
+	// the advisory control-RPC dial targets WITHOUT the session row persisting it
+	// (mirroring how the finalizer re-derives every resource name from SessionName).
+	// It writes nothing and is a read-only derivation.
+	SockDir(name runtime.SessionName) string
 }
 
 // fsStager is the filesystem Stager. It owns a base directory under which every
@@ -189,6 +197,15 @@ func (s *fsStager) Stage(ctx context.Context, name runtime.SessionName, pubKey [
 		},
 		Root: root,
 	}, nil
+}
+
+// SockDir re-derives the per-session sock directory purely from name, returning
+// the SAME path Stage created (base/<name>/sock). It writes nothing: it is the
+// single source of truth for the sock-dir layout, so the create path and the
+// Destroy path agree on the host-dialled control UDS location without the session
+// row persisting it.
+func (s *fsStager) SockDir(name runtime.SessionName) string {
+	return filepath.Join(s.base, string(name), sockDirName)
 }
 
 // failClosed removes the partial root and returns the wrapped ErrStageFailed, so

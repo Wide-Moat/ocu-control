@@ -6,12 +6,14 @@ package lifecycle_test
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 
 	"pgregory.net/rapid"
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/audit"
+	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
 	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
@@ -57,6 +59,7 @@ type orphanHarness struct {
 	binder   *bindFaultStore
 	provider *recordingProvider
 	stager   *faultStager
+	pusher   *recordingPusher
 	audit    *audit.RecordingFake
 	clk      *state.FakeClock
 	tenant   state.Identity
@@ -71,18 +74,26 @@ func newOrphanHarness(t *testing.T) *orphanHarness {
 	cust := registry.NewCustodian(binder)
 	provider := newRecordingProvider()
 	stager := newFaultStager(t.TempDir())
+	pusher := newRecordingPusher()
 	sink := audit.NewRecordingFake()
 	gate := quota.NewGate(binder, clk, generousLimits())
+	signer, _ := newTestSigner(t, clk)
 
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: cust,
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   stager,
-		Audit:     sink,
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
+		Custodian:     cust,
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		Signer:        signer,
+		Push:          pusher,
+		ServiceURL:    testServiceURL,
+		CACertPEM:     testCACert,
+		MountDefaults: testMountDefaults(t),
+		StorageScope:  lifecycle.StorageScope{Workspace: "ws", Org: "org", Intent: cred.IntentWrite},
 	})
 	return &orphanHarness{
 		mgr:      mgr,
@@ -91,6 +102,7 @@ func newOrphanHarness(t *testing.T) *orphanHarness {
 		binder:   binder,
 		provider: provider,
 		stager:   stager,
+		pusher:   pusher,
 		audit:    sink,
 		clk:      clk,
 		tenant:   testCaller.Identity,
@@ -100,8 +112,12 @@ func newOrphanHarness(t *testing.T) *orphanHarness {
 // faultPoints enumerates every create stage that pushes-or-follows a compensator and
 // can be made to fail. S1 (resolveIdentity) and S2 (admit) push no compensator and
 // are covered by their own unit tests; S3 (quotaCharge) refuses before pushing its
-// own compensator, also unit-tested. The headline no-orphan property is the unwind
-// of S4..S8, where 1..N-1 compensators must each run exactly once in reverse.
+// own compensator, also unit-tested. S6 (mintStorageJWT) pushes no compensator (a
+// minted-but-unused token simply expires; its refusal paths are cred's own tests).
+// The headline no-orphan property is the unwind of S4..S10, where 1..N-1
+// compensators — Release, Receipt.Apply, Unstage, Scrub, ForceKill — must each run
+// exactly once in reverse, leaving no row, counter, sockdir, pushed config, or
+// container.
 func faultPoints() []faultPoint {
 	return []faultPoint{
 		{
@@ -121,21 +137,28 @@ func faultPoints() []faultPoint {
 			},
 		},
 		{
-			stage: 6, name: "materialize",
+			stage: 7, name: "renderPushMount",
+			arm: func(h *orphanHarness) error {
+				h.pusher.failPush = true
+				return errPushInjected
+			},
+		},
+		{
+			stage: 8, name: "materialize",
 			arm: func(h *orphanHarness) error {
 				h.provider.failMaterialize = true
 				return runtime.ErrMaterialize
 			},
 		},
 		{
-			stage: 7, name: "commit",
+			stage: 9, name: "commit",
 			arm: func(h *orphanHarness) error {
 				h.audit.SetFault(true, errors.New("sink down"))
 				return audit.ErrAuditWriteFailed
 			},
 		},
 		{
-			stage: 8, name: "bindContainerName",
+			stage: 10, name: "bindContainerName",
 			arm: func(h *orphanHarness) error {
 				h.binder.fail = true
 				return state.ErrBindingExists
@@ -198,13 +221,23 @@ func assertNoResidue(rt *rapid.T, h *orphanHarness, fp faultPoint) {
 	}
 
 	stageCalls, unstageCalls := h.stager.counts()
+	pushCalls, scrubCalls := h.pusher.counts()
+
+	// No pushed mount-config left on the host-owned bind: if the render/push stage
+	// (S7) succeeded, the LIFO unwind Scrubbed it, so the on-disk file is gone.
+	if p := h.pusher.pushedPath(); p != "" {
+		if _, err := os.Stat(p); !errors.Is(err, os.ErrNotExist) {
+			rt.Fatalf("stage %d (%s): pushed mount-config %q survives after unwind (stat err=%v), want gone",
+				fp.stage, fp.name, p, err)
+		}
+	}
 
 	// Exact compensator counts per fault point. Reserve(S4) pushes a Release; the
 	// failure path of Reserve itself writes no row, so a fault AT S4 runs no Release.
 	// A fault at S5+ runs S4's Release (the row drops to a RELEASED tombstone, which is
-	// not "live"). Materialize(S6) pushes a ForceKill; a fault at S7/S8 runs it once.
+	// not "live"). Materialize(S8) pushes a ForceKill; a fault at S9/S10 runs it once.
 	wantForceKill := 0
-	if fp.stage >= 7 { // Materialize succeeded only when the fault is at S7 or later.
+	if fp.stage >= 9 { // Materialize succeeded only when the fault is at S9 or later.
 		wantForceKill = 1
 	}
 	if h.provider.forceKillCalls != wantForceKill {
@@ -221,13 +254,30 @@ func assertNoResidue(rt *rapid.T, h *orphanHarness, fp faultPoint) {
 		// Stage attempted and failed closed: it staged nothing on disk and pushed no
 		// compensator, so there is nothing to Unstage.
 		wantStage, wantUnstage = 1, 0
-	default: // S6, S7, S8
+	default: // S7, S8, S9, S10 — stageHandoff succeeded once
 		// Stage succeeded once; the LIFO unwind Unstaged it exactly once.
 		wantStage, wantUnstage = 1, 1
 	}
 	if stageCalls != wantStage || unstageCalls != wantUnstage {
 		rt.Fatalf("stage %d (%s): stager calls stage=%d unstage=%d, want stage=%d unstage=%d",
 			fp.stage, fp.name, stageCalls, unstageCalls, wantStage, wantUnstage)
+	}
+
+	// Render/push (S7) compensator counts: a fault AT S7 means Push was attempted
+	// once and failed (pushing nothing), so no Scrub is owed. A fault at S8+ means
+	// Push succeeded once and the unwind Scrubbed it exactly once.
+	var wantPush, wantScrub int
+	switch {
+	case fp.stage < 7:
+		wantPush, wantScrub = 0, 0
+	case fp.stage == 7:
+		wantPush, wantScrub = 1, 0
+	default: // S8, S9, S10
+		wantPush, wantScrub = 1, 1
+	}
+	if pushCalls != wantPush || scrubCalls != wantScrub {
+		rt.Fatalf("stage %d (%s): pusher calls push=%d scrub=%d, want push=%d scrub=%d",
+			fp.stage, fp.name, pushCalls, scrubCalls, wantPush, wantScrub)
 	}
 }
 

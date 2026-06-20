@@ -110,13 +110,23 @@ type dockerAPI interface {
 // import surface of this file legible. The provider always passes nil for it.
 type ocispecPlatform = ocispec.Platform
 
+// Revoker is the narrow below-seam port the finalizer step-1 (revoke session JWT)
+// calls to mark a session's minted Storage-JWT dead host-side. It is satisfied by
+// *cred.Revoker; naming only Revoke keeps the provider depending on the revoke
+// effect, not the whole custody package. A nil Revoker (the Phase-3 minimal shelf)
+// makes step-1 the prior no-op; the step still runs in order.
+type Revoker interface {
+	Revoke(ctx context.Context, bind runtime.EgressBinding) error
+}
+
 // Provider is the Docker RuntimeProvider. It holds the SDK behind the dockerAPI
 // seam and the deployment-wide isolation tier it was constructed bound to (the
 // tier is not per-request — requirement 5). It owns NO session state; teardown
 // re-derives every resource name purely from the Sandbox's SessionName.
 type Provider struct {
-	api  dockerAPI
-	tier runtime.RuntimeTier
+	api     dockerAPI
+	tier    runtime.RuntimeTier
+	revoker Revoker
 }
 
 var (
@@ -133,6 +143,10 @@ type Deps struct {
 	// API, when non-nil, is used as-is (the test-fake injection point). When nil,
 	// NewDockerProvider builds a real client via client.NewClientWithOpts(FromEnv).
 	API dockerAPI
+	// Revoker is the below-seam Storage-JWT revocation index the finalizer step-1
+	// calls. nil leaves step-1 the prior host-side no-op (the step still runs in
+	// order); the daemon wires the shared *cred.Revoker here.
+	Revoker Revoker
 }
 
 // NewDockerProvider builds the Docker provider bound to the deployment-wide
@@ -149,7 +163,7 @@ func NewDockerProvider(tier runtime.RuntimeTier, deps Deps) (*Provider, error) {
 		}
 		api = cli
 	}
-	return &Provider{api: api, tier: tier}, nil
+	return &Provider{api: api, tier: tier, revoker: deps.Revoker}, nil
 }
 
 // networkName is the pure function from session name to per-session bridge name,
