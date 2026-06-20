@@ -9,11 +9,16 @@
 # kill-switch-under-saturation target reserves admission priority for the
 # revoke route rather than adding replicas (component-02 Operational concerns).
 #
-# SCAFFOLD STUB. The flag surface tracks the scaffold daemon; the real serving
-# wiring lands with the lifecycle PRs. Until then the pod's daemon refuses with
-# "serve not implemented" by design. The per-session executor is a separate
-# deployable (ocu-sandbox, container-05, [1..N]) the control plane drives over
-# the host-dialled control channel; it is not part of this manifest.
+# The args below carry EVERY required flag the daemon's boot validator demands
+# (operator-listen, gateway-listen, runtime-tier, runtime-provider,
+# workload-profile, jwt-signing-key, audit-sink); omitting any one is a fail-
+# closed boot refusal, so the full set is supplied here. The daemon boots, loads
+# the deny posture, and serves both ingress listeners. The -jwt-signing-key path
+# MUST resolve to a real key at runtime (the ocu-control-jwt-signing-key Secret
+# mounted below) or the daemon aborts fail-closed at boot. The per-session
+# executor is a separate deployable (ocu-sandbox, container-05, [1..N]) the
+# control plane drives over the host-dialled control channel; it is not part of
+# this manifest.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -92,6 +97,13 @@ spec:
             - runc
             - -runtime-provider
             - docker
+            # Deployment-declared trust profile feeding the admission matrix.
+            # REQUIRED and deployment-wide (never per-request): the daemon
+            # refuses to boot without it. Set this per deployment to one of
+            # trusted_operator | internal_workforce | untrusted. `untrusted` is
+            # the safe default here — the most restrictive admission cell.
+            - -workload-profile
+            - untrusted
             - -jwt-signing-key
             - /run/secrets/ocu-control/storage-jwt-signing.key
             - -audit-sink
@@ -119,13 +131,18 @@ spec:
               readOnly: true
 
           # Liveness/readiness use the daemon's own -health-check self-probe as
-          # an exec probe (distroless has no shell or curl, and the ops listener
-          # binds loopback only — an httpGet from the node never reaches it).
+          # an exec probe (distroless has no shell or curl, and the operator
+          # ingress is a Unix socket — an httpGet from the node never reaches
+          # it). The probe re-derives the socket from the SAME -operator-listen
+          # the serving args bind, so it dials exactly the socket the daemon
+          # serves /healthz on, and exits 0 only when /healthz answers 200.
           livenessProbe:
             exec:
               command:
                 - /usr/local/bin/ocu-controld
                 - -health-check
+                - -operator-listen
+                - unix:///run/ocu-control/operator.sock
             initialDelaySeconds: 5
             periodSeconds: 15
             timeoutSeconds: 5
@@ -135,6 +152,8 @@ spec:
               command:
                 - /usr/local/bin/ocu-controld
                 - -health-check
+                - -operator-listen
+                - unix:///run/ocu-control/operator.sock
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 5

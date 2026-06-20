@@ -9,10 +9,18 @@
 # (With a published release image available, drop --build and set
 # OCU_CONTROL_TAG to the release tag.)
 #
-# SCAFFOLD POSTURE. The flag surface below tracks the scaffold daemon; the real
-# serving wiring (the two ingress listeners, the host-dialled control channel,
-# the teardown finalizer) lands with the implementation PRs. Until then `up`
-# exits non-zero on the scaffold's "serve not implemented" refusal — by design.
+# The command below carries EVERY required flag the daemon's boot validator
+# demands (operator-listen, gateway-listen, runtime-tier, runtime-provider,
+# workload-profile, jwt-signing-key, audit-sink); omitting any one is a fail-
+# closed boot refusal, so the full set is supplied here. The daemon boots,
+# loads the deny posture, and serves both ingress listeners; a writable
+# -audit-sink path is backed by a durable, fsync-on-write OCSF trail.
+#
+# RUNTIME PREREQUISITE — the Storage-JWT signing key. -jwt-signing-key names a
+# real file that MUST exist at runtime (there is no daemon-default key): the
+# daemon aborts fail-closed at boot without it. The volume mount below points it
+# at OCU_JWT_SIGNING_KEY (default ./deploy/dev-secrets/storage-jwt-signing.key);
+# supply your own secret source there before `up`.
 #
 # Posture notes:
 # - The root filesystem is read-only; the writable surfaces are the audit sink
@@ -58,6 +66,13 @@ services:
       - ${OCU_RUNTIME_TIER:-runc}
       - -runtime-provider
       - docker
+      # Deployment-declared trust profile feeding the admission matrix. It is
+      # REQUIRED and deployment-wide (never per-request); the daemon refuses to
+      # boot without it. `untrusted` is the safe default — the most restrictive
+      # admission cell. Override per deployment with OCU_WORKLOAD_PROFILE set to
+      # one of: trusted_operator | internal_workforce | untrusted.
+      - -workload-profile
+      - ${OCU_WORKLOAD_PROFILE:-untrusted}
       - -jwt-signing-key
       - /run/secrets/storage-jwt-signing.key
       - -audit-sink
@@ -72,7 +87,15 @@ services:
       # hardened deployment.
       - /var/run/docker.sock:/var/run/docker.sock:ro
     healthcheck:
-      test: ["CMD", "/usr/local/bin/ocu-controld", "-health-check"]
+      # The probe re-derives the operator socket from the SAME -operator-listen
+      # the serving command binds, so it dials exactly the socket the daemon
+      # serves /healthz on. It exits 0 only when /healthz answers 200 (ready).
+      test:
+        - CMD
+        - /usr/local/bin/ocu-controld
+        - -health-check
+        - -operator-listen
+        - unix:///run/ocu-control/operator.sock
       interval: 30s
       timeout: 5s
       retries: 3

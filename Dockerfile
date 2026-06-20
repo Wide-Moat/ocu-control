@@ -64,10 +64,13 @@ VOLUME ["/var/log/ocu-control", "/run/ocu-control"]
 USER nonroot:nonroot
 
 # HEALTHCHECK uses the daemon's own -health-check self-probe mode: it dials the
-# loopback ops listener and exits 0 (alive) or non-zero (unreachable). The
-# distroless image has no shell or curl, so the daemon binary serves as its own
-# liveness probe.
+# operator-ingress Unix socket's /healthz and exits 0 (ready) or non-zero
+# (unreachable / not-ready). The distroless image has no shell or curl, so the
+# daemon binary serves as its own liveness probe. The probe re-derives the
+# socket from the SAME -operator-listen the serving ENTRYPOINT binds; this
+# default matches the operator socket every shipped manifest binds. A deployment
+# that moves the operator socket overrides this probe with its own path.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/ocu-controld", "-health-check"]
+    CMD ["/usr/local/bin/ocu-controld", "-health-check", "-operator-listen", "unix:///run/ocu-control/operator.sock"]
 
 ENTRYPOINT ["/usr/local/bin/ocu-controld"]

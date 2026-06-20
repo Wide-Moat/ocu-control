@@ -126,9 +126,11 @@ func run(ctx context.Context, args []string) error {
 		fmt.Printf("ocu-controld %s\n", version)
 		return nil
 	case modeHealthCheck:
-		// Self-probe placeholder: with no ops listener wired yet there is
-		// nothing to dial, so report not-serving rather than a false green.
-		return errors.New("health-check: ops listener not yet implemented in this scaffold")
+		// Thin client: dial the already-running daemon's operator /healthz over the
+		// SAME Unix socket the serving path binds (re-derived from -operator-listen, so
+		// probe and server agree on the path) and exit 0 iff it answers 200. It does
+		// NOT boot the Store or any listener.
+		return healthCheck(ctx, cfg.operatorListen)
 	}
 
 	if err := validate(cfg); err != nil {
@@ -216,7 +218,21 @@ func serve(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	mgr, eng := compose(store, clk, provider, profile, tier, signer, cfg)
+	// Durable audit custody, FAIL-CLOSED at boot: -audit-sink names the append-only
+	// OCSF spine every privileged action is hash-chained into BEFORE it is
+	// acknowledged. A real path is backed by a durable, fsync-on-write file writer; an
+	// unopenable path aborts the daemon here, before any listener binds, rather than
+	// booting with a silently-discarded trail. The single opt-out (=none/=null) is the
+	// NullSink, behind a loud WARN that the trail is non-durable.
+	auditWriter, err := buildAuditWriter(cfg.auditSink)
+	if err != nil {
+		return fmt.Errorf("boot: open audit sink: %w", err)
+	}
+	// Close the writer on the way out so the final fsync/flush runs after the serve
+	// loops have drained. A NullSink Close is a no-op.
+	defer func() { _ = auditWriter.Close() }()
+
+	mgr, eng := compose(store, clk, provider, profile, tier, signer, auditWriter, cfg)
 
 	// The single operator capability: minted ONCE and handed to the operator
 	// adapter ALONE. The gateway adapter is constructed with no seam.
@@ -310,19 +326,20 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 // (chain computed in-process, nothing durably persisted by default), and a
 // deployment Limits — are bound here. profile and tier are deployment-fixed and
 // flow onto the Manager as fixed fields; CreateInput carries neither.
-func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, cfg config) (*lifecycle.Manager, *killswitch.Engine) {
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, auditWriter ocsf.EventWriter, cfg config) (*lifecycle.Manager, *killswitch.Engine) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
 	stager := handoff.NewStager(handoffBase)
 	// The real OCSF chain sink: it serializes each privileged audit.Record to a
 	// faithful OCSF event, assigns a per-source monotonic sequence, and hash-chains
 	// the spine — all on the success path, BEFORE the privileged action is
-	// acknowledged (fail-closed). The DEFAULT durable writer is ocsf.NullSink: the
-	// chain is computed and validatable in-process, but nothing is durably persisted
-	// (zero external dependency, the minimal-shelf rule). A real EventWriter (a file
-	// appender, a WORM/bus client) slots in behind the same EventWriter contract with
-	// no change to any Emit call site — only this writer argument changes.
-	sink := ocsf.NewChainSink(clk, ocsf.NullSink{}, "control")
+	// acknowledged (fail-closed). The durable writer is the one buildAuditWriter
+	// resolved from -audit-sink: a real path is backed by the append-only fsync-on-
+	// write FileSink, so a write failure denies the action (the fail-closed branch in
+	// the lifecycle/kill-switch callers now actually fires); the explicit =none/=null
+	// opt-out is the NullSink (compute-and-validate, persist-nothing). The writer slots
+	// in behind the EventWriter contract with no change to any Emit call site.
+	sink := ocsf.NewChainSink(clk, auditWriter, "control")
 
 	// The advisory control-RPC dialer mints its per-dial exec JWT through the same
 	// Storage-JWT custodian Signer (the narrow MintExecJWT seam, never the signing
@@ -488,6 +505,48 @@ func algOf(s string) (cred.Alg, error) {
 	default:
 		return 0, fmt.Errorf("%w: %q", errUnknownJWTAlg, s)
 	}
+}
+
+// auditWriter is the durable-emit seam the chain sink writes to, plus the Close the
+// daemon runs on shutdown to flush the final fsync. The FileSink satisfies it; the
+// NullSink is wrapped in a no-op closer so the opt-out path shares the same type.
+type auditWriter interface {
+	ocsf.EventWriter
+	Close() error
+}
+
+// nullCloser adapts the stateless ocsf.NullSink to the auditWriter shape: its Close
+// is a no-op so the explicit -audit-sink=none/=null opt-out flows through the same
+// build-and-close path as the durable FileSink.
+type nullCloser struct{ ocsf.NullSink }
+
+// Close is a no-op: NullSink holds no file handle to flush.
+func (nullCloser) Close() error { return nil }
+
+// auditSinkNone is the explicit, case-insensitive opt-out: -audit-sink=none (or
+// =null) selects the non-durable NullSink behind a loud startup WARN. It is the ONLY
+// way to run without a durable trail — a real path is NEVER silently discarded.
+var auditSinkNone = map[string]bool{"none": true, "null": true}
+
+// buildAuditWriter resolves -audit-sink into the durable-emit writer the chain sink
+// hash-chains into. A real path is backed by the append-only, fsync-on-write,
+// single-writer FileSink, opened FAIL-CLOSED: an unopenable path (e.g. an unwritable
+// directory) is an error the caller turns into a boot abort BEFORE any listener
+// binds, so the daemon never runs with a path it would silently discard. The only
+// non-durable option is the explicit =none/=null opt-out, which selects the NullSink
+// and emits a LOUD startup WARN that the audit trail is non-durable. validate()
+// already rejects an EMPTY -audit-sink as a missing required flag, so this never
+// defaults a discarded sink.
+func buildAuditWriter(sink string) (auditWriter, error) {
+	if auditSinkNone[strings.ToLower(sink)] {
+		fmt.Fprintln(os.Stderr, "ocu-controld: WARNING: -audit-sink="+sink+" selects the NULL audit writer: the OCSF hash-chain is computed in-process but NOTHING is durably persisted. Every privileged action's fail-closed-on-audit deny is therefore NOT backed by durable storage. Use a writable file path for a durable, tamper-evident trail.")
+		return nullCloser{}, nil
+	}
+	fs, err := ocsf.OpenFileSink(sink)
+	if err != nil {
+		return nil, err
+	}
+	return fs, nil
 }
 
 // readCACertPEM reads the CA certificate PEM from the -ca-cert path for rendering

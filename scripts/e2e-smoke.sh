@@ -16,6 +16,12 @@
 #   4. KILL-SWITCH-FIRST: a create presented at startup is refused loudly
 #      end-to-end before any listener binds (NFR-SEC-01), and no socket is
 #      bound on the refusal.
+#   5. MANIFEST FLAG VALIDATION: each shipped deploy manifest's exact serving
+#      argv (docker-compose, k8s, systemd) clears flag validation against the
+#      real binary — it never exits on a missing/invalid REQUIRED flag. The
+#      binary may still fail LATER (the signing-key path is absent in CI), which
+#      is fine: this guards only that no manifest is one required flag short of
+#      booting (the production blocker the readiness review found).
 set -uo pipefail
 
 BIN="${1:-}"
@@ -147,9 +153,60 @@ if ls "$tmp"/*.sock >/dev/null 2>&1; then
   fail=1
 fi
 
+# 5. MANIFEST FLAG VALIDATION — each shipped manifest's exact serving argv clears
+#    flag validation against the real binary. The argv mirrors the committed
+#    manifest (deploy/docker-compose.yml command:, examples/k8s/control-deployment
+#    .yaml args:, contrib/systemd/ocu-controld.service ExecStart=); the in-process
+#    Go test (cmd/ocu-controld Test_Manifests_ClearFlagValidation_*) extracts the
+#    SAME argv directly from those files, so a drift between this argv and a manifest
+#    is caught there. Here we assert against the REAL binary: a valid argv must NOT
+#    print a flag-validation sentinel. It is expected to fail LATER on the absent
+#    signing key, so we assert on output content, never the exit code.
+flag_sentinels='required flag missing or invalid|unknown runtime tier|unknown runtime provider|unknown workload profile|unknown jwt signing algorithm'
+
+assert_clears_flags() {
+  local label="$1"; shift
+  local out
+  out="$("$BIN" "$@" 2>&1)"
+  if echo "$out" | grep -qE "$flag_sentinels"; then
+    echo "::error::$label manifest argv tripped flag validation:"
+    echo "$out"
+    fail=1
+  else
+    echo "ok: $label manifest argv cleared flag validation (failed later on the absent key, as expected)"
+  fi
+}
+
+# docker-compose command: (OCU_WORKLOAD_PROFILE default = untrusted, OCU_RUNTIME_TIER default = runc)
+assert_clears_flags "docker-compose" \
+  -operator-listen unix:///run/ocu-control/operator.sock \
+  -gateway-listen 127.0.0.1:9466 \
+  -runtime-tier runc -runtime-provider docker \
+  -workload-profile untrusted \
+  -jwt-signing-key /run/secrets/storage-jwt-signing.key \
+  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+
+# k8s control-deployment.yaml args:
+assert_clears_flags "k8s" \
+  -operator-listen unix:///run/ocu-control/operator.sock \
+  -gateway-listen 127.0.0.1:9466 \
+  -runtime-tier runc -runtime-provider docker \
+  -workload-profile untrusted \
+  -jwt-signing-key /run/secrets/ocu-control/storage-jwt-signing.key \
+  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+
+# systemd ocu-controld.service ExecStart=
+assert_clears_flags "systemd" \
+  -operator-listen unix:///run/ocu-control/operator.sock \
+  -gateway-listen 127.0.0.1:9466 \
+  -runtime-tier runc -runtime-provider docker \
+  -workload-profile untrusted \
+  -jwt-signing-key /etc/ocu-control/storage-jwt-signing.key \
+  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+
 rm -rf "$tmp"
 
 if [ "$fail" -ne 0 ]; then
   exit 1
 fi
-echo "real-binary smoke passed: all four pre-bind refusals hold"
+echo "real-binary smoke passed: four pre-bind refusals hold and all three manifest argvs clear flag validation"
