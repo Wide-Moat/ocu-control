@@ -22,6 +22,7 @@ func TestPrivilegedActionsIsClosedEnum(t *testing.T) {
 		audit.ActionEditDenylist,
 		audit.ActionOverrideQuota,
 		audit.ActionRetentionPolicy,
+		audit.ActionCreateRejected,
 	}
 	got := audit.PrivilegedActions()
 	if len(got) != len(want) {

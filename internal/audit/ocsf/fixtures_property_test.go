@@ -126,12 +126,35 @@ func TestEmitCallSiteActionsArePinned(t *testing.T) {
 		audit.ActionEditDenylist,  // killswitch denylist edit
 		audit.ActionOverrideQuota, // killswitch quota override
 		audit.ActionRetentionPolicy,
+		audit.ActionCreateRejected, // lifecycle stageAdmit/stageQuotaCharge/stageReserve deny
 	}
 	priv := actionSet(audit.PrivilegedActions())
 	for _, a := range callSiteActions {
 		if !priv[a] {
 			t.Fatalf("Emit call-site action %v is not in PrivilegedActions — the wiring drifted from the fixture", a)
 		}
+	}
+}
+
+// TestCreateRejectedIsSEC72Only proves the system-initiated create rejection is
+// classified into the SEC-72 family ALONE: it is covered by SEC72EnumActions, it is
+// NOT an operator/SOAR action (absent from SEC45Actions, byte-unchanged), and it is
+// not the pinned teardown overlap — so it is covered exactly once, not
+// double-classified. This is the canon ruling: a system rejection is SEC-72, never
+// SEC-45.
+func TestCreateRejectedIsSEC72Only(t *testing.T) {
+	t.Parallel()
+	sec45 := actionSet(audit.SEC45Actions())
+	sec72 := actionSet(audit.SEC72EnumActions())
+
+	if !sec72[audit.ActionCreateRejected] {
+		t.Fatal("ActionCreateRejected is not in SEC72EnumActions — the system rejection escaped its family")
+	}
+	if sec45[audit.ActionCreateRejected] {
+		t.Fatal("ActionCreateRejected is in SEC45Actions — a system rejection must never enter the operator set")
+	}
+	if allowedOverlap[audit.ActionCreateRejected] {
+		t.Fatal("ActionCreateRejected is in allowedOverlap — only the teardown overlap is permitted")
 	}
 }
 
@@ -152,6 +175,7 @@ func TestSEC72LabelSetComplete(t *testing.T) {
 	want := map[string]bool{
 		"session-create": true, "session-destroy": true, "pool-claim": true,
 		"auto-lease-issue": true, "scrub": true, "teardown": true,
+		"quota-rejection": true, "admission-rejection": true, "killswitch-rejection": true,
 		"secret-inject": false, "secret-revoke": false, // forward-declared (HasEnum)
 	}
 	got := make(map[string]bool)

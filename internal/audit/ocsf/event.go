@@ -60,11 +60,14 @@ const (
 	activityOther  uint8 = 99
 )
 
-// OCSF status_id values. A control-plane event that reaches a durable emit is on the
-// success path by construction — a denied action never reaches a durable success
-// event, because an Emit failure IS the deny.
+// OCSF status_id values. A durable emit records the OUTCOME the action reached, not
+// the durability of the record itself: a successful operator/lifecycle action is
+// Success, and a create REFUSED at a pre-side-effect deny stage is Failure — the
+// rejection record is durable (NFR-SEC-46/72), but the action it audits did not
+// succeed, so it must not be marked Success.
 const (
 	statusSuccess uint8 = 1
+	statusFailure uint8 = 2
 )
 
 // OCSF severity_id values. Informational is the default for a routine privileged
@@ -154,10 +157,11 @@ type OCSFEvent struct {
 // activityFor maps a privileged audit.Action onto its OCSF activity_id and a
 // human-readable activity_name. Create-commit is Create(1); destroy is Delete(4);
 // the revoke / denylist-edit / quota-override / retention-policy actions are
-// state-mutating operator controls that map to Update(3); an unknown action falls to
-// Other(99) so a forgotten arm surfaces as an explicit Other rather than a silent
-// mislabel. The name always reflects the Action.String label so the event is
-// self-describing even on the Other path.
+// state-mutating operator controls that map to Update(3); a create-rejected is a
+// refusal that produced no resource and so maps to Other(99) by an explicit case;
+// an unknown action falls to Other(99) so a forgotten arm surfaces as an explicit
+// Other rather than a silent mislabel. The name always reflects the Action.String
+// label so the event is self-describing even on the Other path.
 func activityFor(a audit.Action) (uint8, string) {
 	switch a {
 	case audit.ActionCreateCommit:
@@ -167,6 +171,11 @@ func activityFor(a audit.Action) (uint8, string) {
 	case audit.ActionRevokeOne, audit.ActionRevokeAll,
 		audit.ActionEditDenylist, audit.ActionOverrideQuota, audit.ActionRetentionPolicy:
 		return activityUpdate, a.String()
+	case audit.ActionCreateRejected:
+		// A refused create produced no resource, so it has no CRUD slot: it maps to
+		// Other(99) by an EXPLICIT case (not the unknown fall-through). The name still
+		// reflects the Action label, so the Other event is self-describing.
+		return activityOther, a.String()
 	default:
 		return activityOther, a.String()
 	}
@@ -182,15 +191,29 @@ func severityFor(a audit.Action) uint8 {
 	return severityInformational
 }
 
-// statusName renders an OCSF status_id as its label. Only the success path is
-// reached durably (a denied action never produces a durable success event), so the
-// success label is the meaningful one; an unexpected id renders as "Unknown" rather
-// than an empty string.
-func statusName(id uint8) string {
-	if id == statusSuccess {
-		return "Success"
+// statusFor maps a privileged audit.Action onto its OCSF status_id. A create-rejected
+// is the durable record of a REFUSED action, so its honest status is Failure(2) — the
+// record is durable but the audited action did not succeed. Every other privileged
+// action records a durable Success(1) outcome.
+func statusFor(a audit.Action) uint8 {
+	if a == audit.ActionCreateRejected {
+		return statusFailure
 	}
-	return "Unknown"
+	return statusSuccess
+}
+
+// statusName renders an OCSF status_id as its label. Success and Failure are the two
+// outcomes a durable control-plane record carries (a successful action vs an audited
+// refusal); an unexpected id renders as "Unknown" rather than an empty string.
+func statusName(id uint8) string {
+	switch id {
+	case statusSuccess:
+		return "Success"
+	case statusFailure:
+		return "Failure"
+	default:
+		return "Unknown"
+	}
 }
 
 // buildEvent maps a single audit.Record onto an OCSFEvent at the instant clk.Now()
@@ -203,6 +226,7 @@ func buildEvent(clk state.Clock, rec audit.Record) OCSFEvent {
 	now := clk.Now()
 	activityID, activityName := activityFor(rec.Action)
 	typeUID := uint64(classUIDAPIActivity)*100 + uint64(activityID)
+	sid := statusFor(rec.Action)
 
 	return OCSFEvent{
 		ClassUID:     classUIDAPIActivity,
@@ -212,8 +236,8 @@ func buildEvent(clk state.Clock, rec audit.Record) OCSFEvent {
 		ActivityName: activityName,
 		Time:         now.UnixMilli(),
 		TimeDT:       now.UTC().Format(time.RFC3339Nano),
-		StatusID:     statusSuccess,
-		Status:       statusName(statusSuccess),
+		StatusID:     sid,
+		Status:       statusName(sid),
 		SeverityID:   severityFor(rec.Action),
 		Actor: Actor{
 			User:      User{Name: rec.Caller, UIDAlt: rec.Tenant},

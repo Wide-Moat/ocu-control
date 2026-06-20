@@ -100,6 +100,7 @@ func TestActivityForMapsEveryPrivilegedAction(t *testing.T) {
 		{audit.ActionEditDenylist, activityUpdate},
 		{audit.ActionOverrideQuota, activityUpdate},
 		{audit.ActionRetentionPolicy, activityUpdate},
+		{audit.ActionCreateRejected, activityOther},
 		{audit.Action(200), activityOther},
 	}
 	for _, c := range cases {
@@ -111,8 +112,13 @@ func TestActivityForMapsEveryPrivilegedAction(t *testing.T) {
 			t.Fatalf("activityFor(%v) name = %q, want %q", c.a, name, c.a.String())
 		}
 	}
-	// No privileged action falls to Other.
+	// No privileged action falls to Other EXCEPT the create-rejected refusal, which
+	// faithfully has no CRUD slot and maps to Other(99) by design. Excepting exactly
+	// this one arm keeps the guard for any genuinely-forgotten arm.
 	for _, a := range audit.PrivilegedActions() {
+		if a == audit.ActionCreateRejected {
+			continue
+		}
 		if id, _ := activityFor(a); id == activityOther {
 			t.Fatalf("privileged action %v maps to Other(99) — every privileged action must map to a real activity", a)
 		}
@@ -136,15 +142,71 @@ func TestSeverityForRaisesRevokeAll(t *testing.T) {
 	}
 }
 
-// TestStatusName covers the success label and the unknown fallback.
+// TestStatusName covers the success and failure labels and the unknown fallback.
 func TestStatusName(t *testing.T) {
 	t.Parallel()
 	if got := statusName(statusSuccess); got != "Success" {
 		t.Fatalf("statusName(success) = %q, want Success", got)
 	}
+	if got := statusName(statusFailure); got != "Failure" {
+		t.Fatalf("statusName(failure) = %q, want Failure", got)
+	}
 	if got := statusName(255); got != "Unknown" {
 		t.Fatalf("statusName(255) = %q, want Unknown", got)
 	}
+}
+
+// TestBuildEventRejectionHasFailureStatus pins the OCSF mapping for a system-initiated
+// create rejection: the status is the honest Failure (NOT Success), the activity is
+// Other(99) with the self-describing name, the type_uid follows the OCSF rule, the
+// actor.user is the host-attested caller/tenant (non-blank), the severity is
+// Informational, and the serialized JSON carries no token key.
+func TestBuildEventRejectionHasFailureStatus(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(fixedStart)
+	rec := audit.Record{
+		Action:  audit.ActionCreateRejected,
+		Channel: "operator",
+		Key:     "k",
+		Caller:  "op",
+		Tenant:  "t9",
+		Reason:  "admission-rejection",
+	}
+
+	ev := buildEvent(clk, rec)
+
+	if ev.StatusID != statusFailure || ev.Status != "Failure" {
+		t.Fatalf("status = (%d,%q), want (%d,Failure) — a rejection is NOT Success", ev.StatusID, ev.Status, statusFailure)
+	}
+	if ev.ActivityID != activityOther {
+		t.Fatalf("activity_id = %d, want %d (Other) for a refusal with no CRUD slot", ev.ActivityID, activityOther)
+	}
+	if ev.ActivityName != "create_rejected" {
+		t.Fatalf("activity_name = %q, want create_rejected", ev.ActivityName)
+	}
+	wantType := uint64(classUIDAPIActivity)*100 + uint64(activityOther)
+	if ev.TypeUID != wantType {
+		t.Fatalf("type_uid = %d, want %d (class*100+Other = 600399)", ev.TypeUID, wantType)
+	}
+	if ev.Actor.User.Name != "op" || ev.Actor.User.UIDAlt != "t9" {
+		t.Fatalf("actor.user = %+v, want {op t9} (host-attested, non-blank)", ev.Actor.User)
+	}
+	if ev.Actor.InvokedBy != "operator" {
+		t.Fatalf("actor.invoked_by = %q, want operator", ev.Actor.InvokedBy)
+	}
+	if ev.SeverityID != severityInformational {
+		t.Fatalf("severity_id = %d, want %d (Informational) — a routine fail-closed outcome", ev.SeverityID, severityInformational)
+	}
+	// The serialized event still carries no credential key.
+	b, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatalf("marshal event: %v", err)
+	}
+	var generic map[string]any
+	if err := json.Unmarshal(b, &generic); err != nil {
+		t.Fatalf("unmarshal event: %v", err)
+	}
+	assertNoTokenKeys(t, generic)
 }
 
 // TestEventCarriesNoTokenField is the STRUCTURAL no-token guarantee: the serialized

@@ -40,12 +40,19 @@ func stageResolveIdentity(_ context.Context, _ *Manager, st *createState) (compe
 }
 
 // stageAdmit (S2) calls admission.Decide(profile, tier) — both deployment-fixed,
-// neither request-supplied. A not-admitted decision returns
+// neither request-supplied. A not-admitted decision audits the system-initiated
+// rejection FAIL-CLOSED (NFR-SEC-46/72) and then returns
 // admission.RejectedError{Reason} wrapping ErrAdmissionRejected. It runs BEFORE any
-// host state. Pure; no compensator.
-func stageAdmit(_ context.Context, m *Manager, _ *createState) (compensator, error) {
+// host state, so no compensator is owed; the durable audit write must COMPLETE
+// before the typed rejection reaches the caller, so a crash mid-deny cannot drop the
+// record. If the audit write fails the create is STILL denied (the audit-failure
+// error supersedes the typed admission error). Pure; no compensator.
+func stageAdmit(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	decision := admission.Decide(m.profile, m.tier)
 	if !decision.Admitted {
+		if err := emitCreateRejected(ctx, m, st, "admission-rejection"); err != nil {
+			return nil, fmt.Errorf("lifecycle: admission rejection audit: %w", err)
+		}
 		return nil, admission.RejectedError{Reason: decision.Reason}
 	}
 	return nil, nil
@@ -60,8 +67,15 @@ func stageAdmit(_ context.Context, m *Manager, _ *createState) (compensator, err
 func stageQuotaCharge(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	receipt, err := m.quota.ChargeCreate(ctx, st.owner)
 	if err != nil {
-		// Refused-not-queued: the typed error (ErrQuotaExceeded or ErrStoreUnavailable)
-		// propagates unchanged; ChargeCreate already refunded any partial charge.
+		// Refused-not-queued: ChargeCreate already refunded any partial charge, so the
+		// counter is net-zero. Audit the system-initiated quota rejection FAIL-CLOSED
+		// (the §90 named obligation) BEFORE the typed error propagates; an audit-write
+		// failure supersedes the typed error but the create is STILL denied either way.
+		// ErrStoreUnavailable also flows through here — it is faithfully audited, still a
+		// refused create.
+		if emitErr := emitCreateRejected(ctx, m, st, "quota-rejection"); emitErr != nil {
+			return nil, fmt.Errorf("lifecycle: quota rejection audit: %w", emitErr)
+		}
 		return nil, err
 	}
 	// The receipt refunds EXACTLY the two cells charged; pushing it onto the unwind
@@ -77,8 +91,18 @@ func stageQuotaCharge(ctx context.Context, m *Manager, st *createState) (compens
 func stageReserve(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	row, err := m.reg.Reserve(ctx, st.key, st.owner)
 	if err != nil {
-		// A deny landing mid-create, an existing reservation, or a store fault all
-		// surface their typed error unchanged; no row was written.
+		// A deny landing mid-create (ErrKillSwitchEngaged / ErrSessionDenied), an
+		// existing reservation, or a store fault all surface their typed error
+		// unchanged; no row was written. The deny-posture re-check is the system
+		// rejection NFR-SEC-46/72 require audited: emit FAIL-CLOSED BEFORE the typed
+		// error propagates. The flat "killswitch-rejection" cause covers BOTH the
+		// global kill-switch and the per-key denylist (both are the S4 deny-posture
+		// re-check); the finer kill-switch-vs-denylist distinction stays recoverable
+		// from the wrapped typed error. An audit-write failure supersedes the typed
+		// error but the create is STILL denied either way.
+		if emitErr := emitCreateRejected(ctx, m, st, "killswitch-rejection"); emitErr != nil {
+			return nil, fmt.Errorf("lifecycle: reserve rejection audit: %w", emitErr)
+		}
 		return nil, err
 	}
 	st.row = row
@@ -92,6 +116,29 @@ func stageReserve(ctx context.Context, m *Manager, st *createState) (compensator
 		}
 		return nil
 	}, nil
+}
+
+// emitCreateRejected writes the system-initiated create-rejection audit record
+// FAIL-CLOSED at a pre-side-effect deny stage (admission, quota, or the
+// kill-switch/denylist re-check). The actor is the HOST-ATTESTED owner resolved in
+// S1 (st.owner = st.in.Caller.Identity, NFR-SEC-43) and the correlation handle is the
+// host-derived key (st.key) — never a body hint; cause names which of the three deny
+// posture re-checks fired. It mirrors stageCommit's emit template: the durable write
+// must COMPLETE before the deny stage returns the typed rejection that triggers the
+// LIFO unwind, so a crash or context cancellation mid-unwind cannot drop the record
+// and the client never sees the rejection before the record is durable. A deny stage
+// pushes no compensator, so this emit is inline and synchronous. It uses the live ctx
+// so a cancelled context fails the emit closed.
+func emitCreateRejected(ctx context.Context, m *Manager, st *createState, cause string) error {
+	rec := audit.Record{
+		Action:  audit.ActionCreateRejected,
+		Channel: st.in.Caller.Channel.String(),
+		Key:     st.key.String(),
+		Caller:  st.owner.Caller,
+		Tenant:  st.owner.Tenant,
+		Reason:  cause,
+	}
+	return m.audit.Emit(ctx, rec)
 }
 
 // stageStageHandoff (S5) writes container_info.json, the raw 32-byte Ed25519 PUBLIC

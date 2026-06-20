@@ -28,7 +28,7 @@ const FixtureVersion = "v1"
 // String "audit_action_unknown" boundary just past it is the second, independent
 // proof the walk did not miss a value. It must grow with the const block in
 // audit.go; the exhaustiveness property fails loudly if it lags.
-const lastAction = ActionRetentionPolicy
+const lastAction = ActionCreateRejected
 
 // PrivilegedActions returns the CLOSED set of privileged Action enum values, in enum
 // order. Every value here MUST be covered by exactly one audit fixture family
@@ -95,10 +95,13 @@ type ActionMeta struct {
 // system-driven teardown map to existing enum arms (ActionCreateCommit,
 // ActionDestroy); auto-lease issue and pool-claim land on the create-commit arm
 // (they reach the same privileged checkpoint), and scrub/teardown land on the
-// destroy arm. The secret inject/revoke verbs are forward-declared with HasEnum=false
-// — their wire-contract ops are deferred, so they carry the canon label without an
-// invented enum value. The fixture is faithful to the canon transition list while
-// only enum-backed entries participate in the exhaustiveness union.
+// destroy arm. The three create-rejection causes (quota, admission, kill-switch)
+// land on the create-rejected arm: a create refused at a pre-side-effect deny stage
+// is the system-initiated rejection NFR-SEC-46/72 require audited. The secret
+// inject/revoke verbs are forward-declared with HasEnum=false — their wire-contract
+// ops are deferred, so they carry the canon label without an invented enum value.
+// The fixture is faithful to the canon transition list while only enum-backed
+// entries participate in the exhaustiveness union.
 func SEC72Actions() []ActionMeta {
 	return []ActionMeta{
 		{Label: "session-create", Action: ActionCreateCommit, HasEnum: true},
@@ -109,6 +112,15 @@ func SEC72Actions() []ActionMeta {
 		{Label: "teardown", Action: ActionDestroy, HasEnum: true},
 		{Label: "secret-inject", HasEnum: false},
 		{Label: "secret-revoke", HasEnum: false},
+		// The system-initiated create REJECTION at a pre-side-effect deny stage. The
+		// three cause labels (quota, admission, kill-switch/denylist re-check) all map
+		// onto the single ActionCreateRejected arm — exactly as pool-claim,
+		// auto-lease-issue, and session-create map three labels onto ActionCreateCommit
+		// — so the deny posture that fired is named in the trail without inventing three
+		// enum arms. NFR-SEC-46/72: the deny itself is audited fail-closed.
+		{Label: "quota-rejection", Action: ActionCreateRejected, HasEnum: true},
+		{Label: "admission-rejection", Action: ActionCreateRejected, HasEnum: true},
+		{Label: "killswitch-rejection", Action: ActionCreateRejected, HasEnum: true},
 	}
 }
 

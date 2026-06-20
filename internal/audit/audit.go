@@ -54,6 +54,12 @@ const (
 	// that drives it) is a deferred follow-up; the enum value exists now so the audit
 	// classification is closed over every privileged action the fixture names.
 	ActionRetentionPolicy
+	// ActionCreateRejected is a session create REFUSED at a pre-side-effect deny
+	// stage (admission, quota, or the kill-switch/denylist re-check). It is the
+	// system-initiated rejection record NFR-SEC-46/72 require: the deny itself is
+	// audited fail-closed before the typed rejection reaches the caller. It is NOT
+	// an operator action and never enters the SEC-45 set.
+	ActionCreateRejected
 )
 
 // String renders the Action for the audit record and for diagnostics. An
@@ -76,6 +82,8 @@ func (a Action) String() string {
 		return "override_quota"
 	case ActionRetentionPolicy:
 		return "retention_policy"
+	case ActionCreateRejected:
+		return "create_rejected"
 	default:
 		return "audit_action_unknown"
 	}

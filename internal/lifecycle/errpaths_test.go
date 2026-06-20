@@ -405,6 +405,75 @@ func TestCreateBindFallbackOnEmptyRuntimeID(t *testing.T) {
 	}
 }
 
+// TestCreateAdmissionRejectedAuditFailureDenies proves the S2 deny path is fail-closed
+// when the audit sink is faulted: the create returns the audit-failure deny (which
+// supersedes the typed admission error), and no substrate is touched.
+func TestCreateAdmissionRejectedAuditFailureDenies(t *testing.T) {
+	t.Parallel()
+	h := newRejectHarness(t, admission.ProfileUntrusted, runtime.TierRunc, generousLimits())
+	h.audit.SetFault(true, errors.New("sink down"))
+
+	_, err := h.mgr.Create(context.Background(), input("admit-fault"))
+	if !errors.Is(err, audit.ErrAuditWriteFailed) {
+		t.Fatalf("Create with admission deny + faulted audit = %v; want ErrAuditWriteFailed", err)
+	}
+	if h.provider.materializeCalls != 0 {
+		t.Fatalf("Materialize called %d times; an audit-failure deny must touch no substrate", h.provider.materializeCalls)
+	}
+	if h.audit.Len() != 0 {
+		t.Fatalf("audit recorded %d records on a faulted-sink admission deny; want 0", h.audit.Len())
+	}
+}
+
+// TestCreateQuotaRejectedAuditFailureDenies proves the S3 deny path is fail-closed when
+// the sink is faulted: the second create (refused by the concurrent limit) returns the
+// audit-failure deny, and the concurrent counter is still 1 (the refused attempt's
+// charge was refunded by ChargeCreate before the emit), so no second commit lands.
+func TestCreateQuotaRejectedAuditFailureDenies(t *testing.T) {
+	t.Parallel()
+	h := newRejectHarness(t, admission.ProfileTrustedOperator, runtime.TierRunc,
+		quota.Limits{ConcurrentSessionsPerTenant: 1, CreateRatePerCallerPerMin: 100})
+	ctx := context.Background()
+
+	if _, err := h.mgr.Create(ctx, input("first")); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	h.audit.SetFault(true, errors.New("sink down"))
+
+	_, err := h.mgr.Create(ctx, input("second"))
+	if !errors.Is(err, audit.ErrAuditWriteFailed) {
+		t.Fatalf("second Create with quota deny + faulted audit = %v; want ErrAuditWriteFailed", err)
+	}
+	if got := concurrentCount(t, h.store, testCaller.Identity); got != 1 {
+		t.Fatalf("concurrent counter after faulted-sink quota deny = %d, want 1 (second charge refunded)", got)
+	}
+}
+
+// TestCreateKillSwitchRejectedAuditFailureDenies proves the S4 deny path is fail-closed
+// when the sink is faulted: under DENY-ALL the create returns the audit-failure deny,
+// leaves no ACTIVE row, and the concurrent counter is back at 0.
+func TestCreateKillSwitchRejectedAuditFailureDenies(t *testing.T) {
+	t.Parallel()
+	h := newRejectHarness(t, admission.ProfileTrustedOperator, runtime.TierRunc, generousLimits())
+	ctx := context.Background()
+
+	if err := h.store.SetDeny(ctx, state.DenyEntry{Scope: state.ScopeGlobal}); err != nil {
+		t.Fatalf("SetDeny global: %v", err)
+	}
+	h.audit.SetFault(true, errors.New("sink down"))
+
+	_, err := h.mgr.Create(ctx, input("killswitch-fault"))
+	if !errors.Is(err, audit.ErrAuditWriteFailed) {
+		t.Fatalf("Create under DENY-ALL + faulted audit = %v; want ErrAuditWriteFailed", err)
+	}
+	if got := concurrentCount(t, h.store, testCaller.Identity); got != 0 {
+		t.Fatalf("concurrent counter after faulted-sink killswitch deny = %d, want 0 (refunded on unwind)", got)
+	}
+	if got := h.provider.liveCount(); got != 0 {
+		t.Fatalf("live containers after faulted-sink killswitch deny = %d, want 0", got)
+	}
+}
+
 // unstageFailStager wraps a real Stager but fails Unstage, so the create unwind's
 // stageStageHandoff compensator hits its error branch.
 type unstageFailStager struct{ inner handoff.Stager }

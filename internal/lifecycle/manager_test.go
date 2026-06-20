@@ -376,3 +376,206 @@ func concurrentCount(t *testing.T, store state.Store, id state.Identity) int64 {
 	}
 	return v
 }
+
+// rejectHarness bundles a Manager plus the fakes the create-rejection audit tests
+// inspect. It is built with a caller-chosen profile/tier and quota limits so each of
+// the three deny stages (admission, quota, kill-switch) can be driven in turn.
+type rejectHarness struct {
+	mgr      *lifecycle.Manager
+	store    *listerStore
+	provider *recordingProvider
+	audit    *audit.RecordingFake
+}
+
+// newRejectHarness builds a Manager over an in-mem Store, a recording provider, and
+// the audit recording fake at the given profile/tier and quota limits.
+func newRejectHarness(t *testing.T, profile admission.WorkloadProfile, tier runtime.RuntimeTier, limits quota.Limits) *rejectHarness {
+	t.Helper()
+	clk := state.NewFakeClock(lifeStart)
+	inner := state.NewInMemory(clk)
+	store := newListerStore(inner)
+	provider := newRecordingProvider()
+	sink := audit.NewRecordingFake()
+	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+		Custodian: registry.NewCustodian(store),
+		Provider:  provider,
+		Clock:     clk,
+		Quota:     quota.NewGate(store, clk, limits),
+		Handoff:   newFaultStager(t.TempDir()),
+		Audit:     sink,
+		Profile:   profile,
+		Tier:      tier,
+	})
+	return &rejectHarness{mgr: mgr, store: store, provider: provider, audit: sink}
+}
+
+// onlyRejection returns the single ActionCreateRejected record the sink holds,
+// failing the test if there is not exactly one and asserting no create_commit record
+// leaked.
+func onlyRejection(t *testing.T, sink *audit.RecordingFake) audit.Record {
+	t.Helper()
+	recs := sink.Records()
+	if len(recs) != 1 {
+		t.Fatalf("audit records = %+v, want exactly one create_rejected", recs)
+	}
+	if recs[0].Action != audit.ActionCreateRejected {
+		t.Fatalf("audit record action = %v, want ActionCreateRejected", recs[0].Action)
+	}
+	if recs[0].Caller != testCaller.Identity.Caller || recs[0].Tenant != testCaller.Identity.Tenant {
+		t.Fatalf("audit identity = %q/%q, want host-attested %q/%q",
+			recs[0].Caller, recs[0].Tenant, testCaller.Identity.Caller, testCaller.Identity.Tenant)
+	}
+	if recs[0].Channel != testCaller.Channel.String() {
+		t.Fatalf("audit channel = %q, want %q", recs[0].Channel, testCaller.Channel.String())
+	}
+	if recs[0].Key == "" {
+		t.Fatal("audit record Key is blank; want the host-derived correlation key")
+	}
+	return recs[0]
+}
+
+// TestCreateAdmissionRejectedEmitsAudit proves the S2 deny emits exactly one
+// system-initiated create-rejection record carrying the host-attested identity and
+// the admission-rejection cause, BEFORE the typed admission error propagates, and
+// touches no substrate.
+func TestCreateAdmissionRejectedEmitsAudit(t *testing.T) {
+	t.Parallel()
+	h := newRejectHarness(t, admission.ProfileUntrusted, runtime.TierRunc, generousLimits())
+
+	_, err := h.mgr.Create(context.Background(), input("x"))
+	if !errors.Is(err, admission.ErrAdmissionRejected) {
+		t.Fatalf("Create error = %v, want ErrAdmissionRejected", err)
+	}
+	rec := onlyRejection(t, h.audit)
+	if rec.Reason != "admission-rejection" {
+		t.Fatalf("rejection Reason = %q, want admission-rejection", rec.Reason)
+	}
+	if h.provider.materializeCalls != 0 {
+		t.Fatalf("Materialize called %d times on an admission-rejected create; want 0", h.provider.materializeCalls)
+	}
+}
+
+// TestCreateQuotaRejectedEmitsAudit proves the S3 deny emits exactly one
+// system-initiated create-rejection record with the quota-rejection cause, leaves the
+// concurrent counter at the one live session, and writes no second commit record.
+func TestCreateQuotaRejectedEmitsAudit(t *testing.T) {
+	t.Parallel()
+	h := newRejectHarness(t, admission.ProfileTrustedOperator, runtime.TierRunc,
+		quota.Limits{ConcurrentSessionsPerTenant: 1, CreateRatePerCallerPerMin: 100})
+	ctx := context.Background()
+
+	if _, err := h.mgr.Create(ctx, input("first")); err != nil {
+		t.Fatalf("first Create: %v", err)
+	}
+	// The first create's commit record is present; clear the sink so the rejection is
+	// the only record under assertion.
+	if h.audit.Len() != 1 || h.audit.Records()[0].Action != audit.ActionCreateCommit {
+		t.Fatalf("after first create, audit = %+v, want one create_commit", h.audit.Records())
+	}
+
+	_, err := h.mgr.Create(ctx, input("second"))
+	if !errors.Is(err, state.ErrQuotaExceeded) {
+		t.Fatalf("second Create error = %v, want ErrQuotaExceeded", err)
+	}
+	recs := h.audit.Records()
+	if len(recs) != 2 || recs[1].Action != audit.ActionCreateRejected || recs[1].Reason != "quota-rejection" {
+		t.Fatalf("audit = %+v, want create_commit then create_rejected(quota-rejection)", recs)
+	}
+	if got := concurrentCount(t, h.store, testCaller.Identity); got != 1 {
+		t.Fatalf("concurrent counter after quota rejection = %d, want 1 (the one live session)", got)
+	}
+}
+
+// TestCreateKillSwitchRejectedEmitsAudit proves the S4 deny-posture re-check emits
+// exactly one create-rejection record with the killswitch-rejection cause for BOTH
+// the global kill-switch (ErrKillSwitchEngaged) and a per-key denylist
+// (ErrSessionDenied), and leaves no ACTIVE row and the concurrent counter back at 0
+// (the S3 receipt refunded on unwind, proving no side-effect).
+func TestCreateKillSwitchRejectedEmitsAudit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Variant 1: global DENY-ALL.
+	h := newRejectHarness(t, admission.ProfileTrustedOperator, runtime.TierRunc, generousLimits())
+	if err := h.store.SetDeny(ctx, state.DenyEntry{Scope: state.ScopeGlobal}); err != nil {
+		t.Fatalf("SetDeny global: %v", err)
+	}
+	_, err := h.mgr.Create(ctx, input("denied-global"))
+	if !errors.Is(err, state.ErrKillSwitchEngaged) {
+		t.Fatalf("Create under DENY-ALL error = %v, want ErrKillSwitchEngaged", err)
+	}
+	rec := onlyRejection(t, h.audit)
+	if rec.Reason != "killswitch-rejection" {
+		t.Fatalf("global-deny rejection Reason = %q, want killswitch-rejection", rec.Reason)
+	}
+	if got := concurrentCount(t, h.store, testCaller.Identity); got != 0 {
+		t.Fatalf("concurrent counter after global-deny rejection = %d, want 0 (refunded on unwind)", got)
+	}
+
+	// Variant 2: per-key denylist. Create then destroy a session to learn its
+	// host-derived key (mintHandle is host-internal), denylist that exact key, then
+	// re-create with the SAME hint, which derives the SAME key and is refused at S4.
+	h2 := newRejectHarness(t, admission.ProfileTrustedOperator, runtime.TierRunc, generousLimits())
+	row, err := h2.mgr.Create(ctx, input("denied-key"))
+	if err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+	if err := h2.mgr.Destroy(ctx, testCaller, "denied-key"); err != nil {
+		t.Fatalf("seed Destroy: %v", err)
+	}
+	if err := h2.store.SetDeny(ctx, state.DenyEntry{Scope: state.ScopeSession, Key: row.Key}); err != nil {
+		t.Fatalf("SetDeny session: %v", err)
+	}
+	beforeLen := h2.audit.Len() // create_commit + destroy already recorded
+	_, err = h2.mgr.Create(ctx, input("denied-key"))
+	if !errors.Is(err, state.ErrSessionDenied) {
+		t.Fatalf("Create under per-key denylist error = %v, want ErrSessionDenied", err)
+	}
+	recs := h2.audit.Records()
+	if len(recs) != beforeLen+1 {
+		t.Fatalf("audit recorded %d records after per-key denial, want %d (+1 rejection)", len(recs), beforeLen+1)
+	}
+	last := recs[len(recs)-1]
+	if last.Action != audit.ActionCreateRejected || last.Reason != "killswitch-rejection" {
+		t.Fatalf("last audit record = %+v, want create_rejected(killswitch-rejection)", last)
+	}
+	if got := concurrentCount(t, h2.store, testCaller.Identity); got != 0 {
+		t.Fatalf("concurrent counter after per-key rejection = %d, want 0 (refunded on unwind)", got)
+	}
+}
+
+// TestRejectionAuditPrecedesDeny is the ordering assertion: on success the rejection
+// Record is durable in the sink at the instant the typed error returns (synchronous
+// emit), and on a faulted sink RecordingFake records nothing, so no half-written
+// rejection record exists; in both cases no substrate side-effect occurs.
+func TestRejectionAuditPrecedesDeny(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	// Success-emit: the rejection record is present the moment the deny returns.
+	h := newRejectHarness(t, admission.ProfileUntrusted, runtime.TierRunc, generousLimits())
+	_, err := h.mgr.Create(ctx, input("ordering-ok"))
+	if !errors.Is(err, admission.ErrAdmissionRejected) {
+		t.Fatalf("Create error = %v, want ErrAdmissionRejected", err)
+	}
+	if h.audit.Len() != 1 {
+		t.Fatalf("rejection record count at deny = %d, want 1 (durable before the deny returned)", h.audit.Len())
+	}
+	if h.provider.materializeCalls != 0 {
+		t.Fatalf("Materialize called %d times; a deny must touch no substrate", h.provider.materializeCalls)
+	}
+
+	// Audit-failure: the faulted sink records nothing, so no half-written record exists.
+	hf := newRejectHarness(t, admission.ProfileUntrusted, runtime.TierRunc, generousLimits())
+	hf.audit.SetFault(true, errors.New("sink down"))
+	_, err = hf.mgr.Create(ctx, input("ordering-fault"))
+	if !errors.Is(err, audit.ErrAuditWriteFailed) {
+		t.Fatalf("Create on faulted sink error = %v, want ErrAuditWriteFailed", err)
+	}
+	if hf.audit.Len() != 0 {
+		t.Fatalf("faulted-sink record count = %d, want 0 (no half-written rejection)", hf.audit.Len())
+	}
+	if hf.provider.materializeCalls != 0 {
+		t.Fatalf("Materialize called %d times on a faulted-sink deny; want 0", hf.provider.materializeCalls)
+	}
+}

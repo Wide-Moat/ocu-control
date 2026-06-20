@@ -138,11 +138,31 @@ func TestActionString(t *testing.T) {
 		{audit.ActionEditDenylist, "edit_denylist"},
 		{audit.ActionOverrideQuota, "override_quota"},
 		{audit.ActionRetentionPolicy, "retention_policy"},
+		{audit.ActionCreateRejected, "create_rejected"},
 		{audit.Action(250), "audit_action_unknown"},
 	}
 	for _, c := range cases {
 		if got := c.a.String(); got != c.want {
 			t.Fatalf("Action(%d).String() = %q, want %q", c.a, got, c.want)
 		}
+	}
+}
+
+// TestActionCreateRejectedStringAndPrivileged pins the new system-rejection arm: its
+// String label is "create_rejected", it is an enumerated privileged Action, and the
+// first value past it (lastAction+1) is NOT privileged — so the rejection arm closes
+// the enum without admitting an unknown.
+func TestActionCreateRejectedStringAndPrivileged(t *testing.T) {
+	t.Parallel()
+	if got := audit.ActionCreateRejected.String(); got != "create_rejected" {
+		t.Fatalf("ActionCreateRejected.String() = %q, want create_rejected", got)
+	}
+	if !audit.IsPrivileged(audit.ActionCreateRejected) {
+		t.Fatal("IsPrivileged(ActionCreateRejected) = false, want true")
+	}
+	// ActionCreateRejected is the new highest enum value; one past it is unknown.
+	beyond := audit.Action(uint8(audit.ActionCreateRejected) + 1)
+	if audit.IsPrivileged(beyond) {
+		t.Fatalf("IsPrivileged(%d) = true, want false (one past the last enum arm)", beyond)
 	}
 }
