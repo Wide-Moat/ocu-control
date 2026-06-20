@@ -98,6 +98,18 @@ jobs:
       - name: run the RuntimeProvider Docker integration leg (real daemon)
         env:
           OCU_RUNTIME_IT: "1"
+        # This same OCU_RUNTIME_IT=1 invocation also covers the gVisor leg
+        # (TestIT_GvisorRuntimeInspect): a TierGvisor create whose docker-inspect
+        # asserts HostConfig.Runtime == "runsc", proving the gVisor admission
+        # decision is enforced at the OCI layer. That leg gates a SECOND time on a
+        # `docker info` probe for a registered "runsc" runtime and
+        # skips-with-notice when it is absent. The stock ubuntu-latest runner does
+        # NOT ship runsc, so the gVisor assertion SKIPS here until the runner (or
+        # the Lima VM on darwin) is provisioned with gVisor and registers the
+        # runtime under the name "runsc" — a green run without runsc is a skip, not
+        # an executed gVisor assertion. The unit + fake-SDK + admission↔OCI
+        # consistency tests make the policy-vs-OCI gap red→green on every runner
+        # unconditionally; this leg is the real-runsc confirmation where it exists.
         run: go test -run 'TestIT' ./internal/runtime/docker/ -v -timeout 600s
       # The milestone capstone: the WHOLE lifecycle pipeline driven against a REAL
       # Postgres state.Store AND the REAL Docker daemon together — admission →

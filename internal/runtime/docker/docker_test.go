@@ -9,11 +9,13 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/docker/docker/api/types/container"
 
+	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 )
 
@@ -51,12 +53,21 @@ func validSpec() runtime.SessionSpec {
 }
 
 // TestBuildHostConfig_HOST01 asserts EVERY HOST-01 hardening field on the produced
-// *container.HostConfig — the verbatim hardening surface (requirement 5).
+// *container.HostConfig — the verbatim hardening surface (requirement 5). It builds
+// under TierRunc; the gVisor case is the same surface plus the Runtime string, which
+// TestBuildHostConfig_RuntimeByTier and TestBuildHostConfig_HardeningIdenticalAcrossTiers
+// cover.
 func TestBuildHostConfig_HOST01(t *testing.T) {
 	spec := validSpec()
-	hc, err := buildHostConfig(spec)
+	hc, err := buildHostConfig(spec, runtime.TierRunc)
 	if err != nil {
 		t.Fatalf("buildHostConfig: unexpected error %v", err)
+	}
+
+	// Under TierRunc the Runtime string is empty — the daemon default (runc). The
+	// gVisor arm is asserted separately; here we pin that runc adds NOTHING.
+	if hc.Runtime != "" {
+		t.Errorf("Runtime under TierRunc: want empty (daemon default), got %q", hc.Runtime)
 	}
 
 	// CapDrop == ["ALL"].
@@ -152,6 +163,82 @@ func TestBuildHostConfig_HOST01(t *testing.T) {
 	}
 }
 
+// TestDockerRuntimeForTier asserts the pure tier→runtime-string mapper: TierGvisor
+// asks dockerd for the gVisor sentry ("runsc"), TierRunc uses the daemon default
+// (""), and TierFirecracker falls into the safe empty default (it never reaches
+// this code because Materialize aborts before buildHostConfig, but the mapper is
+// total and must not panic for it). This is the unit that makes the policy↔OCI gap
+// observable independent of the HostConfig wiring.
+func TestDockerRuntimeForTier(t *testing.T) {
+	cases := []struct {
+		name string
+		tier runtime.RuntimeTier
+		want string
+	}{
+		{"gvisor asks for the runsc sentry", runtime.TierGvisor, "runsc"},
+		{"runc uses the daemon default (empty)", runtime.TierRunc, ""},
+		{"firecracker falls into the safe empty default", runtime.TierFirecracker, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := dockerRuntimeForTier(c.tier); got != c.want {
+				t.Errorf("dockerRuntimeForTier(%v): want %q, got %q", c.tier, c.want, got)
+			}
+		})
+	}
+}
+
+// TestBuildHostConfig_RuntimeByTier is the NON-VACUOUS key test: it asserts the
+// REAL buildHostConfig path stamps HostConfig.Runtime per tier — "runsc" for
+// TierGvisor, "" for TierRunc. Before the fix the field was never set, so the
+// gVisor case was empty (the daemon default, bare runc) even though admission
+// admitted the workload expecting the sentry: this assertion is RED on that tree
+// and GREEN with the fix, which is the proof the gap was real.
+func TestBuildHostConfig_RuntimeByTier(t *testing.T) {
+	gv, err := buildHostConfig(validSpec(), runtime.TierGvisor)
+	if err != nil {
+		t.Fatalf("buildHostConfig(TierGvisor): unexpected error %v", err)
+	}
+	if gv.Runtime != "runsc" {
+		t.Errorf("TierGvisor HostConfig.Runtime: want %q (the gVisor sentry), got %q — "+
+			"the gVisor admission decision is NOT enforced at the OCI layer", "runsc", gv.Runtime)
+	}
+
+	rc, err := buildHostConfig(validSpec(), runtime.TierRunc)
+	if err != nil {
+		t.Fatalf("buildHostConfig(TierRunc): unexpected error %v", err)
+	}
+	if rc.Runtime != "" {
+		t.Errorf("TierRunc HostConfig.Runtime: want empty (daemon default), got %q", rc.Runtime)
+	}
+}
+
+// TestBuildHostConfig_HardeningIdenticalAcrossTiers proves the tier adds ONLY the
+// Runtime string: a gVisor HostConfig is byte-identical to the runc one in EVERY
+// other hardening field (CapDrop, SecurityOpt incl. seccomp=, ReadonlyRootfs,
+// Tmpfs, the three Binds, NetworkMode, NanoCPUs/Memory/PidsLimit, no PortBindings),
+// so gVisor runs the SAME hardened HostConfig — the fix changes the OCI runtime,
+// not the hardening posture.
+func TestBuildHostConfig_HardeningIdenticalAcrossTiers(t *testing.T) {
+	rc, err := buildHostConfig(validSpec(), runtime.TierRunc)
+	if err != nil {
+		t.Fatalf("buildHostConfig(TierRunc): %v", err)
+	}
+	gv, err := buildHostConfig(validSpec(), runtime.TierGvisor)
+	if err != nil {
+		t.Fatalf("buildHostConfig(TierGvisor): %v", err)
+	}
+
+	// The ONLY field that may differ is Runtime; normalize it and require the rest
+	// to be deeply equal. (Comparing the whole struct after zeroing Runtime catches
+	// any future field that silently diverges across tiers.)
+	rc.Runtime = ""
+	gv.Runtime = ""
+	if !reflect.DeepEqual(rc, gv) {
+		t.Errorf("HostConfig differs across tiers in a field OTHER than Runtime:\n runc:   %+v\n gvisor: %+v", rc, gv)
+	}
+}
+
 // TestBuildContainerConfig_EnvEmpty asserts Env is empty (no secret rides Env) and
 // the reconciler labels are stamped.
 func TestBuildContainerConfig_EnvEmpty(t *testing.T) {
@@ -226,7 +313,7 @@ func TestBuildHostConfig_SeccompFailClosed(t *testing.T) {
 	compactSeccomp = ""
 	t.Cleanup(func() { compactSeccomp = saved })
 
-	hc, err := buildHostConfig(validSpec())
+	hc, err := buildHostConfig(validSpec(), runtime.TierRunc)
 	if !errors.Is(err, runtime.ErrSeccompProfileMissing) {
 		t.Errorf("buildHostConfig with empty profile: want ErrSeccompProfileMissing, got %v", err)
 	}
@@ -283,6 +370,81 @@ func TestNetworkCreate_Internal(t *testing.T) {
 	}
 	if opt.Labels[labelSessionName] != string(spec.Name) {
 		t.Errorf("bridge label %q: want %q, got %q", labelSessionName, spec.Name, opt.Labels[labelSessionName])
+	}
+}
+
+// TestMaterialize_GvisorRuntimeOnHostConfig proves the WIRING end to end (p.tier →
+// buildHostConfig → ContainerCreate): a provider bound to TierGvisor hands
+// ContainerCreate a HostConfig whose Runtime is "runsc", and a TierRunc provider
+// hands one whose Runtime is "". It asserts on the EXACT HostConfig the provider
+// would send to the daemon (captured by the fake), not on the mapper in isolation —
+// so a regression that drops the wiring while keeping the mapper still fails here.
+func TestMaterialize_GvisorRuntimeOnHostConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		tier runtime.RuntimeTier
+		want string
+	}{
+		{"gvisor provider sends runsc", runtime.TierGvisor, "runsc"},
+		{"runc provider sends the daemon default", runtime.TierRunc, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := newFakeAPI()
+			p, err := NewDockerProvider(c.tier, Deps{API: fake})
+			if err != nil {
+				t.Fatalf("NewDockerProvider: %v", err)
+			}
+			if _, merr := p.Materialize(context.Background(), validSpec()); merr != nil {
+				t.Fatalf("Materialize: %v", merr)
+			}
+			hc := fake.lastHostConfig
+			if hc == nil {
+				t.Fatalf("fake captured no HostConfig from ContainerCreate")
+			}
+			if hc.Runtime != c.want {
+				t.Errorf("HostConfig.Runtime sent to ContainerCreate: want %q, got %q", c.want, hc.Runtime)
+			}
+		})
+	}
+}
+
+// TestAdmissionGvisorCellsAgreeWithOCIRuntime is the regression guard for the gap:
+// for EVERY (profile, tier) pairing admission ADMITS at TierGvisor, the Docker
+// provider's tier→runtime mapper must yield "runsc". This binds the policy decision
+// (admission admits the workload expecting the gVisor sentry) to the OCI reality
+// (dockerd is asked for runsc), so there is no path where admission admits a gVisor
+// workload but the container is created on bare runc. The admission import is
+// test-only — production docker never imports admission, keeping the RuntimeProvider
+// seam decoupled from the admission package.
+func TestAdmissionGvisorCellsAgreeWithOCIRuntime(t *testing.T) {
+	profiles := []admission.WorkloadProfile{
+		admission.ProfileTrustedOperator,
+		admission.ProfileInternalWorkforce,
+		admission.ProfileUntrusted,
+	}
+	tiers := []runtime.RuntimeTier{runtime.TierRunc, runtime.TierGvisor, runtime.TierFirecracker}
+
+	sawAdmittedGvisor := false
+	for _, prof := range profiles {
+		for _, tier := range tiers {
+			if !admission.Decide(prof, tier).Admitted {
+				continue
+			}
+			if tier != runtime.TierGvisor {
+				continue
+			}
+			sawAdmittedGvisor = true
+			if rt := dockerRuntimeForTier(tier); rt != "runsc" {
+				t.Errorf("admission admits (%s, gvisor) but the OCI runtime would be %q, not \"runsc\": "+
+					"the gVisor isolation decision would not be enforced", prof, rt)
+			}
+		}
+	}
+	// Guard the guard: if no gVisor cell is admitted the loop above is vacuous, which
+	// would silently disable the regression check.
+	if !sawAdmittedGvisor {
+		t.Fatalf("expected at least one admission-admitted TierGvisor cell; the consistency check was vacuous")
 	}
 }
 

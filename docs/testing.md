@@ -32,6 +32,25 @@ no live-S3 leg. The integration leg that needs an external service needs a
 real containers — not a mock. `deploy/docker-compose.test.yml` stages that
 runtime; the integration package that consumes it lands with the provider PRs.
 
+### gVisor (runsc) integration leg
+
+The RuntimeProvider integration suite includes a **gVisor leg**
+(`TestIT_GvisorRuntimeInspect`): a `TierGvisor` provider materializes a real
+container and `docker inspect` confirms `HostConfig.Runtime == "runsc"`, proving
+the gVisor admission decision is enforced at the OCI layer (the sentry runs the
+workload, not bare runc). It is gated twice — `OCU_RUNTIME_IT=1` for a reachable
+daemon, then a probe of `docker info`'s registered runtimes — and
+**skips-with-notice** when `runsc` is not registered, naming the requirement in
+the skip message. It never silently passes.
+
+The stock `ubuntu-latest` CI runner does **not** ship runsc, so on the current
+CI this leg skips-with-notice until the runner (or the Lima VM on darwin) is
+provisioned with gVisor and registers the runtime as `runsc`. A green CI without
+runsc is a **skip**, not an executed gVisor assertion. The unit, fake-SDK, and
+admission↔OCI consistency tests (which run on every runner with no daemon) are
+what make the policy-vs-OCI gap red→green unconditionally; this leg is the
+real-runsc confirmation where the runtime exists.
+
 ## Race detector
 
 The daemon is concurrency-heavy: the admission gate, the per-session

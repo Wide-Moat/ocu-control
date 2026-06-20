@@ -232,6 +232,70 @@ func TestIT_GracefulStopHonorsGrace(t *testing.T) {
 	}
 }
 
+// requireRunsc skips with a LOUD notice when the daemon has no "runsc" runtime
+// registered. It is the second half of the gVisor leg's gate: requireIT proves a
+// reachable daemon, then this proves the daemon can actually create a gVisor
+// container — otherwise ContainerCreate would fail with "unknown runtime: runsc".
+// The skip names the requirement so a green CI is never mistaken for an executed
+// gVisor assertion; the CI/Lima runner must register the runsc runtime for this leg
+// to run (the stock ubuntu-latest runner does not ship it, so it skips-with-notice
+// there until provisioned).
+func requireRunsc(t *testing.T, cli *client.Client) {
+	t.Helper()
+	info, err := cli.Info(context.Background())
+	if err != nil {
+		t.Skipf("integration: gVisor leg could not query daemon Info (%v); skipping", err)
+	}
+	if _, ok := info.Runtimes["runsc"]; !ok {
+		names := make([]string, 0, len(info.Runtimes))
+		for n := range info.Runtimes {
+			names = append(names, n)
+		}
+		t.Skipf("integration: gVisor leg requires runsc registered on the daemon "+
+			"(info.Runtimes has no \"runsc\"; registered: %v); the CI/Lima runner must "+
+			"register the gVisor runtime — skipping", names)
+	}
+}
+
+// TestIT_GvisorRuntimeInspect is the real-daemon confirmation of the gVisor wiring:
+// a TierGvisor provider materializes a container and docker inspect reports
+// HostConfig.Runtime == "runsc", proving the admission-admitted gVisor decision is
+// enforced at the OCI layer (the sentry actually runs the workload, not bare runc).
+// It is gated twice — requireIT (reachable daemon) then requireRunsc (runsc
+// registered) — and skips-with-notice where runsc is absent, never silently
+// passing. The unit + fake-SDK + consistency tests make the gap red→green on every
+// runner; this leg is the real-runsc confirmation where the runtime exists.
+func TestIT_GvisorRuntimeInspect(t *testing.T) {
+	cli := requireIT(t)
+	requireRunsc(t, cli)
+	ctx := context.Background()
+	pullIfNeeded(t, cli)
+
+	p, err := NewDockerProvider(runtime.TierGvisor, Deps{})
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	spec := itSpec(t, runtime.SessionName("it-gvisor"))
+
+	sb, merr := p.Materialize(ctx, spec)
+	if merr != nil {
+		t.Fatalf("Materialize(TierGvisor): %v", merr)
+	}
+	t.Cleanup(func() { _ = p.Teardown().ForceKill(context.Background(), sb) })
+
+	ci, cerr := cli.ContainerInspect(ctx, sb.RuntimeID)
+	if cerr != nil {
+		t.Fatalf("container inspect %q: %v", sb.RuntimeID, cerr)
+	}
+	if ci.HostConfig == nil {
+		t.Fatalf("inspect returned no HostConfig")
+	}
+	if ci.HostConfig.Runtime != "runsc" {
+		t.Errorf("TierGvisor container HostConfig.Runtime: want %q (gVisor sentry enforced at OCI), got %q",
+			"runsc", ci.HostConfig.Runtime)
+	}
+}
+
 // TestIT_ForceKillBackstop asserts a container that ignores SIGTERM is
 // force-removed promptly with no wait on any guest reply, and that a second
 // ForceKill on the same Sandbox is idempotent (no error).

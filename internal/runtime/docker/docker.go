@@ -194,6 +194,32 @@ func networkName(name runtime.SessionName) string { return "ocu-net-" + string(n
 // containerName is the pure function from session name to container name.
 func containerName(name runtime.SessionName) string { return "ocu-sess-" + string(name) }
 
+// dockerRuntimeForTier maps the deployment-wide isolation tier to the Docker
+// HostConfig.Runtime string. Empty means "the daemon default" (runc under a
+// stock dockerd) — it is correct NOT to hardcode "runc", since the daemon may
+// name its default differently. TierGvisor asks dockerd for the gVisor sentry
+// ("runsc"); without this the gVisor admission decision is not enforced at the
+// OCI layer (admission admits internal_workforce and untrusted-tier workloads
+// on TierGvisor expecting the sentry, but a container created on the daemon
+// default lands on a shared-kernel runc boundary). TierFirecracker never reaches
+// here (Materialize aborts before buildHostConfig) so it has no arm and falls
+// into the safe empty-string default.
+func dockerRuntimeForTier(tier runtime.RuntimeTier) string {
+	switch tier {
+	case runtime.TierGvisor:
+		// "runsc" is the plain gVisor sentry. A gVisor-enabled host may register
+		// two runsc runtimes — "runsc" (no --fuse) and "runsc-fuse" (with --fuse);
+		// the v1 control plane materializes an ordinary untrusted COMPUTE sandbox
+		// (the rclone-filestore mount runs in-guest behind the egress edge, not as
+		// a host-level FUSE runtime), so "runsc" is correct. A future FUSE workload
+		// would need the "runsc-fuse" variant — named here so the choice is
+		// deliberate, not accidental; v1 does not run it, so no arm is added.
+		return "runsc"
+	default: // TierRunc (and any not-yet-mapped tier): the daemon default.
+		return ""
+	}
+}
+
 // Materialize creates the per-session Internal bridge, the HOST-01 container, and
 // starts it as ONE coarse atomic operation. It validates the spec fail-closed
 // (ErrUnsupportedSpec, zero substrate calls) and aborts a TierFirecracker
@@ -211,7 +237,7 @@ func (p *Provider) Materialize(ctx context.Context, spec runtime.SessionSpec) (r
 		return runtime.Sandbox{}, fmt.Errorf("docker: tier firecracker: %w", runtime.ErrNotImplemented)
 	}
 
-	hostCfg, err := buildHostConfig(spec)
+	hostCfg, err := buildHostConfig(spec, p.tier)
 	if err != nil {
 		return runtime.Sandbox{}, err
 	}
@@ -398,7 +424,14 @@ func buildNetworkingConfig(bridge string) *network.NetworkingConfig {
 // profile is the fail-closed embedded deny-default, never the daemon default — if
 // the compacted profile is empty the build refuses with ErrSeccompProfileMissing
 // rather than emit a HostConfig the daemon would fill with its own default.
-func buildHostConfig(spec runtime.SessionSpec) (*container.HostConfig, error) {
+//
+// It is the SINGLE owner of every HostConfig field, so the deployment-wide tier is
+// threaded in here (not set in the caller): the Runtime string is the ONLY field
+// the tier changes — every other hardening field is byte-identical across tiers,
+// so a gVisor sandbox runs the same hardened HostConfig as a runc one, differing
+// only in which OCI runtime dockerd hands the create to. Without this the gVisor
+// admission decision would not be enforced at the OCI layer.
+func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier) (*container.HostConfig, error) {
 	if compactSeccomp == "" {
 		return nil, fmt.Errorf("docker: build host config: %w", runtime.ErrSeccompProfileMissing)
 	}
@@ -430,6 +463,12 @@ func buildHostConfig(spec runtime.SessionSpec) (*container.HostConfig, error) {
 		// PortBindings deliberately nil: no host port is published; the exec
 		// channel rides the UDS sock bind, not a TCP port.
 	}
+	// The deployment-wide isolation tier selects the OCI runtime dockerd uses:
+	// "runsc" for the gVisor sentry, "" (the daemon default) otherwise. This is the
+	// only tier-dependent field; everything above is identical across tiers. An
+	// empty string omits the field (json:",omitempty"), so dockerd applies its
+	// default runtime for TierRunc — confirming empty is the correct runc value.
+	hostCfg.Runtime = dockerRuntimeForTier(tier)
 	return hostCfg, nil
 }
 
