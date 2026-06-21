@@ -154,6 +154,28 @@ type ManagerDeps struct {
 	// nil ControlDialer (the Phase-3 minimal shelf, or a deployment without the
 	// control-RPC wire) makes the dial a clean no-op.
 	ControlDialer ControlDialer
+
+	// Metrics is the OBSERVABILITY recorder the Manager increments on a successful
+	// create/destroy and observes the reserved->active start duration into for the
+	// admin /metrics surface. It is purely observational and NON-FATAL: a nil
+	// recorder disables metric recording, and no recording can fail a create or a
+	// destroy (the calls are made after the action has already succeeded). It carries
+	// no authority and sees no credential.
+	Metrics Recorder
+}
+
+// Recorder is the NARROW observability port the Manager records lifecycle metrics
+// through. It is satisfied by *metrics.Collector but names only the three events
+// the lifecycle produces, so the Manager depends on the events, not the exporter.
+// Every method is non-fatal and observational — a nil Recorder is a clean no-op via
+// the Manager's guarded calls.
+type Recorder interface {
+	// IncCreate records a successful session create.
+	IncCreate()
+	// IncDestroy records a successful session destroy.
+	IncDestroy()
+	// ObserveStart records one reserved->active start duration.
+	ObserveStart(d time.Duration)
 }
 
 // ControlDialer is the NARROW seam the Destroy path reaches the advisory
@@ -211,6 +233,10 @@ type Manager struct {
 	// controlDialer is the advisory host-dialled control-RPC surface Destroy nudges
 	// before the authoritative finalizer. nil is a clean no-op.
 	controlDialer ControlDialer
+
+	// metrics is the non-fatal observability recorder. nil is a clean no-op (every
+	// call site guards on it), so the base pipeline runs without an exporter wired.
+	metrics Recorder
 }
 
 // NewManager constructs a Manager from its deps and binds the canon create order
@@ -235,6 +261,7 @@ func NewManager(deps ManagerDeps) *Manager {
 		mountDefaults: deps.MountDefaults,
 		storageScope:  deps.StorageScope,
 		controlDialer: deps.ControlDialer,
+		metrics:       deps.Metrics,
 	}
 	// The mint + render/push stages slot AFTER stageHandoff and BEFORE
 	// stageMaterialize: the host-owned bind must carry the mount-config before
@@ -283,6 +310,11 @@ type createState struct {
 	staged  handoff.Staged
 	spec    runtime.SessionSpec
 	sandbox runtime.Sandbox
+	// reservedMark is the monotonic instant the reservation row was written, stamped
+	// at stageReserve. stageCommit observes clk.Since(reservedMark) into the
+	// reserved->active start-duration metric — a monotonic interval, so a wall-clock
+	// setback between reserve and commit cannot skew the start histogram.
+	reservedMark time.Time
 	// storageToken is the freshly minted weak Storage-JWT the render stage carries
 	// into the mount-config. It stays a secret cred.Token on the create state — it
 	// never widens the frozen runtime.MountIntent.AuthToken string seam — and is
@@ -315,6 +347,12 @@ func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow,
 		if comp != nil {
 			compensators = append(compensators, comp)
 		}
+	}
+	// The create succeeded (every stage committed, no unwind). Record it for the
+	// admin /metrics surface — purely observational, after the fact, never able to
+	// affect the create outcome.
+	if m.metrics != nil {
+		m.metrics.IncCreate()
 	}
 	return st.row, nil
 }
@@ -477,6 +515,11 @@ func (m *Manager) Destroy(ctx context.Context, caller ingress.AuthenticatedCalle
 	}
 	if err := m.ReleaseConcurrency(ctx, owner); err != nil {
 		return fmt.Errorf("lifecycle: destroy release concurrency: %w", err)
+	}
+	// The destroy succeeded (released and capacity returned). Record it for the
+	// admin /metrics surface — observational, after the fact.
+	if m.metrics != nil {
+		m.metrics.IncDestroy()
 	}
 	return nil
 }

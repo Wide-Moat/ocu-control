@@ -84,6 +84,11 @@ type Deps struct {
 	// Deployment is the pair of deployment-wide singletons (runtime tier and
 	// provider) the read surface reports, chosen once at boot (ADR-0003).
 	Deployment DeploymentInfo
+	// Metrics is the Prometheus exposition handler mounted at GET /metrics on the
+	// operator plane (the admin console scrapes it). It is passed as a plain
+	// http.Handler so this package stays decoupled from the metrics collector. When
+	// nil the /metrics route is not mounted.
+	Metrics http.Handler
 }
 
 // HealthzFunc is the readiness handler the boot Sequencer's Healthz returns. The
@@ -315,6 +320,7 @@ type Listener struct {
 	handlers *Handlers
 	read     *ReadHandlers
 	healthz  HealthzFunc
+	metrics  http.Handler
 	socket   string
 	ln       net.Listener
 }
@@ -327,6 +333,7 @@ func NewListener(socketPath string, deps Deps) *Listener {
 	l := &Listener{
 		handlers: NewHandlers(deps),
 		healthz:  deps.Healthz,
+		metrics:  deps.Metrics,
 		socket:   socketPath,
 	}
 	// The read surface is mounted only when a reader is supplied. It is built with

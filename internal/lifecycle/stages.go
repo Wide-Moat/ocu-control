@@ -106,6 +106,9 @@ func stageReserve(ctx context.Context, m *Manager, st *createState) (compensator
 		return nil, err
 	}
 	st.row = row
+	// Stamp the monotonic reserve instant for the reserved->active start-duration
+	// metric; stageCommit observes clk.Since(this) on activation.
+	st.reservedMark = m.clk.Now()
 	key := st.key
 	owner := st.owner
 	return func(cctx context.Context) error {
@@ -315,6 +318,14 @@ func stageCommit(ctx context.Context, m *Manager, st *createState) (compensator,
 	// the read surface simply lacks the enrichment for this row until it is
 	// re-recorded. It MUST NOT unwind the commit.
 	_ = m.reg.RecordActivation(ctx, st.key, runtimemap.CapsToState(st.in.Resources), m.clk.Now())
+
+	// Observe the reserved->active start duration into the admin /metrics histogram
+	// — a MONOTONIC interval (clk.Since), so a wall-clock setback between reserve and
+	// commit cannot skew the start tile. Observational and non-fatal: a nil recorder
+	// is a clean no-op, and the observation cannot affect the create.
+	if m.metrics != nil {
+		m.metrics.ObserveStart(m.clk.Since(st.reservedMark))
+	}
 	return nil, nil
 }
 

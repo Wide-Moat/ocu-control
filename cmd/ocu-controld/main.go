@@ -47,6 +47,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/jwks"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/metrics"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
 	"github.com/Wide-Moat/ocu-control/internal/provisioning"
 	"github.com/Wide-Moat/ocu-control/internal/quota"
@@ -254,7 +255,7 @@ func serve(ctx context.Context, cfg config) error {
 	// loops have drained. A NullSink Close is a no-op.
 	defer func() { _ = auditWriter.Close() }()
 
-	mgr, eng := compose(store, clk, provider, profile, tier, signer, auditWriter, cfg)
+	mgr, eng, custodian, collector := compose(store, clk, provider, profile, tier, signer, auditWriter, cfg)
 
 	// The single operator capability: minted ONCE and handed to the operator
 	// adapter ALONE. The gateway adapter is constructed with no seam.
@@ -267,6 +268,14 @@ func serve(ctx context.Context, cfg config) error {
 		Healthz:  seq.Healthz(),
 		Resolver: operator.NewPeerCredResolver(nil),
 		Seam:     seam, // the operator adapter alone holds the seam
+		// The admin read-surface (ADR-0022): the read handler is given ONLY the
+		// custodian's enriched read port and the deployment singletons — no seam, no
+		// Manager, no Engine — so the read-only boundary holds structurally. The
+		// /metrics scrape handler mounts the collector's exposition. Both are the
+		// operator plane only; the gateway adapter receives neither.
+		Reader:     custodian,
+		Deployment: operator.DeploymentInfo{RuntimeTier: cfg.runtimeTier, RuntimeProvider: cfg.runtimeProvider},
+		Metrics:    collector.Handler(),
 	})
 	gwListener := gateway.NewListener(tcpAddrOf(cfg.gatewayListen), gateway.Deps{
 		Manager:  mgr,
@@ -375,9 +384,15 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 // (chain computed in-process, nothing durably persisted by default), and a
 // deployment Limits — are bound here. profile and tier are deployment-fixed and
 // flow onto the Manager as fixed fields; CreateInput carries neither.
-func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, auditWriter ocsf.EventWriter, cfg config) (*lifecycle.Manager, *killswitch.Engine) {
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, auditWriter ocsf.EventWriter, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
+	// The metrics collector reads live state through the same custodian the admin
+	// read-API uses, so the counts-by-state gauge reflects exactly the listed set. It
+	// is handed to the Manager (which increments create/destroy and observes the
+	// reserved->active start duration) and to the operator listener (which mounts its
+	// /metrics scrape handler). It is purely observational — non-fatal everywhere.
+	collector := metrics.NewCollector(custodian)
 	stager := handoff.NewStager(handoffBase)
 	// The real OCSF chain sink: it serializes each privileged audit.Record to a
 	// faithful OCSF event, assigns a per-source monotonic sequence, and hash-chains
@@ -421,9 +436,10 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		MountDefaults: defaultMountDefaults(),
 		StorageScope:  defaultStorageScope(),
 		ControlDialer: controlDialer,
+		Metrics:       collector,
 	})
 	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
-	return mgr, eng
+	return mgr, eng, custodian, collector
 }
 
 // drainTimeout bounds how long serveListeners waits for both Serve loops to

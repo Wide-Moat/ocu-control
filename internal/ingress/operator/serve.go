@@ -47,6 +47,12 @@ func (l *Listener) Serve(ctx context.Context) error {
 	if l.healthz != nil {
 		mux.Handle("/healthz", l.healthz)
 	}
+	if l.metrics != nil {
+		// The Prometheus scrape endpoint lives on the operator plane only (the admin
+		// console scrapes it through the same host-attested transport); the gateway
+		// plane never serves it.
+		mux.Handle("GET /metrics", l.metrics)
+	}
 	l.registerRoutes(mux)
 
 	srv := &http.Server{
