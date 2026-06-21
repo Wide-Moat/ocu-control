@@ -13,6 +13,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
+	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
 // registerRoutes mounts the minimal operator HTTP surface onto mux: create,
@@ -27,29 +28,39 @@ import (
 func (l *Listener) registerRoutes(mux *http.ServeMux) {
 	h := l.handlers
 	mux.HandleFunc("/v1alpha/sessions", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
+		switch r.Method {
+		case http.MethodPost:
+			conn := connInfoFromRequest(r)
+			var body createBody
+			if err := decodeJSON(r, &body); err != nil {
+				writeStatus(w, http.StatusBadRequest, "invalid request body")
+				return
+			}
+			row, err := h.Create(r.Context(), conn, body.toRequest())
+			if err != nil {
+				writeCreateError(w, err)
+				return
+			}
+			writeJSON(w, http.StatusCreated, sessionResponse{Key: row.Key, State: int(row.State)})
+		case http.MethodGet:
+			// GET is the admin list endpoint, but only when a read surface is
+			// mounted. Without one the route is POST-only, so GET is 405 (method not
+			// allowed) — the same contract as before the read surface existed.
+			if l.read == nil {
+				writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+				return
+			}
+			l.handleListSessions(w, r)
+		default:
 			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
 		}
-		conn := connInfoFromRequest(r)
-		var body createBody
-		if err := decodeJSON(r, &body); err != nil {
-			writeStatus(w, http.StatusBadRequest, "invalid request body")
-			return
-		}
-		row, err := h.Create(r.Context(), conn, body.toRequest())
-		if err != nil {
-			writeCreateError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusCreated, sessionResponse{Key: row.Key, State: int(row.State)})
 	})
 
-	mux.HandleFunc("/v1alpha/sessions/destroy", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	// Method-scoped so the literal /v1alpha/sessions/destroy segment is more
+	// specific than the read surface's GET /v1alpha/sessions/{key} wildcard and the
+	// two cannot conflict. A non-POST request to this path is 405 (now from the mux
+	// pattern rather than the handler body, same observable result).
+	mux.HandleFunc("POST /v1alpha/sessions/destroy", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body destroyBody
 		if err := decodeJSON(r, &body); err != nil {
@@ -116,6 +127,85 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		}
 		writeStatus(w, http.StatusOK, "deny-all lifted")
 	})
+
+	// The admin read-surface (ADR-0022) is mounted only when a reader was supplied.
+	// These are GET-only, read-only, and reach ONLY the ReadHandlers (which holds no
+	// seam and no mutating surface) — never the mutating Handlers above. The
+	// per-key route uses a method+path pattern so it cannot shadow the literal
+	// /v1alpha/sessions/destroy POST (a literal segment outranks the {key} wildcard,
+	// and the methods differ regardless).
+	if l.read != nil {
+		mux.HandleFunc("GET /v1alpha/sessions/{key}", l.handleGetSession)
+		mux.HandleFunc("GET /v1alpha/deployment", l.handleDeployment)
+	}
+}
+
+// handleListSessions serves GET /v1alpha/sessions. It parses the optional
+// ?include_released flag and returns the live session views. An unattested caller
+// is 401; a store/enumeration failure is 503; success is 200 with a JSON array.
+func (l *Listener) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	if l.read == nil {
+		writeStatus(w, http.StatusNotFound, "read surface not configured")
+		return
+	}
+	includeReleased := r.URL.Query().Get("include_released") == "true"
+	conn := connInfoFromRequest(r)
+	views, err := l.read.ListSessions(r.Context(), conn, includeReleased)
+	if err != nil {
+		writeReadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, views)
+}
+
+// handleGetSession serves GET /v1alpha/sessions/{key}. A missing key is 404
+// (uniform across released/absent); an unattested caller is 401; a store failure
+// is 503.
+func (l *Listener) handleGetSession(w http.ResponseWriter, r *http.Request) {
+	if l.read == nil {
+		writeStatus(w, http.StatusNotFound, "read surface not configured")
+		return
+	}
+	key := r.PathValue("key")
+	conn := connInfoFromRequest(r)
+	view, err := l.read.GetSession(r.Context(), conn, key)
+	if err != nil {
+		writeReadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// handleDeployment serves GET /v1alpha/deployment: the two deployment-wide
+// singletons. An unattested caller is 401; success is 200.
+func (l *Listener) handleDeployment(w http.ResponseWriter, r *http.Request) {
+	if l.read == nil {
+		writeStatus(w, http.StatusNotFound, "read surface not configured")
+		return
+	}
+	conn := connInfoFromRequest(r)
+	view, err := l.read.Deployment(r.Context(), conn)
+	if err != nil {
+		writeReadError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
+// writeReadError maps a read-surface error onto an HTTP status. An unattested
+// caller is 401; a not-found key is 404; a store/enumeration failure is 503
+// (Denied/unavailable — the read surface never serves a partial or guessed view).
+func writeReadError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ingress.ErrUnattested):
+		writeStatus(w, http.StatusUnauthorized, "caller identity unattested")
+	case errors.Is(err, ErrSessionNotFound):
+		writeStatus(w, http.StatusNotFound, "session not found")
+	case errors.Is(err, state.ErrStoreUnavailable), errors.Is(err, registry.ErrEnumerationUnsupported):
+		writeStatus(w, http.StatusServiceUnavailable, "read surface unavailable")
+	default:
+		writeStatus(w, http.StatusServiceUnavailable, "read surface unavailable")
+	}
 }
 
 // createBody is the minimal JSON create request. SessionHint and the runtime

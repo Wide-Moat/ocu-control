@@ -75,6 +75,15 @@ type Deps struct {
 	// Seam is the single operator capability this adapter holds. cmd mints exactly
 	// one OperatorSeam and hands it here alone; the gateway adapter is given none.
 	Seam ingress.OperatorSeam
+	// Reader is the narrow read port the admin read-surface consumes (the enriched
+	// live-session enumeration through the sole custodian). It is SEPARATE from the
+	// mutating surfaces: the read handler is given only this and the deployment
+	// singletons, never the Seam/Manager/Engine, so the read-only boundary holds
+	// structurally (ADR-0022). When nil the read routes are not mounted.
+	Reader SessionReader
+	// Deployment is the pair of deployment-wide singletons (runtime tier and
+	// provider) the read surface reports, chosen once at boot (ADR-0003).
+	Deployment DeploymentInfo
 }
 
 // HealthzFunc is the readiness handler the boot Sequencer's Healthz returns. The
@@ -292,6 +301,7 @@ type CreateRequest struct {
 // deny posture is durable.
 type Listener struct {
 	handlers *Handlers
+	read     *ReadHandlers
 	healthz  HealthzFunc
 	socket   string
 	ln       net.Listener
@@ -302,11 +312,23 @@ type Listener struct {
 // ahead of the readiness gate. socketPath is the filesystem path of the Unix
 // socket (the operator endpoint with any unix:// scheme stripped by the caller).
 func NewListener(socketPath string, deps Deps) *Listener {
-	return &Listener{
+	l := &Listener{
 		handlers: NewHandlers(deps),
 		healthz:  deps.Healthz,
 		socket:   socketPath,
 	}
+	// The read surface is mounted only when a reader is supplied. It is built with
+	// the SAME resolver the mutating handlers use (so attestation is identical) but
+	// is given NEITHER the Seam nor any mutating surface, so it cannot reach a
+	// reservation mutator, the denylist, or a quota override.
+	if deps.Reader != nil {
+		resolver := deps.Resolver
+		if resolver == nil {
+			resolver = NewPeerCredResolver(nil)
+		}
+		l.read = NewReadHandlers(deps.Reader, resolver, deps.Deployment)
+	}
+	return l
 }
 
 // Handlers exposes the in-process operator surface for direct (transport-free)

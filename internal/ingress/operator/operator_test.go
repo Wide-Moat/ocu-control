@@ -9,6 +9,7 @@ import (
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/handoff"
@@ -266,6 +267,32 @@ func (s *listerStore) LiveSessions(ctx context.Context) ([]state.SessionRow, err
 		}
 	}
 	return out, nil
+}
+
+// LiveSessionsEnriched and RecordActivation forward to the inner Store so the
+// listerStore satisfies the read-surface seams (registry.EnrichedLister /
+// ActivationRecorder). The wrapper embeds a state.Store INTERFACE, which does not
+// promote the concrete in-memory leg's extra methods, so the forward is explicit:
+// the inner store is the in-memory leg, which implements both. A wrapped store
+// that does not is a test-setup error surfaced loudly here.
+func (s *listerStore) LiveSessionsEnriched(ctx context.Context) ([]state.EnrichedSessionRow, error) {
+	el, ok := s.Store.(interface {
+		LiveSessionsEnriched(context.Context) ([]state.EnrichedSessionRow, error)
+	})
+	if !ok {
+		return nil, state.ErrStoreUnavailable
+	}
+	return el.LiveSessionsEnriched(ctx)
+}
+
+func (s *listerStore) RecordActivation(ctx context.Context, key string, caps state.Caps, at time.Time) error {
+	ar, ok := s.Store.(interface {
+		RecordActivation(context.Context, string, state.Caps, time.Time) error
+	})
+	if !ok {
+		return state.ErrStoreUnavailable
+	}
+	return ar.RecordActivation(ctx, key, caps, at)
 }
 
 // fakeVerifier is a test SOARVerifier: on a successful verify (err == nil) it
