@@ -162,6 +162,14 @@ type ManagerDeps struct {
 	// destroy (the calls are made after the action has already succeeded). It carries
 	// no authority and sees no credential.
 	Metrics Recorder
+
+	// Events is the DESIGN-FENCED live-view fan-out the Manager publishes lifecycle
+	// transitions to for the admin console's eventual SSE surface (ADR-0022). It is a
+	// SEAM: nil leaves publishing a clean no-op (the console polls the GET endpoints),
+	// and the real broadcast hub is wired when the SSE event schema freezes (Open
+	// Question #2). Publishing is best-effort and NON-FATAL — it never blocks or fails
+	// a create/destroy.
+	Events EventPublisher
 }
 
 // Recorder is the NARROW observability port the Manager records lifecycle metrics
@@ -237,6 +245,10 @@ type Manager struct {
 	// metrics is the non-fatal observability recorder. nil is a clean no-op (every
 	// call site guards on it), so the base pipeline runs without an exporter wired.
 	metrics Recorder
+
+	// events is the design-fenced live-view fan-out. nil is a clean no-op (the guarded
+	// publishEvent), so the base pipeline runs without a fan-out hub wired.
+	events EventPublisher
 }
 
 // NewManager constructs a Manager from its deps and binds the canon create order
@@ -262,6 +274,7 @@ func NewManager(deps ManagerDeps) *Manager {
 		storageScope:  deps.StorageScope,
 		controlDialer: deps.ControlDialer,
 		metrics:       deps.Metrics,
+		events:        deps.Events,
 	}
 	// The mint + render/push stages slot AFTER stageHandoff and BEFORE
 	// stageMaterialize: the host-owned bind must carry the mount-config before
@@ -354,6 +367,10 @@ func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow,
 	if m.metrics != nil {
 		m.metrics.IncCreate()
 	}
+	// Publish the live-view delta (the session reached ACTIVE) to the design-fenced
+	// fan-out — non-fatal, nil-safe; the console renders it when SSE is wired, and
+	// polls the GET endpoints until then.
+	m.publishEvent(ctx, state.StateActive, st.row.Key)
 	return st.row, nil
 }
 
@@ -521,6 +538,10 @@ func (m *Manager) Destroy(ctx context.Context, caller ingress.AuthenticatedCalle
 	if m.metrics != nil {
 		m.metrics.IncDestroy()
 	}
+	// Publish the live-view delta (the session reached RELEASED) to the
+	// design-fenced fan-out — non-fatal, nil-safe; the console removes the row from
+	// its live view when SSE is wired.
+	m.publishEvent(ctx, state.StateReleased, key.String())
 	return nil
 }
 
