@@ -305,6 +305,16 @@ func stageCommit(ctx context.Context, m *Manager, st *createState) (compensator,
 	if err := m.audit.Emit(ctx, rec); err != nil {
 		return nil, fmt.Errorf("lifecycle: commit audit: %w", err)
 	}
+
+	// Record the read-surface activation enrichment (active-at + the caps the
+	// provider stamped) out of band of the frozen Commit (ADR-0022, Option A). This
+	// is NON-FATAL to the create: the row is already ACTIVE and correct; only the
+	// admin read-surface enrichment is being persisted. A transient store failure
+	// (or a Store without the optional ActivationRecorder) is swallowed exactly as
+	// the best-effort control-RPC dial is — the create has already succeeded, and
+	// the read surface simply lacks the enrichment for this row until it is
+	// re-recorded. It MUST NOT unwind the commit.
+	_ = m.reg.RecordActivation(ctx, st.key, runtimemap.CapsToState(st.in.Resources), m.clk.Now())
 	return nil, nil
 }
 

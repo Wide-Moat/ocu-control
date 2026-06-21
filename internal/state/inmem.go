@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"sync"
+	"time"
 )
 
 // stripeCount is the fixed number of per-key advisory-lock stripes. A
@@ -55,6 +56,15 @@ type memStore struct {
 	// reservation key that owns it, enforcing global container_name uniqueness
 	// without scanning the row map.
 	boundNames map[string]string
+	// enrichment is the parallel read-surface index keyed by reservation key:
+	// the reserved-at instant (stamped at Reserve), the active-at instant and the
+	// recorded caps (stamped out of band by RecordActivation, after Commit). It is
+	// guarded by rowMu like the row map and the bound-name index, and it is read
+	// ONLY by LiveSessionsEnriched — the frozen SessionRow and the frozen mutators
+	// are untouched by it. A RELEASED tombstone keeps its enrichment so a released
+	// row still reads back its history; a re-Reserve over a tombstone overwrites
+	// the entry with a fresh reserved-at and clears the prior active-at/caps.
+	enrichment map[string]rowEnrichment
 
 	// denyMu guards the deny posture. Reserve reads the posture under it while
 	// holding its key stripe, so the deny check and the dependent row insert are
@@ -80,6 +90,17 @@ type memStore struct {
 	quota map[QuotaKey]int64
 }
 
+// rowEnrichment is the in-memory parallel to the additive Postgres read-surface
+// columns: the reserved-at instant and, once RecordActivation runs, the active-at
+// instant and recorded caps. activeAt is the zero Time and caps is nil until the
+// row is activated, mirroring the NULLABLE Postgres columns; LiveSessionsEnriched
+// maps a zero activeAt to a nil *time.Time and a nil caps to a nil *Caps.
+type rowEnrichment struct {
+	reservedAt time.Time
+	activeAt   time.Time
+	caps       *Caps
+}
+
 // NewInMemory returns the in-memory Store backed by clk. It is safe for
 // concurrent use and holds no resource that needs closing.
 func NewInMemory(clk Clock) Store {
@@ -87,6 +108,7 @@ func NewInMemory(clk Clock) Store {
 		clk:        clk,
 		rows:       make(map[string]SessionRow),
 		boundNames: make(map[string]string),
+		enrichment: make(map[string]rowEnrichment),
 		deny:       make(map[string]DenyEntry),
 		quota:      make(map[QuotaKey]int64),
 	}
@@ -202,6 +224,10 @@ func (m *memStore) Reserve(ctx context.Context, key string, owner Identity) (Ses
 		State: StateReserved,
 	}
 	m.rows[key] = row
+	// Stamp the read-surface reserved-at and clear any stale active-at/caps from a
+	// prior tombstone at this key, mirroring the Postgres upsert that resets
+	// reserved_at and leaves the activation columns NULL for the fresh row.
+	m.enrichment[key] = rowEnrichment{reservedAt: m.clk.Now()}
 	return row, nil
 }
 
@@ -337,6 +363,87 @@ func (m *memStore) LiveSessions(ctx context.Context) ([]SessionRow, error) {
 		}
 	}
 	return live, nil
+}
+
+// LiveSessionsEnriched returns every live (RESERVED or ACTIVE) row as an
+// EnrichedSessionRow — the frozen row plus the parallel read-surface enrichment
+// (reserved-at, active-at, caps) — for the admin read-API (registry.EnrichedLister
+// seam). Like LiveSessions it is a snapshot read under rowMu only: the returned
+// slice is independent of the maps, and a zero active-at maps to a nil *time.Time
+// and a nil caps to a nil *Caps so the read view distinguishes a not-yet-activated
+// row from an activated one. A cancelled context fails closed with
+// ErrStoreUnavailable.
+func (m *memStore) LiveSessionsEnriched(ctx context.Context) ([]EnrichedSessionRow, error) {
+	if err := ctxErr(ctx); err != nil {
+		return nil, err
+	}
+
+	m.rowMu.Lock()
+	defer m.rowMu.Unlock()
+
+	live := make([]EnrichedSessionRow, 0, len(m.rows))
+	for key, row := range m.rows {
+		if row.State != StateReserved && row.State != StateActive {
+			continue
+		}
+		en := m.enrichment[key]
+		enriched := EnrichedSessionRow{
+			SessionRow: row,
+			ReservedAt: en.reservedAt,
+		}
+		if !en.activeAt.IsZero() {
+			at := en.activeAt
+			enriched.ActiveAt = &at
+		}
+		if en.caps != nil {
+			// Copy the caps (and the PidsLimit pointer target) so the returned
+			// snapshot does not alias the stored enrichment.
+			c := *en.caps
+			if en.caps.PidsLimit != nil {
+				p := *en.caps.PidsLimit
+				c.PidsLimit = &p
+			}
+			enriched.Caps = &c
+		}
+		live = append(live, enriched)
+	}
+	return live, nil
+}
+
+// RecordActivation stamps the activation instant and the recorded caps onto the
+// enrichment for an already-committed (ACTIVE) row, out of band of the frozen
+// Commit (registry.ActivationRecorder seam). It takes the key stripe then rowMu,
+// the same order the reservation mutators use, so it serializes against a Reserve
+// or Commit on the same key. It is idempotent: re-recording overwrites with the
+// same data. A cancelled context fails closed with ErrStoreUnavailable. It does
+// not require the row to exist — a missing or already-RELEASED row simply records
+// the enrichment that LiveSessionsEnriched will ignore (it enumerates live rows
+// only), so a late record after a fast release is a harmless no-op on the read
+// surface rather than an error the create path must handle.
+func (m *memStore) RecordActivation(ctx context.Context, key string, caps Caps, at time.Time) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+
+	stripe := m.keyStripe(key)
+	stripe.Lock()
+	defer stripe.Unlock()
+
+	m.rowMu.Lock()
+	defer m.rowMu.Unlock()
+
+	en := m.enrichment[key]
+	en.activeAt = at
+	// Copy caps defensively so the stored enrichment does not alias the caller's
+	// PidsLimit pointer.
+	c := caps
+	if caps.PidsLimit != nil {
+		p := *caps.PidsLimit
+		c.PidsLimit = &p
+	}
+	en.caps = &c
+	m.enrichment[key] = en
+	return nil
 }
 
 // LookupSession reads the current row for key without the key stripe, race-safe

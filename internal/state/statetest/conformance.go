@@ -659,6 +659,134 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		}
 	})
 
+	t.Run("LiveSessionsEnriched carries reserved-at, and active-at/caps only after RecordActivation", func(t *testing.T) {
+		// The admin read-surface contract, held against both legs: every live row
+		// carries its reserved-at; a row that has not been activation-recorded has a
+		// nil active-at and nil caps; a recorded row carries both. This distinguishes
+		// a RESERVED (or just-committed-but-not-yet-recorded) row from a fully
+		// activated one on the read surface.
+		s := newFixture()
+		el, ok := s.(enrichedLister)
+		if !ok {
+			t.Fatalf("Store %T does not implement LiveSessionsEnriched: the admin read-API cannot enumerate enriched rows", s)
+		}
+		ar, ok := s.(activationRecorder)
+		if !ok {
+			t.Fatalf("Store %T does not implement RecordActivation: the lifecycle cannot persist the read-surface enrichment", s)
+		}
+
+		// k-reserved stays RESERVED (never recorded). k-active is committed AND
+		// activation-recorded with caps at a known instant.
+		mustReserve(ctx, t, s, "k-reserved", owner)
+		mustReserve(ctx, t, s, "k-active", owner)
+		mustCommit(ctx, t, s, "k-active", owner)
+
+		pids := int64(256)
+		caps := state.Caps{CPUCores: 1.5, MemoryBytes: 2 << 30, PidsLimit: &pids}
+		activeAt := conformanceStart.Add(42 * time.Second)
+		if err := ar.RecordActivation(ctx, "k-active", caps, activeAt); err != nil {
+			t.Fatalf("RecordActivation(k-active): unexpected error %v", err)
+		}
+
+		live, err := el.LiveSessionsEnriched(ctx)
+		if err != nil {
+			t.Fatalf("LiveSessionsEnriched: unexpected error %v", err)
+		}
+		byKey := make(map[string]state.EnrichedSessionRow, len(live))
+		for _, row := range live {
+			byKey[row.Key] = row
+		}
+		if len(byKey) != 2 {
+			t.Fatalf("LiveSessionsEnriched: want 2 live rows, got %d (%+v)", len(byKey), live)
+		}
+
+		// Both rows carry a reserved-at (the FakeClock instant of their Reserve).
+		res := byKey["k-reserved"]
+		if res.ReservedAt.IsZero() {
+			t.Errorf("k-reserved must carry a non-zero reserved-at, got zero")
+		}
+		// The un-recorded RESERVED row has nil active-at and nil caps.
+		if res.ActiveAt != nil {
+			t.Errorf("k-reserved (never recorded) must have a nil active-at, got %v", *res.ActiveAt)
+		}
+		if res.Caps != nil {
+			t.Errorf("k-reserved (never recorded) must have nil caps, got %+v", *res.Caps)
+		}
+
+		// The recorded ACTIVE row carries the stamped active-at and caps.
+		act := byKey["k-active"]
+		if act.ReservedAt.IsZero() {
+			t.Errorf("k-active must carry a non-zero reserved-at, got zero")
+		}
+		if act.ActiveAt == nil {
+			t.Fatalf("k-active (recorded) must have a non-nil active-at, got nil")
+		}
+		if !act.ActiveAt.Equal(activeAt) {
+			t.Errorf("k-active active-at: want %v, got %v", activeAt, *act.ActiveAt)
+		}
+		if act.Caps == nil {
+			t.Fatalf("k-active (recorded) must have non-nil caps, got nil")
+		}
+		if act.Caps.CPUCores != caps.CPUCores || act.Caps.MemoryBytes != caps.MemoryBytes {
+			t.Errorf("k-active caps scalar: want %+v, got %+v", caps, *act.Caps)
+		}
+		if act.Caps.PidsLimit == nil || *act.Caps.PidsLimit != pids {
+			t.Errorf("k-active caps PidsLimit: want %d, got %v", pids, act.Caps.PidsLimit)
+		}
+		// The frozen embedded row is intact (state + owner carried through).
+		if act.State != state.StateActive || act.Owner != owner {
+			t.Errorf("k-active enriched row must embed the frozen row unchanged, got state=%v owner=%v", act.State, act.Owner)
+		}
+	})
+
+	t.Run("re-Reserve over a tombstone clears the prior active-at and caps on the read surface", func(t *testing.T) {
+		// A re-Reserve at a released key starts a fresh row; its enrichment must not
+		// leak the prior incarnation's active-at/caps, mirroring the Postgres upsert
+		// that resets the activation columns to NULL.
+		s := newFixture()
+		el := s.(enrichedLister)
+		ar := s.(activationRecorder)
+
+		mustReserve(ctx, t, s, "k", owner)
+		mustCommit(ctx, t, s, "k", owner)
+		pids := int64(99)
+		if err := ar.RecordActivation(ctx, "k", state.Caps{CPUCores: 4, MemoryBytes: 1 << 30, PidsLimit: &pids}, conformanceStart); err != nil {
+			t.Fatalf("RecordActivation: %v", err)
+		}
+		mustRelease(ctx, t, s, "k", owner)
+
+		// Re-reserve the same key: the fresh RESERVED row must read back with a nil
+		// active-at and nil caps.
+		mustReserve(ctx, t, s, "k", owner)
+		live, err := el.LiveSessionsEnriched(ctx)
+		if err != nil {
+			t.Fatalf("LiveSessionsEnriched: %v", err)
+		}
+		if len(live) != 1 {
+			t.Fatalf("want 1 live row after re-reserve, got %d", len(live))
+		}
+		if live[0].ActiveAt != nil {
+			t.Errorf("re-reserved row must clear the prior active-at, got %v", *live[0].ActiveAt)
+		}
+		if live[0].Caps != nil {
+			t.Errorf("re-reserved row must clear the prior caps, got %+v", *live[0].Caps)
+		}
+	})
+
+	t.Run("LiveSessionsEnriched and RecordActivation fail closed on a cancelled context", func(t *testing.T) {
+		s := newFixture()
+		el := s.(enrichedLister)
+		ar := s.(activationRecorder)
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := el.LiveSessionsEnriched(cancelled); !errors.Is(err, state.ErrStoreUnavailable) {
+			t.Fatalf("LiveSessionsEnriched on cancelled ctx: want ErrStoreUnavailable, got %v", err)
+		}
+		if err := ar.RecordActivation(cancelled, "k", state.Caps{}, conformanceStart); !errors.Is(err, state.ErrStoreUnavailable) {
+			t.Fatalf("RecordActivation on cancelled ctx: want ErrStoreUnavailable, got %v", err)
+		}
+	})
+
 	t.Run("a cancelled context fails closed with ErrStoreUnavailable", func(t *testing.T) {
 		s := newFixture()
 		cancelled, cancel := context.WithCancel(context.Background())
@@ -712,6 +840,23 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 // the type assertion and the suite fails loudly.
 type liveLister interface {
 	LiveSessions(ctx context.Context) ([]state.SessionRow, error)
+}
+
+// enrichedLister is the optional admin read-surface enumeration capability
+// (mirroring registry.EnrichedLister). The suite asserts both legs satisfy it so
+// the one behavioural contract — the live set carries the reserved-at, active-at,
+// and caps enrichment, with active-at/caps nil until RecordActivation runs — is
+// held in the shared suite. The signature MUST match the production method so a
+// leg that drifts stops satisfying the assertion and the suite fails loudly.
+type enrichedLister interface {
+	LiveSessionsEnriched(ctx context.Context) ([]state.EnrichedSessionRow, error)
+}
+
+// activationRecorder is the optional out-of-band activation-record write
+// (mirroring registry.ActivationRecorder). It stamps active-at and caps onto an
+// already-committed row, the read-surface complement of the frozen Commit.
+type activationRecorder interface {
+	RecordActivation(ctx context.Context, key string, caps state.Caps, at time.Time) error
 }
 
 // mustReserve reserves key for owner and fails the test on any error.

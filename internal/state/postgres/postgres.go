@@ -29,6 +29,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -89,8 +90,10 @@ func Open(ctx context.Context, url string, clk state.Clock) (state.Store, error)
 	return s, nil
 }
 
-// Migrate applies the embedded schema. Every statement is CREATE ... IF NOT
-// EXISTS, so this is idempotent and runs on every boot. A transient failure is
+// Migrate applies the embedded schema. Every statement is idempotent — CREATE
+// ... IF NOT EXISTS for the tables and indexes, ALTER TABLE ... ADD COLUMN IF
+// NOT EXISTS for the additive read-surface columns — so this runs on every boot
+// and is safe on a fresh or an existing deployment alike. A transient failure is
 // wrapped as state.ErrStoreUnavailable.
 func (s *store) Migrate(ctx context.Context) error {
 	if _, err := s.pool.Exec(ctx, schemaSQL); err != nil {
@@ -186,7 +189,11 @@ func (s *store) Reserve(ctx context.Context, key string, owner state.Identity) (
 		         owner_caller = EXCLUDED.owner_caller,
 		         state = EXCLUDED.state,
 		         container_name = NULL,
-		         reserved_at = EXCLUDED.reserved_at`,
+		         reserved_at = EXCLUDED.reserved_at,
+		         active_at = NULL,
+		         caps_cpu_cores = NULL,
+		         caps_memory_bytes = NULL,
+		         caps_pids_limit = NULL`,
 		key, owner.Tenant, owner.Caller, int16(state.StateReserved), now,
 	); err != nil {
 		// A unique violation here can only be the partial container_name index,
@@ -417,6 +424,72 @@ func (s *store) LiveSessions(ctx context.Context) ([]state.SessionRow, error) {
 	return live, nil
 }
 
+// LiveSessionsEnriched returns every live (RESERVED or ACTIVE) row as an
+// EnrichedSessionRow — the frozen row plus the additive read-surface columns
+// (reserved_at, active_at, the three caps columns) — for the admin read-API
+// (registry.EnrichedLister seam). It is the same SNAPSHOT read as LiveSessions
+// (no advisory lock), keyed on the same SMALLINT state codes, so the two
+// enumerations cannot drift. active_at and the caps columns are NULLABLE: a
+// not-yet-activated row scans them to nil, which maps to a nil *time.Time / *Caps
+// so the read view distinguishes a RESERVED row from an activated one. A transient
+// driver failure wraps state.ErrStoreUnavailable, fail-closed, exactly as
+// LiveSessions does.
+func (s *store) LiveSessionsEnriched(ctx context.Context) ([]state.EnrichedSessionRow, error) {
+	rows, err := s.pool.Query(ctx,
+		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, ''),
+		        reserved_at, active_at, caps_cpu_cores, caps_memory_bytes, caps_pids_limit
+		 FROM sessions WHERE state IN ($1, $2)`,
+		int16(state.StateReserved), int16(state.StateActive))
+	if err != nil {
+		return nil, unavailable("live-sessions-enriched: query", err)
+	}
+	defer rows.Close()
+
+	live := make([]state.EnrichedSessionRow, 0)
+	for rows.Next() {
+		enriched, serr := scanEnrichedRow(rows)
+		if serr != nil {
+			// A row that scans to an out-of-range state, or a transient scan fault,
+			// is fail-closed evidence the read must treat as a refusal, never a
+			// partial-and-trusted enumeration.
+			return nil, unavailable("live-sessions-enriched: scan", serr)
+		}
+		live = append(live, enriched)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, unavailable("live-sessions-enriched: iterate", err)
+	}
+	return live, nil
+}
+
+// RecordActivation stamps the activation instant and the recorded caps onto an
+// already-committed (ACTIVE) row, out of band of the frozen Commit
+// (registry.ActivationRecorder seam). It is a single idempotent UPDATE keyed on
+// the reservation key — re-recording overwrites with the same data. A row that
+// does not exist (a fast release before the record lands) updates zero rows and
+// is a harmless no-op on the read surface, not an error, mirroring the in-memory
+// leg. The caps_pids_limit column is NULL when PidsLimit is nil. A transient
+// driver failure wraps state.ErrStoreUnavailable, fail-closed.
+func (s *store) RecordActivation(ctx context.Context, key string, caps state.Caps, at time.Time) error {
+	var pids *int64
+	if caps.PidsLimit != nil {
+		p := *caps.PidsLimit
+		pids = &p
+	}
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sessions
+		    SET active_at = $2,
+		        caps_cpu_cores = $3,
+		        caps_memory_bytes = $4,
+		        caps_pids_limit = $5
+		  WHERE key = $1`,
+		key, at, caps.CPUCores, caps.MemoryBytes, pids,
+	); err != nil {
+		return unavailable("record-activation: update", err)
+	}
+	return nil
+}
+
 // SetDeny writes a durable deny entry and engages it immediately. Re-setting an
 // already-set scope/key is idempotent: the row is upserted with the new
 // operator context. The global kill-switch normalizes its key to empty so it
@@ -644,6 +717,47 @@ func scanRow(row pgx.Row) (state.SessionRow, error) {
 		return state.SessionRow{}, err
 	}
 	out.State = decoded
+	return out, nil
+}
+
+// scanEnrichedRow materializes an EnrichedSessionRow: the frozen columns plus the
+// additive read-surface columns. reserved_at is NOT NULL; active_at and the caps
+// columns are NULLABLE and scan into pointers, so a not-yet-activated row yields a
+// nil ActiveAt and a nil Caps. Caps is materialized only when at least one caps
+// column is present (an activated row writes all three together, so the cpu-cores
+// column presence is the activation witness).
+func scanEnrichedRow(row pgx.Row) (state.EnrichedSessionRow, error) {
+	var (
+		out      state.EnrichedSessionRow
+		st       int16
+		activeAt *time.Time
+		cpuCores *float64
+		memBytes *int64
+		pids     *int64
+	)
+	if err := row.Scan(
+		&out.Key, &out.Owner.Tenant, &out.Owner.Caller, &st, &out.ContainerName,
+		&out.ReservedAt, &activeAt, &cpuCores, &memBytes, &pids,
+	); err != nil {
+		return state.EnrichedSessionRow{}, err
+	}
+	decoded, err := sessionStateFromDB(st)
+	if err != nil {
+		return state.EnrichedSessionRow{}, err
+	}
+	out.State = decoded
+	out.ActiveAt = activeAt
+	// The three caps columns are written together at activation; cpu-cores present
+	// is the activation witness. A NULL cpu-cores leaves Caps nil (RESERVED or a
+	// pre-enrichment row).
+	if cpuCores != nil {
+		caps := state.Caps{CPUCores: *cpuCores}
+		if memBytes != nil {
+			caps.MemoryBytes = *memBytes
+		}
+		caps.PidsLimit = pids
+		out.Caps = &caps
+	}
 	return out, nil
 }
 

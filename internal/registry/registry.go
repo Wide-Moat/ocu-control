@@ -33,6 +33,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"hash"
+	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
@@ -131,6 +132,43 @@ type LiveLister interface {
 	// force-kill-every step and the boot reconciler; a transient store failure
 	// returns state.ErrStoreUnavailable.
 	LiveSessions(ctx context.Context) ([]state.SessionRow, error)
+}
+
+// EnrichedLister is the optional read capability the admin read-API consumes: it
+// enumerates the live reservation rows WITH the durable read-surface enrichment
+// (reserved-at, active-at, caps) the dashboard renders. It is SEPARATE from both
+// state.Store and LiveLister for the same reason LiveLister is separate — the
+// frozen Phase-1 interface is not widened, and a Store that does not enrich is
+// simply not asserted to satisfy this. Both shipped Stores implement it; the
+// read-API type-asserts its Store to EnrichedLister and fails closed
+// (ErrEnumerationUnsupported) if a Store does not, never reporting an empty set.
+// Like LiveSessions it is a snapshot read (no advisory lock): the admin surface
+// is read-only and tolerates a row mutating under it.
+type EnrichedLister interface {
+	// LiveSessionsEnriched returns every reservation row currently in
+	// StateReserved or StateActive as an EnrichedSessionRow (the frozen row plus
+	// reserved-at, active-at, caps). A transient store failure returns
+	// state.ErrStoreUnavailable, fail-closed, exactly as LiveSessions does.
+	LiveSessionsEnriched(ctx context.Context) ([]state.EnrichedSessionRow, error)
+}
+
+// ActivationRecorder is the optional write capability that records the
+// read-surface enrichment at the RESERVED -> ACTIVE transition. It is called by
+// the lifecycle activation IMMEDIATELY AFTER the frozen Commit (never inside it):
+// Commit's signature stays byte-identical, and the enrichment is persisted out of
+// band of the state flip. The admin read-surface is read-only and tolerates the
+// millisecond eventual-consistency window between the state flip and this record
+// — a read sees either the pre-record (no caps/active-at) or post-record (with)
+// view, both valid — so no atomicity invariant is owed (ADR-0022). A transient
+// store failure returns state.ErrStoreUnavailable; the caller treats a record
+// failure as non-fatal to the create (the row is already ACTIVE and correct; only
+// the read-surface enrichment is missing), and MUST NOT unwind the commit on it.
+type ActivationRecorder interface {
+	// RecordActivation stamps the activation instant and the recorded caps onto
+	// an already-committed (ACTIVE) row, keyed on the host-derived reservation
+	// key. It is idempotent: re-recording the same key overwrites with the same
+	// data. A transient store failure returns state.ErrStoreUnavailable.
+	RecordActivation(ctx context.Context, key string, caps state.Caps, at time.Time) error
 }
 
 // Custodian is the SOLE writer of the session registry (requirement 4): the only
@@ -256,4 +294,40 @@ func (c *Custodian) ReservedAndActiveKeys(ctx context.Context) ([]state.SessionR
 		return nil, err
 	}
 	return rows, nil
+}
+
+// EnrichedLiveSessions is the admin read-API's enumeration through the sole
+// custodian: it routes the enriched live-row read via the Store's optional
+// EnrichedLister, the same type-assert discipline as ReservedAndActiveKeys. A
+// Store that does not enrich yields ErrEnumerationUnsupported (fail-closed — the
+// read-API surfaces it rather than reporting an empty set); a transient store
+// failure propagates unchanged. The returned rows are recorded data the read
+// surface renders; no authority is keyed on them (NFR-SEC-43).
+func (c *Custodian) EnrichedLiveSessions(ctx context.Context) ([]state.EnrichedSessionRow, error) {
+	lister, ok := c.store.(EnrichedLister)
+	if !ok {
+		return nil, ErrEnumerationUnsupported
+	}
+	rows, err := lister.LiveSessionsEnriched(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// RecordActivation routes the out-of-band activation record through the sole
+// custodian, keyed on the registry Key (so the host-derived authority/hint
+// boundary is preserved — a raw request string can never reach this). It is
+// called by the lifecycle immediately AFTER Commit and is NON-FATAL to the
+// create: the row is already ACTIVE and correct; only the read-surface enrichment
+// is being persisted, so a transient failure is the caller's to log-and-continue,
+// never to unwind the commit on (ADR-0022). A Store without the optional
+// ActivationRecorder yields ErrEnumerationUnsupported, which the caller treats the
+// same non-fatal way — the read surface simply lacks the enrichment for that row.
+func (c *Custodian) RecordActivation(ctx context.Context, key Key, caps state.Caps, at time.Time) error {
+	recorder, ok := c.store.(ActivationRecorder)
+	if !ok {
+		return ErrEnumerationUnsupported
+	}
+	return recorder.RecordActivation(ctx, key.k, caps, at)
 }

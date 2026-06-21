@@ -36,3 +36,43 @@ func IdentityFromState(id state.Identity) runtime.Identity {
 		Caller: id.Caller,
 	}
 }
+
+// CapsFromState maps the recorded-data state.Caps into the leaf-seam
+// runtime.ResourceCaps, the inverse direction of the durable read-surface. It is
+// the same single-point relabelling discipline as IdentityFromState: state owns
+// the durable recorded caps (read by the admin surface) and runtime owns the
+// provider's hard-cap primitive, neither leaf imports the other, and this package
+// is the one named place they meet. PidsLimit is carried as a pointer (nil means
+// unset); the value is copied so the result does not alias the source's pointer.
+// The field-parity test in this package fails to build the moment either struct
+// grows, loses, renames, or re-types a field.
+func CapsFromState(c state.Caps) runtime.ResourceCaps {
+	out := runtime.ResourceCaps{
+		CPUCores:    c.CPUCores,
+		MemoryBytes: c.MemoryBytes,
+	}
+	if c.PidsLimit != nil {
+		p := *c.PidsLimit
+		out.PidsLimit = &p
+	}
+	return out
+}
+
+// CapsToState maps the leaf-seam runtime.ResourceCaps the provider stamped into
+// the recorded-data state.Caps the durable read-surface persists. This is the
+// direction the lifecycle activation uses: it takes the caps it just handed the
+// provider on the SessionSpec and records them on the row via RecordActivation. It
+// is a pure relabelling and derives no authority — the caps are recorded data the
+// admin surface renders, never an authority predicate (NFR-SEC-43). PidsLimit is
+// copied so the result does not alias the source's pointer.
+func CapsToState(c runtime.ResourceCaps) state.Caps {
+	out := state.Caps{
+		CPUCores:    c.CPUCores,
+		MemoryBytes: c.MemoryBytes,
+	}
+	if c.PidsLimit != nil {
+		p := *c.PidsLimit
+		out.PidsLimit = &p
+	}
+	return out
+}

@@ -26,6 +26,25 @@ CREATE TABLE IF NOT EXISTS sessions (
     reserved_at    TIMESTAMPTZ NOT NULL
 );
 
+-- Read-surface enrichment columns (admin read-API, additive). All four are
+-- NULLABLE: they carry the durable resource caps the provider stamped and the
+-- RESERVED -> ACTIVE transition instant, neither of which exists on a freshly
+-- reserved row, and neither of which the frozen reservation mutators write. They
+-- are populated at activation (out of band of the state flip) and read only by
+-- the LiveLister enrichment path; the reservation/commit/release contract is
+-- unchanged. ADD COLUMN IF NOT EXISTS keeps Migrate idempotent on an existing
+-- deployment — a fresh DB gets them from CREATE TABLE-equivalent state, an older
+-- one ALTERs them in once.
+--   caps_cpu_cores   — runtime.ResourceCaps.CPUCores (fractional cores)
+--   caps_memory_bytes— runtime.ResourceCaps.MemoryBytes (hard memory ceiling)
+--   caps_pids_limit  — runtime.ResourceCaps.PidsLimit (nil => NULL; no pids cap)
+--   active_at        — the RESERVED -> ACTIVE instant; avg-start-time uses
+--                      active_at - reserved_at.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS caps_cpu_cores    DOUBLE PRECISION;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS caps_memory_bytes BIGINT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS caps_pids_limit   BIGINT;
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_at         TIMESTAMPTZ;
+
 -- A partial unique index over the bound rows enforces global container_name
 -- uniqueness while leaving unbound (NULL) rows unconstrained. A duplicate bind
 -- raises SQLSTATE 23505, which BindContainerName maps to ErrBindingExists.

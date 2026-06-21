@@ -142,6 +142,47 @@ type SessionRow struct {
 	ContainerName string
 }
 
+// Caps mirrors the hard resource caps the provider stamps onto a runtime, as
+// recorded data on the durable row for the admin read-surface. It is a
+// state-local type by design: internal/state imports neither internal/runtime
+// nor any provider, so the durable layer carries no dependency on the runtime
+// seam. The lifecycle bridge (internal/runtimemap) is the single named place a
+// runtime.ResourceCaps is relabelled into this, guarded by a field-parity test,
+// exactly as the Identity bridge is. These are caps (hard ceilings), never
+// shares, and are recorded data only — no authority is keyed on them.
+type Caps struct {
+	// CPUCores is the hard CPU ceiling in fractional cores.
+	CPUCores float64
+	// MemoryBytes is the hard memory ceiling.
+	MemoryBytes int64
+	// PidsLimit caps the process count. A nil value means "unset" (no recorded
+	// pids cap), preserving the runtime seam's nil-means-unset convention.
+	PidsLimit *int64
+}
+
+// EnrichedSessionRow is the read-surface view of a reservation row: the frozen
+// SessionRow plus the durable read-only enrichment the admin read-API exposes —
+// the reservation instant, the RESERVED -> ACTIVE transition instant (nil until
+// the row is activated), and the resource caps recorded at activation (nil until
+// then). It is returned ONLY by the optional EnrichedLister seam and never by a
+// frozen Store mutator; the frozen SessionRow is embedded unchanged, so the
+// Phase-1 core is not widened. Every enrichment field is recorded data — no
+// authority is keyed on any of it (NFR-SEC-43).
+type EnrichedSessionRow struct {
+	// SessionRow is the frozen core row, byte-identical to what the mutators
+	// return.
+	SessionRow
+	// ReservedAt is the instant Reserve wrote the row.
+	ReservedAt time.Time
+	// ActiveAt is the instant the row transitioned RESERVED -> ACTIVE, recorded
+	// out of band of the frozen Commit by RecordActivation. It is nil for a row
+	// that has not been activated (still RESERVED, or never reached ACTIVE).
+	ActiveAt *time.Time
+	// Caps are the hard resource caps recorded at activation. They are nil until
+	// RecordActivation runs (a still-RESERVED row, or a pre-enrichment row).
+	Caps *Caps
+}
+
 // QuotaDim names a counter dimension. The Store holds the counters; the policy
 // (the limit and the decision) lives above in the admission gate. The set is the
 // four Phase-3 per-tenant dimensions plus the per-caller create-rate
