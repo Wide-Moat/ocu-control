@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
@@ -221,27 +220,37 @@ func TestReadList_UnattestedIs401(t *testing.T) {
 
 // TestReadHandlers_HoldNoMutatingCapability is the IMPORT-BOUNDARY structural
 // guard (NFR-SEC-26 mirror, ADR-0022): the read handler must not be able to reach
-// any mutating operator surface. It holds only the read port, the resolver, and
-// the deployment singletons — NOT the OperatorSeam, NOT the lifecycle Manager, NOT
-// the kill-switch Engine. This test fails the moment a field of a forbidden type is
-// added to ReadHandlers, so the read-only boundary cannot regress unobserved.
+// any mutating operator surface. It is a POSITIVE allow-list, not a denylist of a
+// few known-bad type names: EVERY field of ReadHandlers must be one of the
+// explicitly-vetted read-only types (the narrow read port, the resolver, the
+// deployment singletons). Any other field type fails — including a swap of the
+// narrow SessionReader interface for the concrete *registry.Custodian (whose
+// Reserve/Release/RecordActivation mutators would then be reachable), which a
+// denylist of three names would miss. A new field of any unvetted type fails the
+// moment it is added, so the read-only boundary cannot regress unobserved.
 func TestReadHandlers_HoldNoMutatingCapability(t *testing.T) {
+	// The exact set of field types the read surface is permitted to hold. Each is
+	// vetted read-only: SessionReader is the one-method enumerate port (no mutator);
+	// IdentityResolver only attests; DeploymentInfo is plain recorded strings. Adding
+	// a type here is a deliberate, reviewable act — the boundary's whole point.
+	allowed := map[string]bool{
+		"operator.SessionReader":   true,
+		"ingress.IdentityResolver": true,
+		"operator.DeploymentInfo":  true,
+	}
 	rt := reflect.TypeOf(operator.ReadHandlers{})
+	if rt.NumField() == 0 {
+		t.Fatal("ReadHandlers has no fields; the reflection guard is vacuous")
+	}
 	for i := 0; i < rt.NumField(); i++ {
 		f := rt.Field(i)
 		typeName := f.Type.String()
-		// The read handler must carry none of these capability types — each is a
-		// path to a mutating operation (mint an OperatorScope, run create/destroy,
-		// or author the deny posture / quota override).
-		for _, forbidden := range []string{
-			"OperatorSeam",
-			"lifecycle.Manager",
-			"killswitch.Engine",
-		} {
-			if strings.Contains(typeName, forbidden) {
-				t.Errorf("ReadHandlers field %q has forbidden mutating-capability type %s: the read surface must hold no path to a mutating operation",
-					f.Name, typeName)
-			}
+		if !allowed[typeName] {
+			t.Errorf("ReadHandlers field %q has type %s, which is not on the vetted read-only allow-list "+
+				"{SessionReader, IdentityResolver, DeploymentInfo}: the read surface must hold ONLY read-only "+
+				"capabilities. If this type is genuinely read-only, add it to the allow-list deliberately; if it "+
+				"is a concrete type with mutators (e.g. *registry.Custodian), it breaks the read-only boundary.",
+				f.Name, typeName)
 		}
 	}
 }

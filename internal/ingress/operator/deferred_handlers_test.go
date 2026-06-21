@@ -7,6 +7,8 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
+	"strings"
 	"testing"
 )
 
@@ -91,69 +93,92 @@ func TestDeferredHandlers_AllowListIsExact(t *testing.T) {
 	}
 }
 
-// handlerMethods parses operator.go and returns the set of method names on the
-// *Handlers receiver (the full in-process operator surface).
+// handlerMethods parses EVERY non-test .go file in the package directory and
+// returns the set of exported method names on the *Handlers receiver (the full
+// in-process operator surface). It scans the whole package, not a single named
+// file, so an exported *Handlers method added in any file is in scope — a handler
+// defined outside operator.go cannot be a silently-missed orphan.
 func handlerMethods(t *testing.T) map[string]bool {
 	t.Helper()
 	out := map[string]bool{}
-	file := parseFile(t, "operator.go")
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
-			continue
-		}
-		if receiverTypeName(fn.Recv.List[0].Type) != "Handlers" {
-			continue
-		}
-		// Exported methods only — the operator operations. Unexported helpers
-		// (resolveCaller) are not wire-mountable operations.
-		if fn.Name.IsExported() {
-			out[fn.Name.Name] = true
+	for _, file := range parsePackageFiles(t) {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Recv == nil || len(fn.Recv.List) != 1 {
+				continue
+			}
+			if receiverTypeName(fn.Recv.List[0].Type) != "Handlers" {
+				continue
+			}
+			// Exported methods only — the operator operations. Unexported helpers
+			// (resolveCaller) are not wire-mountable operations.
+			if fn.Name.IsExported() {
+				out[fn.Name.Name] = true
+			}
 		}
 	}
 	if len(out) == 0 {
-		t.Fatal("parsed no *Handlers methods from operator.go; the AST walk is broken")
+		t.Fatal("parsed no *Handlers methods from the package; the AST walk is broken")
 	}
 	return out
 }
 
-// mountedHandlers parses routes.go and returns the set of Handlers method names
-// invoked from a route closure (an h.<Method>( call), i.e. the wire-mounted set.
+// mountedHandlers parses EVERY non-test .go file in the package and returns the set
+// of Handlers method names invoked from a route registration. It matches a call
+// whose receiver resolves to the handlers — either the local alias `h` (h := l.handlers)
+// OR the field access `l.handlers` directly — so a deferred handler mounted via the
+// equivalent l.handlers.<Method>( expression cannot evade the not-mounted check.
 func mountedHandlers(t *testing.T) map[string]bool {
 	t.Helper()
 	out := map[string]bool{}
-	file := parseFile(t, "routes.go")
-	ast.Inspect(file, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok {
+	for _, file := range parsePackageFiles(t) {
+		ast.Inspect(file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			if receiverIsHandlers(sel.X) {
+				out[sel.Sel.Name] = true
+			}
 			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok {
-			return true
-		}
-		// Match h.<Method>( where h is the handlers receiver bound at the top of
-		// registerRoutes (h := l.handlers).
-		if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "h" {
-			out[sel.Sel.Name] = true
-		}
-		return true
-	})
+		})
+	}
 	if len(out) == 0 {
-		t.Fatal("parsed no mounted h.<Method> calls from routes.go; the AST walk is broken")
+		t.Fatal("parsed no mounted handler calls from the package; the AST walk is broken")
 	}
 	return out
 }
 
-// parseFile parses a source file in this package directory.
-func parseFile(t *testing.T, name string) *ast.File {
+// parsePackageFiles parses every non-test .go file in this package's directory, so
+// the guard reasons over the WHOLE package surface rather than a single named file
+// (a handler or a route in any file is in scope).
+func parsePackageFiles(t *testing.T) []*ast.File {
 	t.Helper()
 	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, name, nil, 0)
+	entries, err := os.ReadDir(".")
 	if err != nil {
-		t.Fatalf("parse %s: %v", name, err)
+		t.Fatalf("read package dir: %v", err)
 	}
-	return file
+	var files []*ast.File
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		f, err := parser.ParseFile(fset, name, nil, 0)
+		if err != nil {
+			t.Fatalf("parse %s: %v", name, err)
+		}
+		files = append(files, f)
+	}
+	if len(files) == 0 {
+		t.Fatal("parsed no package .go files; the AST walk is broken")
+	}
+	return files
 }
 
 // receiverTypeName returns the bare type name of a method receiver (stripping a
@@ -166,4 +191,23 @@ func receiverTypeName(expr ast.Expr) string {
 		return ident.Name
 	}
 	return ""
+}
+
+// receiverIsHandlers reports whether a call's receiver expression resolves to the
+// operator handlers — either the local alias `h` (h := l.handlers) or the field
+// access `l.handlers` directly. Both forms mount a route on the same surface, so
+// the not-mounted fence must recognize both; matching only the bare `h` identifier
+// would let an l.handlers.<Method>( mount slip past.
+func receiverIsHandlers(expr ast.Expr) bool {
+	switch e := expr.(type) {
+	case *ast.Ident:
+		// The local alias bound at the top of registerRoutes (h := l.handlers).
+		return e.Name == "h"
+	case *ast.SelectorExpr:
+		// A direct field access whose selector is `handlers` (l.handlers). The base
+		// is any expression (l, the Listener receiver), so this catches the field
+		// access regardless of the receiver variable name.
+		return e.Sel.Name == "handlers"
+	}
+	return false
 }
