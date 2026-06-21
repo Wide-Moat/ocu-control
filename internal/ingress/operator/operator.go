@@ -248,6 +248,12 @@ func (h *Handlers) RevokeAllViaSOAR(ctx context.Context, conn ingress.ConnInfo, 
 // LiftDeny lifts a per-session deny entry (the operator denylist edit). The
 // admin/CLI channel authenticates via the attested socket and the scope is minted
 // from the held seam.
+//
+// DEFERRED ROUTE: this handler is complete and tested in-process but its HTTP route
+// is deliberately not mounted yet (mounted with the denylist-edit wire route). It is
+// on the deferredHandlers allow-list, which TestDeferredHandlers_AllowListIsExact
+// enforces — a dead-code pass cannot delete it, and a premature mount fails the
+// build. It is the same design-fenced class as the SOAR-revoke pair.
 func (h *Handlers) LiftDeny(ctx context.Context, conn ingress.ConnInfo, key, reason string) error {
 	caller, err := h.resolveCaller(ctx, conn)
 	if err != nil {
@@ -262,6 +268,12 @@ func (h *Handlers) LiftDeny(ctx context.Context, conn ingress.ConnInfo, key, rea
 // OverrideQuota applies an operator-authored delta to a counter cell through the
 // atomic Charge. The admin/CLI channel authenticates via the attested socket; the
 // scope is minted from the held seam.
+//
+// DEFERRED ROUTE: this handler is complete and tested in-process but its HTTP route
+// is deliberately not mounted yet (mounted with the quota-override wire route). It
+// is on the deferredHandlers allow-list, which TestDeferredHandlers_AllowListIsExact
+// enforces — a dead-code pass cannot delete it, and a premature mount fails the
+// build. It is the same design-fenced class as the SOAR-revoke pair.
 func (h *Handlers) OverrideQuota(ctx context.Context, conn ingress.ConnInfo, key state.QuotaKey, delta, limit int64, reason string) error {
 	caller, err := h.resolveCaller(ctx, conn)
 	if err != nil {
