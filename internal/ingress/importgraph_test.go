@@ -75,11 +75,6 @@ func TestGatewayCannotReachOperatorSeam(t *testing.T) {
 	assertSymbolsDeclaredInIngress(t, root)
 
 	gatewayDir := filepath.Join(root, "internal", "ingress", "gateway")
-	if _, err := os.Stat(gatewayDir); os.IsNotExist(err) {
-		t.Skipf("gateway adapter (%s) not built yet (lands in implementation step 10); "+
-			"structural anchor verified, gateway scan pending", gatewayPkgPath)
-		return
-	}
 
 	// (a) Source scan: no gateway source file may reference an operator-seam symbol.
 	scanGatewaySourceForForbiddenSymbols(t, gatewayDir)

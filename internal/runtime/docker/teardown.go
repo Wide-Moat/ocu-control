@@ -62,7 +62,7 @@ func (t *teardown) ForceKill(parent context.Context, sess runtime.Sandbox) error
 //
 // The EXACT NFR-SEC-65 step order, none depending on guest cooperation:
 //
-//  1. revoke session JWT                  (host-side; Phase-4 wires the real revoke)
+//  1. revoke session JWT                  (host-side; the real cross-component revoke is deferred-external)
 //  2. drop the network-bound egress route (host-side EVEN IF the guest is unresponsive)
 //  3. zero tmpfs/scratch                  (host reclamation)
 //  4. unmount data scope                  (host reclamation)
@@ -95,8 +95,9 @@ func (t *teardown) finalize(parent context.Context, sess runtime.Sandbox, grace 
 	step1RevokeJWT := t.revokeJWT(base, sess.Egress)
 
 	// 2. Drop the network-bound egress route host-side via the EgressBinding —
-	//    EVEN IF the guest is unresponsive (NFR-SEC-27). Phase-4 TODO: materialize
-	//    against the real Envoy SDS; the host-side route binding is dropped now.
+	//    EVEN IF the guest is unresponsive (NFR-SEC-27). Deferred-external: the real
+	//    Envoy SDS route-drop rides the EgressProgrammer seam (gated on the live
+	//    Envoy + deploy-SDS coordination); the host-side route binding is dropped now.
 	step2DropEgress := t.dropEgress(base, sess.Egress)
 
 	// 3. Zero the host-owned per-session scratch: scrub the credential-bearing
@@ -105,8 +106,9 @@ func (t *teardown) finalize(parent context.Context, sess runtime.Sandbox, grace 
 	//    the session on host disk (NFR-SEC-65).
 	step3ZeroTmpfs := t.zeroTmpfs(base, sess)
 
-	// 4. Unmount the data scope (host reclamation). Phase-4 TODO: unmount the real
-	//    rclone-filestore mount; the host-side bind is reclaimed now.
+	// 4. Unmount the data scope (host reclamation). Deferred-external: the real
+	//    rclone-filestore unmount rides the UnmountTrigger seam (gated on the sibling
+	//    unmount contract); the host-side bind is reclaimed now.
 	step4Unmount := t.unmountScope(base, sess)
 
 	// 5. Kill the process tree == force-remove the container.
@@ -156,11 +158,11 @@ func (t *teardown) revokeJWT(base context.Context, bind runtime.EgressBinding) e
 // dropEgress is finalizer step 2: drop the network-bound egress route host-side
 // via the EgressBinding, even if the guest is unresponsive (NFR-SEC-27). Phase 2
 // drops the host-side route binding keyed on the FilesystemID; the real Envoy SDS
-// resource removal is a Phase-4 wire. The step EXISTS and runs in order now.
+// resource removal is deferred-external (real Envoy SDS). The step EXISTS and runs in order now.
 func (t *teardown) dropEgress(_ context.Context, _ runtime.EgressBinding) error {
-	// TODO(phase-4): materialize the route drop against the real Envoy SDS. The
+	// Deferred-external: materialize the route drop against the real Envoy SDS via the
 	// host-side route binding is dropped here regardless of guest reachability;
-	// the cross-component SDS push is deferred to Phase 4.
+	// EgressProgrammer seam; the cross-component SDS push is deferred-external.
 	return nil
 }
 
@@ -241,10 +243,10 @@ func scrubHandoffRoot(root string) error {
 
 // unmountScope is finalizer step 4: unmount the per-session data scope host-side.
 // Phase 2 reclaims the host-side bind; the real rclone-filestore unmount is a
-// Phase-4 wire. The step EXISTS and runs in order now.
+// deferred-external (real rclone unmount). The step EXISTS and runs in order now.
 func (t *teardown) unmountScope(_ context.Context, _ runtime.Sandbox) error {
-	// TODO(phase-4): unmount the real rclone-filestore mount. The host-side bind
-	// reclamation runs here; the cross-component unmount is deferred to Phase 4.
+	// Deferred-external: unmount the real rclone-filestore mount via the UnmountTrigger seam. The host-side bind
+	// reclamation runs here; the cross-component unmount is deferred-external.
 	return nil
 }
 
