@@ -27,10 +27,9 @@ var operatorSeamSymbols = []string{
 	"OperatorScope",
 }
 
-// gatewayPkgPath is the import path of the (future) gateway adapter. The package
-// lands in implementation step 10; until then this test verifies the structural
-// anchor and reports the gateway scan as pending. The assertion goes live with no
-// edit the moment the package directory appears.
+// gatewayPkgPath is the import path of the gateway adapter. The package is built;
+// this test scans its real source and its real transitive dependency closure for
+// any route to the operator-seam mint path.
 const gatewayPkgPath = "github.com/Wide-Moat/ocu-control/internal/ingress/gateway"
 
 // moduleRoot walks up from this test file to the directory holding go.mod, so the
@@ -61,9 +60,9 @@ func moduleRoot(t *testing.T) string {
 // the import-graph half of the capability seal (the compile-fail fixture is the
 // type half); together they make the gateway↛operator separation a mechanical fact.
 //
-// Until the gateway package lands (step 10) the test verifies the structural anchor
-// — that the forbidden symbols are real exported names of THIS package, so the
-// grep/scan target is well-defined — and marks the gateway-specific scan pending.
+// The test also verifies the structural anchor — that the forbidden symbols are real
+// exported names of THIS package, so the grep/scan target is well-defined — before
+// scanning the built gateway package's source and transitive dependency closure.
 func TestGatewayCannotReachOperatorSeam(t *testing.T) {
 	t.Parallel()
 

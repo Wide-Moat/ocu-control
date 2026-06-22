@@ -35,14 +35,16 @@ per-request one (ADR-0003, ADR-0012).
 
 - **Seam:** `internal/runtime/provider.go` (`RuntimeProvider`),
   `internal/state/store.go` (`Store`).
-- **Enforcement:** seam isolation — control packages import the interface, not
-  the impl. *(Note: unlike invariants III and II, this one has no dedicated
-  import-graph test yet; it is held by the seam shape. The compile-test upgrade —
-  a runtime/state import-graph test at parity with `cred`'s
-  `TestCredHoldsNoListener` and `ingress`'s `TestGatewayCannotReachOperatorSeam`
-  — is a tracked guard-strength item, scheduled as Phase 7 of the roadmap. This
-  caveat closes when that test lands; until then, do not assume the test is
-  present.)*
+- **Enforcement:** `internal/runtime/importgraph_test.go`
+  (`TestRuntimeHoldsNoConcreteSDK`) and `internal/state/importgraph_test.go`
+  (`TestStateHoldsNoConcreteDriver`) — for each ROOT seam package an AST scan
+  rejects a direct concrete-SDK import in its source, and a `go list -deps` check
+  asserts its transitive closure excludes `github.com/docker/docker`,
+  `github.com/moby`, `github.com/jackc/pgx`, and `database/sql`. The concrete
+  Docker SDK and Postgres driver appear only below the seam, in
+  `internal/runtime/docker` and `internal/state/postgres`. This is at parity with
+  `cred`'s `TestCredHoldsNoListener` and `ingress`'s
+  `TestGatewayCannotReachOperatorSeam`.
 
 ## II. The gateway can never reach the operator surface (NFR-SEC-52, NFR-SEC-26)
 
