@@ -19,11 +19,28 @@
 # Schema reference: https://github.com/go-gremlins/gremlins
 unleash:
   coverpkg: ./internal/admission/...,./internal/registry/...,./internal/quota/...,./internal/killswitch/...
-  # Thresholds are 0 (advisory) until a stable baseline is measured on the CI
-  # toolchain. The ratchet plan: once gremlins reports a real efficacy figure
-  # on the pinned Go toolchain, set threshold.efficacy / threshold.mutant-coverage
-  # to floor(baseline) and drop continue-on-error in the workflow so a drop in
-  # assertion strength fails the gate.
+  # Thresholds are 0 (advisory) and MUST stay there with gremlins: this tool is
+  # structurally blind on THIS module and reports a phantom 0% efficacy / 0%
+  # mutant-coverage (every mutant "Not covered") regardless of how strong the
+  # suite is. Promoting the gate to blocking on that phantom would be a FALSE
+  # ratchet — green-looking but enforcing nothing.
+  #
+  # Root cause (verified, gremlins-side, Go-version-independent): gremlins
+  # v0.6.0's internal modPkg() reads ONLY THE FIRST LINE of go.mod and strips a
+  # "module " prefix, instead of parsing with x/mod/modfile. This module's go.mod
+  # opens with a license/SPDX comment, so gremlins takes that comment as the
+  # module path; the coverage-profile filename keys then never get the module
+  # prefix stripped while the mutation engine keys by WalkDir-relative paths, so
+  # the position lookup misses on every mutant and all are scored "Not covered".
+  # (Proof: moving `module ...` to go.mod line 1 flips a mutant from Not-covered
+  # to Timed-out — it actually runs. We do NOT reorder go.mod for a tool bug.)
+  #
+  # Ratchet plan (Phase-7, per-plan): replace gremlins with avito-tech/go-mutesting,
+  # which builds clean and scores honestly on this toolchain. Its terminology is
+  # INVERTED (PASS = mutant killed, FAIL = mutant survived) and it has no built-in
+  # threshold, so wrap it in a score-floor CI check. Once go-mutesting reports a
+  # real efficacy floor on the security-core packages, arm THAT gate blocking —
+  # never this gremlins gate.
   threshold:
     efficacy: 0
     mutant-coverage: 0
