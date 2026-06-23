@@ -70,6 +70,22 @@ const (
 // filter keys on the (key, value) pair.
 const managedLabelValue = "true"
 
+// Single-source guest sock-dir layout. The host binds the per-session 0700 sock
+// dir RW at guestSockDir (buildHostConfig), and the guest's listener Cmd flags
+// (buildContainerConfig) derive the exec/control socket paths from the SAME
+// mountpoint — so the in-guest path "/run/ocu" lives in exactly one place and the
+// bind target can never drift from the path the guest is told to listen on.
+const (
+	// guestSockDir is the in-guest mountpoint of the host-owned RW sock directory.
+	guestSockDir = "/run/ocu"
+	// execSockName is the exec-channel UDS filename inside guestSockDir; the guest
+	// binds it under --listen-uds.
+	execSockName = "exec.sock"
+	// controlSockName is the advisory control-RPC UDS filename inside guestSockDir;
+	// the guest binds it under --control-listen-uds (additive, ADR-0018).
+	controlSockName = "control.sock"
+)
+
 // defaultSeccomp is the embedded deny-default seccomp profile, applied verbatim
 // as the seccomp= SecurityOpt on every container. Provenance: seccomp/README.md.
 //
@@ -409,12 +425,48 @@ func validateSpec(spec runtime.SessionSpec) error {
 
 // buildContainerConfig is the container.Config for a HOST-01 sandbox: the image,
 // empty Env (no secret rides Env — requirement 5; the Storage-JWT goes into the
-// mount material, never the environment), no exposed ports, and the labels the
-// reconciler keys on. The mount AuthToken is deliberately absent from Env.
+// mount material, never the environment), no exposed ports, the labels the
+// reconciler keys on, and the LOAD-BEARING guest entrypoint Cmd.
+//
+// WHY THE Cmd IS LOAD-BEARING. The production guest image declares no CMD, so the
+// host driver MUST supply the guest's argv here; without it the guest hits two
+// distinct failure modes, and a half-fix that escapes one falls into the other:
+//
+//   - listener fail-STOP: --listen-uds is the guest's required listener token. With
+//     no listener flag the guest exits before binding (a crash loop). An empty Cmd is
+//     exactly this case.
+//   - keyless fail-OPEN: --auth-public-key turns on Session JWT signature
+//     verification. If it is absent the guest runs keyless and NEVER checks the JWT
+//     signature — silently disabling admission. Binding the key file :ro
+//     (buildHostConfig) without naming it on the Cmd is exactly as unauthenticated as
+//     not binding it. This is the latent hole behind a listener-only fix.
+//
+// The --auth-public-key value is the SAME spec.Handoff.PublicKeyPath buildHostConfig
+// binds :ro (single source — never a hardcoded literal), so the path the guest is
+// told to read the key from can never drift from the path the host actually mounts.
+// validateSpec has already forced a non-empty PublicKeyPath and a 32-byte key before
+// this runs, so the Cmd can never carry an empty key value. The socket paths derive
+// from the same guestSockDir mountpoint buildHostConfig binds RW at /run/ocu.
+//
+// This protects CONSTITUTION invariant V / the host-derived identity binding
+// (NFR-SEC-43): a guest that never verifies the Session JWT cannot enforce the
+// host-attested caller identity the JWT carries — the admission decision would be
+// silently void. The argv is exec-form (no shell exists to split a joined string),
+// flag and value are SEPARATE elements, and it carries NO TCP-perimeter flag
+// (--addr / --block-local-connections) and NO NotImplemented flag.
 func buildContainerConfig(spec runtime.SessionSpec) *container.Config {
 	return &container.Config{
 		Image: spec.Image,
 		Env:   []string{}, // EMPTY on every production path (requirement 5).
+		// Exec-form argv: separate tokens, no shell. --listen-uds is the required
+		// listener (fail-STOP guard); --auth-public-key turns on JWT verification
+		// (fail-OPEN guard); --control-listen-uds is the additive advisory /shutdown
+		// surface (ADR-0018), NOT part of the listener ArgGroup.
+		Cmd: []string{
+			"--listen-uds", guestSockDir + "/" + execSockName,
+			"--control-listen-uds", guestSockDir + "/" + controlSockName,
+			"--auth-public-key", spec.Handoff.PublicKeyPath,
+		},
 		Labels: map[string]string{
 			labelManaged:      managedLabelValue,
 			labelSessionName:  string(spec.Name),
@@ -451,13 +503,15 @@ func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier) (*conta
 	}
 
 	// The THREE binds: container_info.json (:ro), the 32-byte Ed25519 PUBLIC key
-	// (:ro), and the host-owned 0700 sock dir mounted RW at /run/ocu (no :ro). The
-	// guest creates the exec UDS inside the RW dir; the provider never pre-creates
-	// the socket.
+	// (:ro), and the host-owned 0700 sock dir mounted RW at guestSockDir (no :ro).
+	// The guest creates the exec UDS inside the RW dir; the provider never pre-creates
+	// the socket. The mountpoint is the SAME guestSockDir const the guest's listener
+	// Cmd flags derive their socket paths from (buildContainerConfig), so the bind
+	// target and the --listen-uds value can never drift.
 	binds := []string{
 		spec.Handoff.ContainerInfoPath + ":" + spec.Handoff.ContainerInfoPath + ":ro",
 		spec.Handoff.PublicKeyPath + ":" + spec.Handoff.PublicKeyPath + ":ro",
-		spec.Handoff.HostSockDir + ":/run/ocu",
+		spec.Handoff.HostSockDir + ":" + guestSockDir,
 	}
 
 	hostCfg := &container.HostConfig{

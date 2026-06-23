@@ -258,6 +258,161 @@ func TestBuildContainerConfig_EnvEmpty(t *testing.T) {
 	}
 }
 
+// valueAfterFlag scans an exec-form argv for flag and returns (value, true) where
+// value is the IMMEDIATELY following element. It enforces the exec-form contract:
+// the flag and its value are SEPARATE slice elements. A single joined element such
+// as "--auth-public-key /etc/ocu/control.pub" never matches flag, so a regression
+// that space-joins the pair into one token is caught here (there is no shell in the
+// FROM-scratch guest to re-split it). Returns ("", false) when the flag is absent or
+// is the last element with no value following it.
+func valueAfterFlag(argv []string, flag string) (string, bool) {
+	for i, tok := range argv {
+		if tok == flag {
+			if i+1 >= len(argv) {
+				return "", false
+			}
+			return argv[i+1], true
+		}
+	}
+	return "", false
+}
+
+// TestBuildContainerConfigCmd_CarriesAuthPublicKey is failure-mode (A): keyless
+// fail-OPEN. The FROM-scratch guest runs in keyless dev mode when --auth-public-key
+// is absent and then NEVER checks Session JWT signatures — silently disabling
+// admission. Mounting the key (buildHostConfig binds it :ro) but omitting the flag
+// is exactly as unauthenticated as not mounting it at all. The prod create path must
+// therefore ALWAYS emit --auth-public-key, and its value must be the SAME
+// spec.Handoff.PublicKeyPath docker.go binds :ro (single source — NOT a hardcoded
+// literal, NOT empty). This guards CONSTITUTION invariant V (the host-derived
+// identity binding, NFR-SEC-43): a guest that never verifies the JWT cannot enforce
+// the host-attested caller identity the Session JWT carries.
+func TestBuildContainerConfigCmd_CarriesAuthPublicKey(t *testing.T) {
+	spec := validSpec()
+	cfg := buildContainerConfig(spec)
+
+	val, ok := valueAfterFlag(cfg.Cmd, "--auth-public-key")
+	if !ok {
+		t.Fatalf("Cmd is missing --auth-public-key (keyless fail-OPEN: the guest never checks Session JWT signatures): got %v", cfg.Cmd)
+	}
+	if val != spec.Handoff.PublicKeyPath {
+		t.Errorf("--auth-public-key value: want spec.Handoff.PublicKeyPath %q (single source, the same path bound :ro), got %q",
+			spec.Handoff.PublicKeyPath, val)
+	}
+	if val == "" {
+		t.Errorf("--auth-public-key value is empty (keyless fail-OPEN)")
+	}
+	// The value must be DERIVED from the spec, not a hardcoded literal: prove it by
+	// mutating PublicKeyPath and re-deriving the Cmd. A literal would not move.
+	spec2 := validSpec()
+	spec2.Handoff.PublicKeyPath = "/some/other/derived/key.pub"
+	val2, ok2 := valueAfterFlag(buildContainerConfig(spec2).Cmd, "--auth-public-key")
+	if !ok2 || val2 != spec2.Handoff.PublicKeyPath {
+		t.Errorf("--auth-public-key value is not derived from spec.Handoff.PublicKeyPath: want %q, got %q (ok=%v)",
+			spec2.Handoff.PublicKeyPath, val2, ok2)
+	}
+}
+
+// TestBuildContainerConfigCmd_CarriesListener is failure-mode (B): listener
+// fail-STOP. --listen-uds / --addr / --dial-uds form a required listener ArgGroup;
+// with none of them set the guest clap-exits before binding (crash loop) — which is
+// today's real prod-create failure with argv=[]. The non-negotiable listener token
+// is --listen-uds (NOT --control-listen-uds, which is additive for advisory
+// /shutdown per ADR-0018), and its value is the in-guest exec.sock path derived from
+// the same sock-dir mountpoint docker.go binds RW at /run/ocu.
+func TestBuildContainerConfigCmd_CarriesListener(t *testing.T) {
+	cfg := buildContainerConfig(validSpec())
+
+	val, ok := valueAfterFlag(cfg.Cmd, "--listen-uds")
+	if !ok {
+		t.Fatalf("Cmd is missing --listen-uds (listener fail-STOP: the guest clap-exits before binding, crash loop): got %v", cfg.Cmd)
+	}
+	wantExecSock := guestSockDir + "/" + execSockName
+	if val != wantExecSock {
+		t.Errorf("--listen-uds value: want the in-guest exec.sock path %q, got %q", wantExecSock, val)
+	}
+}
+
+// TestBuildContainerConfigCmd_ExecFormShape pins the exec-form contract and the
+// forbidden-flag boundary on the prod Cmd. There is no shell in the FROM-scratch
+// guest, so (1) the Cmd is a []string of SEPARATE tokens and (2) no token is a
+// space-joined "flag value" element. It also asserts the Cmd carries NONE of the
+// forbidden flags: --addr (opens a forbidden TCP perimeter on a UDS-only guest),
+// --block-local-connections (a TCP-only no-op), and the NotImplemented flags
+// --listen-vsock-port / --firecracker-init / --control-server-addr (the guest bails
+// if any is set).
+func TestBuildContainerConfigCmd_ExecFormShape(t *testing.T) {
+	spec := validSpec()
+	cfg := buildContainerConfig(spec)
+
+	if len(cfg.Cmd) == 0 {
+		t.Fatalf("Cmd is empty: the guest crash-loops (no listener) and runs keyless (no key)")
+	}
+
+	// Exec-form: every token is a distinct element; no element smuggles a flag and
+	// its value joined by a space (no shell exists to split it).
+	for i, tok := range cfg.Cmd {
+		if strings.Contains(tok, " ") {
+			t.Errorf("Cmd[%d] = %q contains a space: exec-form requires flag and value as SEPARATE elements", i, tok)
+		}
+	}
+
+	// Both load-bearing flags carry a separate value element (re-checks the pair
+	// shape independently of the per-mode tests above).
+	for _, flag := range []string{"--auth-public-key", "--listen-uds"} {
+		if _, ok := valueAfterFlag(cfg.Cmd, flag); !ok {
+			t.Errorf("Cmd must carry %s followed by a SEPARATE value element, got %v", flag, cfg.Cmd)
+		}
+	}
+
+	// Forbidden flags must NOT appear anywhere in the Cmd.
+	forbidden := []string{
+		"--addr",
+		"--block-local-connections",
+		"--listen-vsock-port",
+		"--firecracker-init",
+		"--control-server-addr",
+	}
+	for _, tok := range cfg.Cmd {
+		for _, bad := range forbidden {
+			if tok == bad {
+				t.Errorf("Cmd carries forbidden flag %q (breaks the UDS-only guest perimeter / is a NotImplemented bail): %v", bad, cfg.Cmd)
+			}
+		}
+	}
+}
+
+// TestValidateSpec_EmptyPubkeyRejectsBeforeCmd asserts the keyless-key material is
+// rejected fail-closed at validateSpec BEFORE any Cmd would be emitted. validateSpec
+// already forces a non-empty PublicKeyPath (the "missing pubkey bind" row of
+// TestValidateSpec_FailClosed), so this does NOT duplicate the check: it pins the
+// ORDERING — a prod spec with an empty PublicKeyPath never reaches buildContainerConfig,
+// so the Cmd can never carry an empty --auth-public-key value derived from it.
+func TestValidateSpec_EmptyPubkeyRejectsBeforeCmd(t *testing.T) {
+	spec := validSpec()
+	spec.Handoff.PublicKeyPath = ""
+
+	// validateSpec rejects the empty key path fail-closed (the gate Materialize runs
+	// before buildContainerConfig is ever called).
+	if err := validateSpec(spec); !errors.Is(err, runtime.ErrUnsupportedSpec) {
+		t.Fatalf("validateSpec with empty PublicKeyPath: want ErrUnsupportedSpec (before any Cmd is emitted), got %v", err)
+	}
+
+	// Materialize must reject with ZERO substrate calls — no ContainerCreate, so no
+	// Cmd is ever handed to the daemon with an empty key value.
+	fake := newFakeAPI()
+	p, err := NewDockerProvider(runtime.TierRunc, Deps{API: fake})
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	if _, merr := p.Materialize(context.Background(), spec); !errors.Is(merr, runtime.ErrUnsupportedSpec) {
+		t.Errorf("Materialize with empty PublicKeyPath: want ErrUnsupportedSpec, got %v", merr)
+	}
+	if got := len(fake.ops()); got != 0 {
+		t.Errorf("empty-PublicKeyPath Materialize issued %d substrate calls (want 0 — no Cmd emitted): %v", got, fake.ops())
+	}
+}
+
 // TestSeccomp_CompactedEqualsEmbed asserts the package-init compaction equals
 // json.Compact of the embedded profile (not "{}", not the daemon default).
 func TestSeccomp_CompactedEqualsEmbed(t *testing.T) {
