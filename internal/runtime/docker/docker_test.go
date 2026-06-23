@@ -46,7 +46,7 @@ func validSpec() runtime.SessionSpec {
 			ContainerInfoJSON: []byte(`{"k":"v"}`),
 			ContainerInfoPath: "/etc/ocu/container_info.json",
 			PublicKeyEd25519:  pub,
-			PublicKeyPath:     "/etc/ocu/control_pubkey.ed25519",
+			PublicKeyPath:     "/etc/ocu/auth_public_key",
 			HostSockDir:       "/var/run/ocu/sess-a",
 		},
 	}
@@ -122,7 +122,7 @@ func TestBuildHostConfig_HOST01(t *testing.T) {
 	// Exactly THREE binds with the right :ro / RW(:/run/ocu) suffixes.
 	wantBinds := []string{
 		"/etc/ocu/container_info.json:/etc/ocu/container_info.json:ro",
-		"/etc/ocu/control_pubkey.ed25519:/etc/ocu/control_pubkey.ed25519:ro",
+		"/etc/ocu/auth_public_key:/etc/ocu/auth_public_key:ro",
 		"/var/run/ocu/sess-a:/run/ocu",
 	}
 	if len(hc.Binds) != 3 {
@@ -261,7 +261,7 @@ func TestBuildContainerConfig_EnvEmpty(t *testing.T) {
 // valueAfterFlag scans an exec-form argv for flag and returns (value, true) where
 // value is the IMMEDIATELY following element. It enforces the exec-form contract:
 // the flag and its value are SEPARATE slice elements. A single joined element such
-// as "--auth-public-key /etc/ocu/control_pubkey.ed25519" never matches flag, so a regression
+// as "--auth-public-key /etc/ocu/auth_public_key" never matches flag, so a regression
 // that space-joins the pair into one token is caught here (there is no shell in the
 // FROM-scratch guest to re-split it). Returns ("", false) when the flag is absent or
 // is the last element with no value following it.

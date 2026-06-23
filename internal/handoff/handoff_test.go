@@ -85,7 +85,7 @@ func TestStageWritesAllArtifacts(t *testing.T) {
 	if len(infoBytes) == 0 {
 		t.Fatalf("container_info.json is empty")
 	}
-	keyBytes, err := os.ReadFile(filepath.Join(st.Root, "control_pubkey.ed25519"))
+	keyBytes, err := os.ReadFile(filepath.Join(st.Root, "auth_public_key"))
 	if err != nil {
 		t.Fatalf("read public key: %v", err)
 	}
@@ -196,7 +196,7 @@ func TestStageMountIntentAccepted(t *testing.T) {
 		t.Fatalf("Stage with mounts: %v", err)
 	}
 	// The AuthToken is NOT written into any handoff artifact this phase.
-	keyBytes, err := os.ReadFile(filepath.Join(st.Root, "control_pubkey.ed25519"))
+	keyBytes, err := os.ReadFile(filepath.Join(st.Root, "auth_public_key"))
 	if err != nil {
 		t.Fatalf("read public key: %v", err)
 	}

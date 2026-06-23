@@ -30,7 +30,7 @@ func stageHandoffRoot(t *testing.T, base string, name runtime.SessionName) strin
 	mountCfg := []byte(`{"token":"eyJhbGciOiJFZERTQSJ9.eyJmaWxlc3lzdGVtX2lkIjoiZnMtMSJ9.c2lnbmF0dXJl","service_url":"https://filestore.example"}`)
 	files := map[string][]byte{
 		"container_info.json":     []byte(`{"schema":"v1alpha","session_name":"` + string(name) + `","sock_dir":"/run/ocu"}`),
-		"control_pubkey.ed25519":  make([]byte, 32),
+		"auth_public_key":         make([]byte, 32),
 		"mount-config.json":       mountCfg,
 		"sock/exec.sock.metadata": []byte("placeholder"),
 	}

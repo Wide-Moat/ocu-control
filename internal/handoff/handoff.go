@@ -47,15 +47,19 @@ const (
 	// container_info.json within the per-session root.
 	containerInfoFile = "container_info.json"
 	// publicKeyFile is the on-host filename for the raw 32-byte Ed25519 public key.
-	publicKeyFile = "control_pubkey.ed25519"
+	publicKeyFile = "auth_public_key"
 	// sockDirName is the per-session sock-dir name within the root; the guest
 	// creates its exec UDS here (bound RW at /run/ocu inside the guest).
 	sockDirName = "sock"
 
 	// guestContainerInfoPath is the absolute guest mountpoint for container_info.json.
 	guestContainerInfoPath = "/etc/ocu/container_info.json"
-	// guestPublicKeyPath is the absolute guest mountpoint for the public key.
-	guestPublicKeyPath = "/etc/ocu/control_pubkey.ed25519"
+	// guestPublicKeyPath is the absolute guest mountpoint for the public key. It is
+	// the fleet-canon in-guest path the guest image declares and the sandbox's own
+	// host-side driver also binds to (the guest-image INTEGRATION.md contract +
+	// ocu-sandbox host/internal/control/create.go) — one path across both host
+	// drivers that materialize the same guest image.
+	guestPublicKeyPath = "/etc/ocu/auth_public_key"
 )
 
 // ErrBadPublicKey is the fail-closed refusal for a public key that is not exactly
