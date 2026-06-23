@@ -96,7 +96,7 @@ func itSpec(t *testing.T, name runtime.SessionName) runtime.SessionSpec {
 	if err != nil {
 		t.Fatalf("generate ed25519 key: %v", err)
 	}
-	keyPath := filepath.Join(dir, "control.pub")
+	keyPath := filepath.Join(dir, "control_pubkey.ed25519")
 	if err := os.WriteFile(keyPath, pub, 0o600); err != nil {
 		t.Fatalf("write pubkey: %v", err)
 	}
