@@ -35,13 +35,41 @@ set. `docker-build` builds the image single-arch to catch go.mod / Dockerfile
 toolchain drift; it never pushes. This is a required, release-gating workflow —
 no `continue-on-error`.
 
+## deadcode.yml
+
+`deadcode -test ./...` (pinned `v0.38.0`) over the whole build-plus-test graph;
+fails on ANY unreachable function, catching dead exports the package-local unused
+check cannot see. It gates on non-empty output, never on the tool's exit status
+(deadcode exits 0 even with findings). The `-test` flag keeps the
+deliberately-deferred operator handlers reachable from their own unit tests, so
+the clean baseline is empty and "any output is a failure" is a true rule.
+Blocking. Local: `make deadcode`.
+
 ## mutation.yml
 
-go-gremlins on the pure-logic leaf packages (`internal/admission`,
-`internal/registry`, `internal/quota`, `internal/killswitch`), scoped in
-`.gremlins.yaml`. Advisory (`continue-on-error`) until a stable efficacy
-baseline; the ratchet plan is in the workflow header. The job skips a missing
-dir with a notice.
+go-mutesting (pinned to the `48d0401f00fb` pseudo-version — no upstream semver
+tag) on the pure-logic leaf packages (`internal/admission`, `internal/registry`,
+`internal/quota`, `internal/killswitch`). `scripts/mutation-floor.sh` enforces a
+per-package score floor that ratchets UP only and gates on the PARSED score, not
+the exit code (always 0); a no-score run fails CLOSED — the anti-gremlins guard.
+go-mutesting replaced go-gremlins, which was structurally blind on this module's
+comment-led go.mod and scored a phantom 0%. Blocking. Floors: admission 1.0,
+killswitch 0.8, quota 0.8, registry 1.0. Local: `make mutation`.
+
+## docs.yml
+
+vale (pinned `v3.15.1`, installed with the same go-install model as
+deadcode/go-mutesting — a Go single binary, no Node) against the Architecture
+style: a banlist of marketing adjectives, AI-slop preamble phrases, and the AP-13
+data-class-picks-substrate anti-pattern. Blocking on the canon-critical docs
+(README, CONSTITUTION, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT, CHANGELOG, the
+`docs/` tree), warning on the auxiliary set. The slop-scanner CLASS was dropped,
+not replaced one-for-one — no vetted Node-free ML-slop detector exists, and a
+substitute CLI would be fake-green. The `.vale.ini` and the Architecture style
+are vendored byte-identical from canon; a banlist change lands in canon first.
+`scripts/vale-redprobe.sh` proves the gate fires on planted banned vocabulary.
+lychee (`lycheeverse/lychee-action`, bundled version) checks forward-reference
+(relative-link) integrity on the same .md. Local: `make vale`.
 
 ## security.yml
 

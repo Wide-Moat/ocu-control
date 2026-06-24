@@ -94,3 +94,38 @@ Every PR must pass: secrets scan (gitleaks + trufflehog, any hit blocks),
 naming denylist (lexicon job; the list is maintained outside the tree), SAST
 (semgrep CRITICAL blocks), SCA (trivy CRITICAL blocks), conventional-commits.
 Coverage, mutation, property, and perf gates wire in as the code lands.
+
+## Quality gates (as built)
+
+Four quality gates landed on top of the security/coverage set above. Each is
+blocking, pinned to an exact tool version, and ships a RED-when-neutered proof —
+a script that plants a defect, asserts the gate fires, and restores the tree — so
+a gate that guards nothing cannot pass review. The proofs run in CI alongside the
+gates, not just locally.
+
+- **Dead code** (`deadcode.yml`, `scripts/deadcode-gate.sh`): `deadcode -test
+  ./...` over the whole build-plus-test graph; fails on ANY unreachable function,
+  catching dead EXPORTS the package-local unused check cannot see. It gates on
+  non-empty output, never on the tool's exit status. The `-test` flag keeps the
+  deliberately-deferred operator handlers reachable from their own tests, so the
+  clean baseline is literally empty.
+- **Mutation score** (`mutation.yml`, `scripts/mutation-floor.sh`): go-mutesting
+  on the pure-logic leaf packages (admission, killswitch, quota, registry) with a
+  per-package score floor that ratchets UP only. It gates on the PARSED score (not
+  the exit code, which is always 0) and fails closed on a no-score run — the
+  anti-gremlins guard, since the retired gremlins tool was structurally blind on
+  this module and reported a phantom 0%. Current floors: admission 1.0, killswitch
+  0.8, quota 0.8, registry 1.0.
+- **Doc prose** (`docs.yml`, `scripts/vale-gate.sh`): vale against the
+  Architecture style — a banlist of marketing adjectives, AI-slop preamble
+  phrases, and the AP-13 data-class-picks-substrate anti-pattern — blocking on the
+  canon-critical docs and warning on the auxiliary set. The slop-scanner CLASS was
+  DROPPED, not replaced one-for-one: no vetted Node-free ML-slop detector exists,
+  and dropping in a substitute CLI would be fake-green in a new wrapper. A
+  deterministic prose banlist is the honest gate instead. The `.vale.ini` and the
+  Architecture style are vendored byte-identical from canon (one banlist across
+  the fleet); a banlist change lands in canon first, never by editing `.vale/`
+  here. lychee checks forward-reference (relative-link) integrity on the same .md.
+- **License headers, contract identity, doc identity**: the SPDX header gate, the
+  byte-identity check against the vendored canon contracts, and the stale-identity
+  scan round out `make check`, the one-command pre-push gate that mirrors CI.
