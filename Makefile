@@ -24,6 +24,9 @@ GOLANGCI_LINT_VERSION := v2.12.2
 # go-gremlins mutation tester version pinned in CI (mutation.yml install step).
 GREMLINS_VERSION := v0.6.0
 
+# golang.org/x/tools/cmd/deadcode version pinned in CI (deadcode.yml install step).
+GO_DEADCODE_VERSION := v0.38.0
+
 # Coverage floor (matches the awk assertion in go.yml). The first logic
 # packages (internal/state, internal/state/postgres, internal/boot) measured
 # 92.9% over the production packages with a live Postgres; the floor is
@@ -36,7 +39,7 @@ GREMLINS_VERSION := v0.6.0
 COVERAGE_FLOOR := 91
 
 .PHONY: help build bin dev-secrets test test-race cover spdx contract identity seccomp schema vet fmt \
-        staticcheck lint mutation check
+        staticcheck lint deadcode mutation check
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -157,6 +160,14 @@ lint: ## golangci-lint run — structural meta-linter (.golangci.yml), pinned to
 	fi
 	golangci-lint run --timeout=5m ./...
 
+deadcode: ## deadcode -test ./... — fail on any unreachable function (whole-program), pinned to $(GO_DEADCODE_VERSION)
+	@if ! command -v deadcode >/dev/null 2>&1; then \
+	  echo "deadcode not found — install with:"; \
+	  echo "  go install golang.org/x/tools/cmd/deadcode@$(GO_DEADCODE_VERSION)"; \
+	  exit 1; \
+	fi
+	bash scripts/deadcode-gate.sh
+
 # ── mutation (advisory — NOT part of `make check`) ────────────────────────────
 #
 # Mirrors the mutation.yml CI job: go-gremlins on the pure-logic leaf packages
@@ -207,4 +218,4 @@ seccomp: ## Assert the embedded Docker seccomp profile matches its pinned digest
 # Those exclusions match CI's own gating model: the plain `test` job also
 # loud-skips the gated legs.
 
-check: fmt vet staticcheck lint spdx contract identity seccomp test ## Full local gate (pre-push)
+check: fmt vet staticcheck lint deadcode spdx contract identity seccomp test ## Full local gate (pre-push)

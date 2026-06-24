@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -540,14 +539,4 @@ func TestCloseIdempotentBeforeBind(t *testing.T) {
 	if l.Addr() != "" {
 		t.Fatalf("Addr() before Bind = %q; want empty", l.Addr())
 	}
-}
-
-// errBadVerifier always rejects, so the SOAR transport path can be exercised if a
-// SOAR route is added later; for now it documents the verify-then-mint wiring.
-var _ killswitch.SOARVerifier = errBadVerifier{}
-
-type errBadVerifier struct{}
-
-func (errBadVerifier) Verify(context.Context, []byte, []byte) (state.Identity, error) {
-	return state.Identity{}, errors.New("never verifies")
 }
