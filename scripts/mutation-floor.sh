@@ -19,11 +19,13 @@
 #      tool that "passes" by building nothing must be a failure here, not a pass.
 #      Absence of a score is never a high score.
 #
-# Floors are floor(measured baseline), measured firsthand 2026-06-24:
-# admission 1.000, killswitch 0.839, quota 0.609, registry 0.529. The floors
-# ratchet UP only, never down. The honest-low suites (registry, quota) carry a
-# tracked hardening follow-up (see docs/design-decisions.md) — their floors rise
-# once their suites kill the surviving mutants; they are not silently accepted.
+# Floors are floor(measured), ratcheted UP as suites are hardened (never down).
+# Firsthand 2026-06-24 baselines: admission 1.000, killswitch 0.839, quota 0.609,
+# registry 0.529. registry has since been HARDENED to 1.000 (its 8 surviving
+# mutants killed — the DeriveKey golden/per-field tests and the transient-error
+# propagation tests), so its floor is ratcheted to 1.0. quota stays at 0.6 with a
+# tracked hardening follow-up (see docs/design-decisions.md); its floor rises once
+# its refund-path survivors are killed. A low floor is never silently accepted.
 set -euo pipefail
 
 # go-mutesting writes a report.json into the working dir on each run; remove it
@@ -43,7 +45,7 @@ declare -A FLOOR=(
   [admission]=1.0
   [killswitch]=0.8
   [quota]=0.6
-  [registry]=0.5
+  [registry]=1.0
 )
 
 fail=0

@@ -92,6 +92,50 @@ func TestPropertyNoHintEscapesNamespace(t *testing.T) {
 	})
 }
 
+// TestDeriveKeyGolden pins the EXACT digest DeriveKey produces for a fixed
+// (Tenant, Caller, handle) triple. The distinctness properties above prove keys
+// differ from each other, but they pass even if the length-prefixed pre-image is
+// serialized wrongly (a different prefix width, a dropped field, an un-written
+// length) — every key just shifts together and stays mutually distinct. This
+// golden anchor is the byte-exact witness: the digest is computed independently
+// (sha256 over keyVersion ++ each of Tenant/Caller/handle as an 8-byte big-endian
+// length followed by its bytes), so ANY change to the serialization — the prefix
+// width, the field set, or the length computation — moves the digest and reds
+// this test. It is what makes the pre-image construction (not just its
+// distinctness) load-bearing and mutation-covered.
+func TestDeriveKeyGolden(t *testing.T) {
+	t.Parallel()
+	got := registry.DeriveKey(state.Identity{Tenant: "t-gold", Caller: "c-gold"}, "h-gold").String()
+	const want = "e191b4aeec02b7b0456067f25e9c945e27ebcdd00b8e4ab28f0d9d2103fbc639"
+	if got != want {
+		t.Fatalf("DeriveKey golden digest drift:\n got %q\nwant %q\n"+
+			"(the length-prefixed pre-image serialization changed — prefix width, field set, or length computation)", got, want)
+	}
+}
+
+// TestDeriveKeyEveryFieldIsLoadBearing proves each of the three identity inputs
+// independently changes the key: flipping ONLY the Tenant, ONLY the Caller, or
+// ONLY the handle (holding the other two fixed) must move the digest. A
+// serialization that drops or fails to write any one field would leave that
+// field's mutation undetected — these three assertions kill exactly that mutant
+// class (a writeField call whose effect is nulled).
+func TestDeriveKeyEveryFieldIsLoadBearing(t *testing.T) {
+	t.Parallel()
+	base := registry.DeriveKey(state.Identity{Tenant: "t", Caller: "c"}, "h")
+	tenantFlip := registry.DeriveKey(state.Identity{Tenant: "T", Caller: "c"}, "h")
+	callerFlip := registry.DeriveKey(state.Identity{Tenant: "t", Caller: "C"}, "h")
+	handleFlip := registry.DeriveKey(state.Identity{Tenant: "t", Caller: "c"}, "H")
+	if base == tenantFlip {
+		t.Errorf("flipping Tenant did not change the key — Tenant is not load-bearing in the pre-image")
+	}
+	if base == callerFlip {
+		t.Errorf("flipping Caller did not change the key — Caller is not load-bearing in the pre-image")
+	}
+	if base == handleFlip {
+		t.Errorf("flipping handle did not change the key — handle is not load-bearing in the pre-image")
+	}
+}
+
 // TestCustodianReserveCommitBind exercises the sole-custody wrappers end to end:
 // Reserve, BindContainerName after Commit, and the lookup the owner sees.
 func TestCustodianReserveCommitBind(t *testing.T) {
@@ -321,5 +365,72 @@ func TestReservedAndActiveKeysWithLister(t *testing.T) {
 	}
 	if !sawReserved {
 		t.Fatalf("ReservedAndActiveKeys dropped the RESERVED row")
+	}
+}
+
+// TestLookupForCallerTransientErrorPropagates proves a TRANSIENT store failure is
+// NOT collapsed into the not-addressable refusal. LookupForCaller maps only
+// state.ErrReservationNotFound to ErrNotOwned (so absent and foreign-owned are
+// indistinguishable); any OTHER store error — here ErrStoreUnavailable, surfaced
+// by a cancelled context — must propagate UNCHANGED so a transient backing-store
+// fault is never silently reported as "not yours". Without this, the
+// not-found-branch guard could be widened to swallow every error and the suite
+// would not notice.
+func TestLookupForCallerTransientErrorPropagates(t *testing.T) {
+	t.Parallel()
+	c, _ := newCustodian(t)
+	owner := state.Identity{Tenant: "t1", Caller: "c1"}
+	key := registry.DeriveKey(owner, "h-transient")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // a cancelled context makes the in-memory store fail closed with ErrStoreUnavailable
+
+	_, err := c.LookupForCaller(ctx, key, owner)
+	if !errors.Is(err, state.ErrStoreUnavailable) {
+		t.Fatalf("transient store error: want ErrStoreUnavailable propagated, got %v", err)
+	}
+	if errors.Is(err, registry.ErrNotOwned) {
+		t.Fatalf("a transient store error was collapsed into ErrNotOwned — a backing-store fault must not read as not-addressable")
+	}
+}
+
+// TestReservedAndActiveKeysTransientErrorPropagates proves the enumeration does
+// not swallow a transient lister failure into an empty result. A cancelled
+// context makes the in-memory LiveSessions fail closed with ErrStoreUnavailable;
+// ReservedAndActiveKeys must propagate it (not return nil, nil), because
+// RevokeAll's force-kill-every step treats an empty slice as "no live rows" and a
+// swallowed error would leave a just-reserved session alive.
+func TestReservedAndActiveKeysTransientErrorPropagates(t *testing.T) {
+	t.Parallel()
+	c, _ := newCustodian(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rows, err := c.ReservedAndActiveKeys(ctx)
+	if !errors.Is(err, state.ErrStoreUnavailable) {
+		t.Fatalf("transient enumeration error: want ErrStoreUnavailable propagated, got %v", err)
+	}
+	if rows != nil {
+		t.Fatalf("a transient enumeration error returned %d rows; want nil (no silent empty set)", len(rows))
+	}
+}
+
+// TestEnrichedLiveSessionsTransientErrorPropagates is the same fail-closed
+// propagation for the admin read-API enumeration: a cancelled context makes the
+// enriched lister fail with ErrStoreUnavailable, which EnrichedLiveSessions must
+// propagate rather than swallow into an empty set (the read surface must surface
+// the fault, never render an empty dashboard as if no sessions were live).
+func TestEnrichedLiveSessionsTransientErrorPropagates(t *testing.T) {
+	t.Parallel()
+	c, _ := newCustodian(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	rows, err := c.EnrichedLiveSessions(ctx)
+	if !errors.Is(err, state.ErrStoreUnavailable) {
+		t.Fatalf("transient enriched-enumeration error: want ErrStoreUnavailable propagated, got %v", err)
+	}
+	if rows != nil {
+		t.Fatalf("a transient enriched-enumeration error returned %d rows; want nil", len(rows))
 	}
 }
