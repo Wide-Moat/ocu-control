@@ -1,0 +1,63 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: install vale
+        # Pin the exact version (same go-install pin model as deadcode/go-mutesting):
+        # a floating tool version could flip this gate red/green between two runs of
+        # the same commit. vale is a Go single binary, so the host toolchain is the
+        # only dependency — no Node, no slop-scanner CLI.
+        run: go install github.com/errata-ai/vale/v3/cmd/vale@v3.15.1 # github.com/errata-ai/vale/v3/cmd/vale
+      - name: vale doc-prose gate (banned vocab / AI-slop / AP-13)
+        # Blocking on the canon-critical docs, warning on the auxiliary set. The
+        # .vale.ini and the Architecture style are vendored byte-identical from canon.
+        run: bash scripts/vale-gate.sh
+      - name: vale RED-when-neutered proof
+        # Prove the gate is non-vacuous: it must go RED on planted banned vocabulary.
+        run: bash scripts/vale-redprobe.sh
+      # lychee — forward-reference (relative-link) integrity on tracked .md. lychee is
+      # a Rust standalone (no go-install), so it runs via the SHA-pinned action using
+      # the action's BUNDLED lychee version: its installer only unpacks the flat-layout
+      # tarball, and a newer pin nests the binary and breaks the install step. The
+      # lychee.toml config is written for the bundled version's schema accordingly.
+      - name: lychee (broken links)
+        uses: lycheeverse/lychee-action@8646ba30535128ac92d33dfc9133794bfdd9b411 # v2
+        with:
+          args: >-
+            --config lychee.toml
+            --no-progress
+            --offline
+            'README.md'
+            'CONSTITUTION.md'
+            'CONTRIBUTING.md'
+            'SECURITY.md'
+            'CODE_OF_CONDUCT.md'
+            'CHANGELOG.md'
+            'CLAUDE.md'
+            'docs/**/*.md'
+            'examples/**/*.md'
+          fail: true
+          failIfEmpty: false

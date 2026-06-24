@@ -30,6 +30,12 @@ GO_MUTESTING_VERSION := v0.0.0-20251226130216-48d0401f00fb
 # golang.org/x/tools/cmd/deadcode version pinned in CI (deadcode.yml install step).
 GO_DEADCODE_VERSION := v0.38.0
 
+# errata-ai/vale version pinned in CI (docs.yml install step). vale is a Go single
+# binary, installed with the same go-install pin model as deadcode/go-mutesting —
+# no Node, no slop-scanner CLI. The slop-scanner CLASS was dropped (no vetted
+# Node-free ML detector exists); a deterministic prose banlist is the gate instead.
+VALE_VERSION := v3.15.1
+
 # Coverage floor (matches the awk assertion in go.yml). The first logic
 # packages (internal/state, internal/state/postgres, internal/boot) measured
 # 92.9% over the production packages with a live Postgres; the floor is
@@ -42,7 +48,7 @@ GO_DEADCODE_VERSION := v0.38.0
 COVERAGE_FLOOR := 91
 
 .PHONY: help build bin dev-secrets test test-race cover spdx contract identity seccomp schema vet fmt \
-        staticcheck lint deadcode mutation check
+        staticcheck lint deadcode vale mutation check
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -59,12 +65,13 @@ help: ## Print this target list
 	@printf '  %-20s  %s\n' staticcheck "staticcheck ./..."
 	@printf '  %-20s  %s\n' lint        "golangci-lint run (structural meta-linter, .golangci.yml)"
 	@printf '  %-20s  %s\n' deadcode    "deadcode -test ./... — fail on any unreachable function (whole-program)"
+	@printf '  %-20s  %s\n' vale        "vale doc-prose gate (banned vocab / AI-slop / AP-13) on tracked .md"
 	@printf '  %-20s  %s\n' mutation    "go-mutesting score floor on the pure-logic packages (blocking)"
 	@printf '  %-20s  %s\n' spdx        "scripts/check-spdx.sh"
 	@printf '  %-20s  %s\n' contract    "scripts/check-contract-identity.sh"
 	@printf '  %-20s  %s\n' schema      "ajv compile of every vendored contract schema"
 	@printf '  %-20s  %s\n' identity    "scripts/check-doc-identity.sh"
-	@printf '  %-20s  %s\n' check       "Full local gate: fmt+vet+staticcheck+lint+spdx+contract+identity+test"
+	@printf '  %-20s  %s\n' check       "Full local gate: fmt+vet+staticcheck+lint+deadcode+vale+spdx+contract+identity+test"
 	@echo
 
 # ── build ───────────────────────────────────────────────────────────────────
@@ -172,6 +179,14 @@ deadcode: ## deadcode -test ./... — fail on any unreachable function (whole-pr
 	fi
 	bash scripts/deadcode-gate.sh
 
+vale: ## vale doc-prose gate (banned vocab / AI-slop / AP-13) on tracked .md, pinned to $(VALE_VERSION)
+	@if ! command -v vale >/dev/null 2>&1; then \
+	  echo "vale not found — install with:"; \
+	  echo "  go install github.com/errata-ai/vale/v3/cmd/vale@$(VALE_VERSION)"; \
+	  exit 1; \
+	fi
+	bash scripts/vale-gate.sh
+
 # ── mutation (slower gate — NOT part of `make check`) ─────────────────────────
 #
 # Mirrors the mutation.yml CI job: go-mutesting on the pure-logic leaf packages
@@ -220,4 +235,4 @@ seccomp: ## Assert the embedded Docker seccomp profile matches its pinned digest
 # Those exclusions match CI's own gating model: the plain `test` job also
 # loud-skips the gated legs.
 
-check: fmt vet staticcheck lint deadcode spdx contract identity seccomp test ## Full local gate (pre-push)
+check: fmt vet staticcheck lint deadcode vale spdx contract identity seccomp test ## Full local gate (pre-push)
