@@ -2,82 +2,59 @@
 # Copyright (c) 2025 Open Computer Use Contributors
 name: mutation
 
-# Mutation testing measures assertion strength: it rewrites covered source
-# (a `+` becomes a `-`, a `>` becomes a `>=`, a condition is negated) and
-# re-runs the suite. A mutant the tests still pass on ("LIVED") is a line the
-# suite executes but does not actually assert on — a gap line coverage cannot
-# see. This gate runs go-gremlins (https://github.com/go-gremlins/gremlins)
-# scoped to the pure-logic leaf packages where the signal is highest and the
-# suite is fast: the admission matrix, the row-as-reservation create flow, and
-# the kill-switch / denylist engine. The runtime-provider / control-channel /
-# state-store packages are excluded on purpose — they need a live container
-# backend and a live socket, which would make a mutation run enormous for little
-# added signal over their own integration suites. The scope lives in
-# .gremlins.yaml at the repo root (coverpkg) so it is declared once.
+# GATE 3 (QUAL-03): the mutation-test score floor — a BLOCKING gate on assertion
+# strength. Mutation testing rewrites covered source (a `+` becomes a `-`, a `>`
+# becomes a `>=`, a condition is negated) and re-runs the suite; a mutant the
+# tests still pass on is a line the suite executes but does not assert on — a gap
+# line coverage cannot see. The gate is scoped to the pure-logic leaf packages
+# where the signal is highest and the suite is fast: admission, killswitch, quota,
+# registry.
 #
-# The loop below skips any scoped directory that is absent with a notice
-# rather than failing, so the scope and the tree never have to move in lockstep.
+# The tool is avito-tech/go-mutesting, NOT go-gremlins. go-gremlins is structurally
+# blind on this module: it reads the module name from go.mod line 1, which here is
+# the SPDX comment, so every mutant scored "Not covered" — a phantom 0%. Promoting
+# a gremlins gate to blocking would enforce nothing. go-mutesting builds and mutates
+# correctly on this toolchain, so the gate is promoted on it; the unfreeze trigger
+# was always "go-mutesting green", never "gremlins fixes parsing".
 #
-# ADVISORY (continue-on-error: true) for now. gremlins is slow and its
-# coverage-to-mutant position matching is not yet reliable on this repo's Go
-# toolchain — it can report covered lines as "NOT COVERED", which would make a
-# blocking threshold meaningless. Running it advisory surfaces the efficacy
-# summary in the job log without gating merges.
-#
-# Ratchet plan: once gremlins reports a stable, correct efficacy figure on the
-# pinned Go toolchain, set unleash.threshold.efficacy /
-# unleash.threshold.mutant-coverage in .gremlins.yaml to floor(baseline) and
-# drop continue-on-error below so a regression in assertion strength fails the
-# gate.
+# go-mutesting has inverted terminology (PASS = mutant killed = good), no built-in
+# threshold, and exits 0 regardless of score, so scripts/mutation-floor.sh parses
+# the score line and fails below a per-package floor — and fails CLOSED on a
+# no-score run (the anti-gremlins guard: a tool that "passes" by mutating nothing
+# is a failure, not a pass). This job is BLOCKING (no continue-on-error): a
+# regression in assertion strength below floor fails the merge.
 
 on:
   pull_request:
     branches: [main]
+  push:
+    branches: [main]
   schedule:
-    # Weekly, Monday 03:00 UTC — keeps a baseline visible even when no PR has
-    # run it recently, without putting a slow job on the hot push-to-main path.
+    # Weekly, Monday 03:00 UTC — a drift canary that keeps the score visible even
+    # when no PR has run it recently.
     - cron: '0 3 * * 1'
 
 permissions:
   contents: read
 
 concurrency:
-  # Advisory job — safe to cancel a superseded run on the same ref.
+  # Blocking job: let a superseded run complete its verdict on its own ref rather
+  # than cancelling it (matches the go.yml blocking-job posture).
   group: mutation-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  gremlins:
+  mutation:
     runs-on: ubuntu-latest
-    # ADVISORY: never blocks merge. See the ratchet plan in the header before
-    # removing this line.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version-file: go.mod
-      - name: install go-gremlins (pinned)
-        # Pinned to the v0.6.0 release commit
-        # (e05b1d47b8c55748e50abc28ff6b132c536bacca). The bare module version is
-        # acceptable here because go install resolves it to that immutable commit
-        # via the checksum database; the comment records the SHA for auditors.
-        run: go install github.com/go-gremlins/gremlins/cmd/gremlins@v0.6.0
-      - name: gremlins unleash (pure-logic packages — advisory)
-        # gremlins unleash takes a single path argument (the files to mutate),
-        # so the scoped packages are run in a loop. The coverpkg scope is read
-        # from .gremlins.yaml at the repo root. The job is advisory
-        # (continue-on-error above), so this step emits the per-package
-        # efficacy/coverage summary and never fails the run. A package dir that
-        # does not exist yet is skipped with a warning, not a failure.
-        run: |
-          set -u
-          for pkg in ./internal/admission/ ./internal/registry/ ./internal/quota/ ./internal/killswitch/; do
-            if [ ! -d "$pkg" ]; then
-              echo "::notice::$pkg does not exist; skipping"
-              continue
-            fi
-            echo "::group::gremlins unleash $pkg"
-            gremlins unleash "$pkg" || echo "::warning::gremlins reported a non-zero exit for $pkg (advisory)"
-            echo "::endgroup::"
-          done
+      - name: install go-mutesting
+        # No semver tag exists upstream, so the commit pseudo-version IS the pin
+        # (commit 48d0401f00fb). go install resolves it to that immutable commit
+        # via the checksum database (T-07-08).
+        run: go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@v0.0.0-20251226130216-48d0401f00fb
+      - name: mutation score floor (blocking)
+        run: bash scripts/mutation-floor.sh

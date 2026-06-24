@@ -21,8 +21,11 @@ STATICCHECK_VERSION := 2026.1
 # golangci-lint version pinned in CI (go.yml golangci job + go install fallback).
 GOLANGCI_LINT_VERSION := v2.12.2
 
-# go-gremlins mutation tester version pinned in CI (mutation.yml install step).
-GREMLINS_VERSION := v0.6.0
+# avito-tech/go-mutesting mutation tester version pinned in CI (mutation.yml
+# install step). No semver tag exists upstream, so the commit pseudo-version IS
+# the pin (commit 48d0401f00fb). go-mutesting replaced go-gremlins, which is
+# structurally blind on this module's comment-led go.mod (it scored a phantom 0%).
+GO_MUTESTING_VERSION := v0.0.0-20251226130216-48d0401f00fb
 
 # golang.org/x/tools/cmd/deadcode version pinned in CI (deadcode.yml install step).
 GO_DEADCODE_VERSION := v0.38.0
@@ -55,7 +58,8 @@ help: ## Print this target list
 	@printf '  %-20s  %s\n' vet         "go vet ./..."
 	@printf '  %-20s  %s\n' staticcheck "staticcheck ./..."
 	@printf '  %-20s  %s\n' lint        "golangci-lint run (structural meta-linter, .golangci.yml)"
-	@printf '  %-20s  %s\n' mutation    "go-gremlins mutation test (advisory) on the pure-logic packages"
+	@printf '  %-20s  %s\n' deadcode    "deadcode -test ./... — fail on any unreachable function (whole-program)"
+	@printf '  %-20s  %s\n' mutation    "go-mutesting score floor on the pure-logic packages (blocking)"
 	@printf '  %-20s  %s\n' spdx        "scripts/check-spdx.sh"
 	@printf '  %-20s  %s\n' contract    "scripts/check-contract-identity.sh"
 	@printf '  %-20s  %s\n' schema      "ajv compile of every vendored contract schema"
@@ -168,26 +172,24 @@ deadcode: ## deadcode -test ./... — fail on any unreachable function (whole-pr
 	fi
 	bash scripts/deadcode-gate.sh
 
-# ── mutation (advisory — NOT part of `make check`) ────────────────────────────
+# ── mutation (slower gate — NOT part of `make check`) ─────────────────────────
 #
-# Mirrors the mutation.yml CI job: go-gremlins on the pure-logic leaf packages
-# (admission, registry, quota, killswitch). Mutation testing measures assertion
-# strength — it rewrites covered source and re-runs the suite; a mutant the
-# tests still pass on is a line executed but not asserted on, which line
-# coverage cannot see. The coverpkg scope is read from .gremlins.yaml at the
-# repo root and the path loop below must stay in agreement with it. Advisory and
-# deliberately excluded from `make check`.
+# Mirrors the mutation.yml CI job: go-mutesting on the pure-logic leaf packages
+# (admission, killswitch, quota, registry). Mutation testing measures assertion
+# strength — it rewrites covered source and re-runs the suite; a mutant the tests
+# still pass on is a line executed but not asserted on, which line coverage cannot
+# see. scripts/mutation-floor.sh enforces a per-package score floor and fails
+# closed on a no-score run (the anti-gremlins guard). It stays its own slower
+# target, deliberately excluded from `make check`. (go-gremlins was retired: it is
+# structurally blind on this module's comment-led go.mod.)
 
-mutation: ## go-gremlins mutation test (advisory) on admission/registry/quota/killswitch — pinned to $(GREMLINS_VERSION)
-	@if ! command -v gremlins >/dev/null 2>&1; then \
-	  echo "gremlins not found — install with:"; \
-	  echo "  go install github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)"; \
+mutation: ## go-mutesting score floor on the pure-logic packages (blocking) — pinned to $(GO_MUTESTING_VERSION)
+	@if ! command -v go-mutesting >/dev/null 2>&1; then \
+	  echo "go-mutesting not found — install with:"; \
+	  echo "  go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@$(GO_MUTESTING_VERSION)"; \
 	  exit 1; \
 	fi
-	@for pkg in ./internal/admission/ ./internal/registry/ ./internal/quota/ ./internal/killswitch/; do \
-	  echo "--- gremlins unleash $$pkg ---"; \
-	  gremlins unleash "$$pkg" || echo "gremlins reported a non-zero exit for $$pkg (advisory)"; \
-	done
+	bash scripts/mutation-floor.sh
 
 # ── checks ───────────────────────────────────────────────────────────────────
 

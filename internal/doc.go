@@ -73,6 +73,6 @@
 //	internal/killswitch      — the host-initiated revoke engine (one/all), audit-first
 //	                           fail-closed, reachable only on the operator scope.
 //
-// The coverage floor and the mutation scope (.gremlins.yaml) are declared
-// against these paths so they ratchet as the code changes.
+// The coverage floor and the mutation scope (scripts/mutation-floor.sh) are
+// declared against these paths so they ratchet as the code changes.
 package internal
