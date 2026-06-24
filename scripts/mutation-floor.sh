@@ -23,9 +23,18 @@
 # Firsthand 2026-06-24 baselines: admission 1.000, killswitch 0.839, quota 0.609,
 # registry 0.529. registry has since been HARDENED to 1.000 (its 8 surviving
 # mutants killed — the DeriveKey golden/per-field tests and the transient-error
-# propagation tests), so its floor is ratcheted to 1.0. quota stays at 0.6 with a
-# tracked hardening follow-up (see docs/design-decisions.md); its floor rises once
-# its refund-path survivors are killed. A low floor is never silently accepted.
+# propagation tests), so its floor is ratcheted to 1.0. quota has since been
+# HARDENED to 0.804 — its load-bearing refund-path survivors killed via a
+# recording+faulting Store fixture (first-refund-error capture/return, first-not-
+# last error identity, RefundConcurrent store-error propagation, and the exact
+# refund delta/limit each compensator issues, which the saturating in-memory Store
+# otherwise masks) — so its floor is ratcheted 0.6 -> 0.8. The 9 remaining quota
+# survivors are equivalent or brittle (negative-delta limit-arg mutants the Store
+# never refuses; the unwindStepTimeout const; the unexported empty-Receipt guard
+# unreachable through the public API; dayWindow truncation masked by a date-only
+# layout on an unwired later-phase function) and are deliberately not chased — a
+# low floor is never silently accepted, but neither is a cosmetic one bought with
+# brittle over-fitting.
 set -euo pipefail
 
 # go-mutesting writes a report.json into the working dir on each run; remove it
@@ -44,7 +53,7 @@ fi
 declare -A FLOOR=(
   [admission]=1.0
   [killswitch]=0.8
-  [quota]=0.6
+  [quota]=0.8
   [registry]=1.0
 )
 

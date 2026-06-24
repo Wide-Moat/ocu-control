@@ -6,6 +6,8 @@ package quota_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,62 @@ import (
 // gateStart is the fixed instant the quota tests anchor their FakeClock on, so
 // the per-minute window label is reproducible across runs.
 var gateStart = time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
+
+// errChargeInjected is the sentinel a faulting Charge returns, so a test can
+// assert by identity that the refund path surfaced THIS error and not some other.
+var errChargeInjected = errors.New("quota_test: injected Charge fault")
+
+// chargeRecord captures one Charge call's arguments. The refund paths saturate at
+// zero in the in-memory Store, so the OBSERVABLE counter cannot distinguish a
+// correct refund (delta -1, limit 0) from an over-refund (delta -2) or a mutated
+// limit arg — the mutation is masked by saturation. Recording the exact triple a
+// refund issued lets a test pin the delta the compensator actually charged, which
+// is the only way to kill the delta-magnitude mutants on the refund path.
+type chargeRecord struct {
+	Key   state.QuotaKey
+	Delta int64
+	Limit int64
+}
+
+// chargeRecorderStore wraps an in-memory Store, records every Charge it forwards,
+// and can optionally fault negative-delta (refund) charges so the refund-error
+// paths are exercised. It is a single fixture covering both gaps the refund path
+// leaves: delta-magnitude (via Records) and error-propagation (via failNegCharge).
+type chargeRecorderStore struct {
+	state.Store
+	records       []chargeRecord
+	failNegCharge bool // when set, every negative-delta (refund) Charge returns errChargeInjected
+}
+
+func (s *chargeRecorderStore) Charge(ctx context.Context, key state.QuotaKey, delta, limit int64) (int64, error) {
+	s.records = append(s.records, chargeRecord{Key: key, Delta: delta, Limit: limit})
+	if s.failNegCharge && delta < 0 {
+		return 0, errChargeInjected
+	}
+	return s.Store.Charge(ctx, key, delta, limit)
+}
+
+// negativeDeltaRecords returns only the refund (negative-delta) Charge records, in
+// the order they were issued — the create-path positive charges are filtered out
+// so a refund assertion is not confused by the preceding +1 charges.
+func (s *chargeRecorderStore) negativeDeltaRecords() []chargeRecord {
+	var out []chargeRecord
+	for _, r := range s.records {
+		if r.Delta < 0 {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// newRecorderGate builds a Gate over a chargeRecorderStore (itself over a fresh
+// in-memory Store), returning both so a test can drive the gate and then inspect
+// the exact Charge triples the refund path issued.
+func newRecorderGate(t *testing.T, clk state.Clock, limits quota.Limits) (*quota.Gate, *chargeRecorderStore) {
+	t.Helper()
+	rec := &chargeRecorderStore{Store: state.NewInMemory(clk)}
+	return quota.NewGate(rec, clk, limits), rec
+}
 
 // readOnlyForbiddenStore wraps an in-memory Store and FAILS the test if ReadQuota
 // is consulted on the gate path: a Read-then-Charge is the forbidden TOCTOU, so
@@ -359,4 +417,191 @@ func TestPropertyQuotaNoOvercommit(t *testing.T) {
 			}
 		}
 	})
+}
+
+// TestReceiptApplyReturnsFirstRefundError proves Receipt.Apply CAPTURES and RETURNS
+// a refund error rather than discarding it. A faulting Store fails the negative-delta
+// refund Charge; Apply must surface the injected error (wrapped). The earlier
+// TestReceiptApplyRefundsBothCells only asserts the happy-path counter reaches zero,
+// so the error-capture assignment was never load-bearing — a mutant that drops the
+// firstErr assignment survived. This pins the return contract.
+func TestReceiptApplyReturnsFirstRefundError(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 10})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	rcpt, err := g.ChargeCreate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ChargeCreate: %v", err)
+	}
+	// Fault the refund: every negative-delta Charge now errors.
+	rec.failNegCharge = true
+
+	err = rcpt.Apply(context.Background())
+	if err == nil {
+		t.Fatalf("Receipt.Apply: returned nil despite a failing refund Charge; the refund error was swallowed")
+	}
+	if !errors.Is(err, errChargeInjected) {
+		t.Fatalf("Receipt.Apply: error %v does not wrap the injected Charge fault", err)
+	}
+}
+
+// TestReceiptApplyReturnsFirstNotLastRefundError proves Apply returns the FIRST
+// refund error and keeps attempting the remaining cells (the "first error after
+// trying every remaining cell" contract). With BOTH cells faulting, Apply must
+// still issue a Charge for every cell (so one slow/failing cell cannot block the
+// rest) yet return only the first captured error — pinning the firstErr==nil guard
+// that a mutant relaxed to `true` (which would overwrite with the LAST error).
+func TestReceiptApplyReturnsFirstNotLastRefundError(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 10})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	rcpt, err := g.ChargeCreate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ChargeCreate: %v", err)
+	}
+	rec.failNegCharge = true
+	// Reset the record log so we count only the refund attempts.
+	rec.records = nil
+
+	if err := rcpt.Apply(context.Background()); err == nil {
+		t.Fatalf("Receipt.Apply: returned nil despite failing refunds")
+	}
+	// Every recorded cell must have been attempted even though the first one failed:
+	// a Receipt from ChargeCreate holds two cells, so two refund Charges must fire.
+	refunds := rec.negativeDeltaRecords()
+	if len(refunds) != 2 {
+		t.Fatalf("Receipt.Apply issued %d refund charges, want 2 (a failing cell must not abort the rest)", len(refunds))
+	}
+	// The first-vs-last error identity is asserted in TestReceiptApplyReturnsFirstErrorByDim;
+	// here the contract under test is only that a failing cell does not abort the rest.
+}
+
+// TestReceiptApplyReturnsFirstErrorByDim sharpens the first-not-last contract: it
+// asserts the returned error names the FIRST-refunded cell's dimension (the
+// concurrent level cell, refunded first because refunds run in reverse of charge
+// order). A mutant that relaxes `firstErr == nil` to `true` overwrites firstErr on
+// every iteration, so the returned error would name the create-rate dim instead —
+// this asserts the dim and kills that mutant directly.
+func TestReceiptApplyReturnsFirstErrorByDim(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 10})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	rcpt, err := g.ChargeCreate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ChargeCreate: %v", err)
+	}
+	rec.failNegCharge = true
+
+	err = rcpt.Apply(context.Background())
+	if err == nil {
+		t.Fatalf("Receipt.Apply: nil error despite failing refunds")
+	}
+	// The first cell refunded is the LAST cell charged: the concurrent (level) cell.
+	// The error message embeds its dim. If the first-error guard were relaxed, the
+	// final (create-rate) dim would win instead.
+	wantDim := fmt.Sprintf("dim=%d", state.DimConcurrentSessions)
+	dontWantDim := fmt.Sprintf("dim=%d", state.DimCallerCreateRate)
+	if msg := err.Error(); !strings.Contains(msg, wantDim) || strings.Contains(msg, dontWantDim) {
+		t.Fatalf("Receipt.Apply error = %q; want it to name the FIRST-refunded cell %q, not the last %q", msg, wantDim, dontWantDim)
+	}
+}
+
+// TestRefundConcurrentPropagatesStoreError proves RefundConcurrent surfaces a
+// non-quota Store failure (its sole error path — a negative delta is never quota-
+// refused) rather than swallowing it. TestRefundConcurrentDecrementsAndSaturates
+// only exercised the happy path, so the `return fmt.Errorf(...)` was never asserted
+// and a mutant that drops it survived. This pins the propagation contract the
+// destroy path and the boot reconciler both rely on to log a stranded counter.
+func TestRefundConcurrentPropagatesStoreError(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 10})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	rec.failNegCharge = true // RefundConcurrent's decrement is a negative-delta Charge
+	err := g.RefundConcurrent(context.Background(), id)
+	if err == nil {
+		t.Fatalf("RefundConcurrent: returned nil despite a failing Charge; the store error was swallowed")
+	}
+	if !errors.Is(err, errChargeInjected) {
+		t.Fatalf("RefundConcurrent: error %v does not wrap the injected Charge fault", err)
+	}
+}
+
+// TestRefundConcurrentChargesExactlyMinusOne pins the EXACT refund delta and limit
+// RefundConcurrent issues: a single -1 charge with limit 0 (saturate, never refuse).
+// The in-memory Store saturates at zero, so a mutated delta (-1 -> -2) or limit (0
+// -> 1) is invisible in the counter — only inspecting the issued triple kills those
+// mutants. It returns precisely one slot, no more, against the level cell.
+func TestRefundConcurrentChargesExactlyMinusOne(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 10})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	rec.records = nil // isolate the refund charge
+	if err := g.RefundConcurrent(context.Background(), id); err != nil {
+		t.Fatalf("RefundConcurrent: %v", err)
+	}
+	refunds := rec.negativeDeltaRecords()
+	if len(refunds) != 1 {
+		t.Fatalf("RefundConcurrent issued %d negative charges, want exactly 1", len(refunds))
+	}
+	r := refunds[0]
+	if r.Delta != -1 {
+		t.Fatalf("RefundConcurrent delta = %d, want -1 (one slot, never more)", r.Delta)
+	}
+	if r.Limit != 0 {
+		t.Fatalf("RefundConcurrent limit = %d, want 0 (negative delta saturates, never refuses)", r.Limit)
+	}
+	if r.Key.Dim != state.DimConcurrentSessions {
+		t.Fatalf("RefundConcurrent dim = %d, want DimConcurrentSessions", r.Key.Dim)
+	}
+}
+
+// TestReceiptApplyChargesExactChargedDeltaPerCell pins the per-cell refund delta
+// the unwind compensator issues: each cell is refunded by EXACTLY the negation of
+// what was charged (-1), not more. A mutant that records Delta:2 in the Receipt (or
+// negates to -2 on the Charge) over-refunds, which the saturating Store hides at a
+// counter of 1 — so this inspects the issued triples instead. Refunds run in
+// reverse charge order: concurrent first, then create-rate.
+func TestReceiptApplyChargesExactChargedDeltaPerCell(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 10})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	rcpt, err := g.ChargeCreate(context.Background(), id)
+	if err != nil {
+		t.Fatalf("ChargeCreate: %v", err)
+	}
+	rec.records = nil // isolate the two refund charges from the two create charges
+	if err := rcpt.Apply(context.Background()); err != nil {
+		t.Fatalf("Receipt.Apply: %v", err)
+	}
+	refunds := rec.negativeDeltaRecords()
+	if len(refunds) != 2 {
+		t.Fatalf("Receipt.Apply issued %d refund charges, want 2 (one per charged cell)", len(refunds))
+	}
+	// Reverse charge order: concurrent (level) cell first, then create-rate.
+	if refunds[0].Key.Dim != state.DimConcurrentSessions {
+		t.Fatalf("first refund dim = %d, want DimConcurrentSessions (reverse order)", refunds[0].Key.Dim)
+	}
+	if refunds[1].Key.Dim != state.DimCallerCreateRate {
+		t.Fatalf("second refund dim = %d, want DimCallerCreateRate (reverse order)", refunds[1].Key.Dim)
+	}
+	for i, r := range refunds {
+		if r.Delta != -1 {
+			t.Fatalf("refund[%d] delta = %d, want -1 (exactly the negation of the +1 charged)", i, r.Delta)
+		}
+		if r.Limit != 0 {
+			t.Fatalf("refund[%d] limit = %d, want 0 (negative delta saturates)", i, r.Limit)
+		}
+	}
 }
