@@ -52,8 +52,11 @@ const (
 	// creates its exec UDS here (bound RW at /run/ocu inside the guest).
 	sockDirName = "sock"
 
-	// guestContainerInfoPath is the absolute guest mountpoint for container_info.json.
-	guestContainerInfoPath = "/etc/ocu/container_info.json"
+	// guestContainerInfoPath is the absolute in-guest mountpoint for
+	// container_info.json: the guest image's hardcoded default-read path, which is
+	// the filesystem root. The guest reads container_info.json from root with no
+	// override supplied, so this is both the bind TARGET and the guest read path.
+	guestContainerInfoPath = "/container_info.json"
 	// guestPublicKeyPath is the absolute guest mountpoint for the public key. It is
 	// the fleet-canon in-guest path the guest image declares and the sandbox's own
 	// host-side driver also binds to (the guest-image INTEGRATION.md contract +
@@ -193,11 +196,13 @@ func (s *fsStager) Stage(ctx context.Context, name runtime.SessionName, pubKey [
 
 	return Staged{
 		Material: runtime.HandoffMaterial{
-			ContainerInfoJSON: containerInfoFor(name),
-			ContainerInfoPath: guestContainerInfoPath,
-			PublicKeyEd25519:  keyCopy,
-			PublicKeyPath:     guestPublicKeyPath,
-			HostSockDir:       sockDir,
+			ContainerInfoJSON:      containerInfoFor(name),
+			ContainerInfoHostPath:  infoPath,
+			ContainerInfoGuestPath: guestContainerInfoPath,
+			PublicKeyEd25519:       keyCopy,
+			PublicKeyHostPath:      keyPath,
+			PublicKeyGuestPath:     guestPublicKeyPath,
+			HostSockDir:            sockDir,
 		},
 		Root: root,
 	}, nil

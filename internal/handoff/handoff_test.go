@@ -33,8 +33,8 @@ func newStager(t *testing.T) handoff.Stager {
 }
 
 // TestStageWritesAllArtifacts proves a successful Stage writes container_info.json,
-// the 32-byte public key, and the 0700 sock dir, and returns material pointing at
-// the guest mountpoints.
+// the 32-byte public key, and the 0700 sock dir, and returns material carrying both
+// the host-source and the guest-target path for each bound artifact.
 func TestStageWritesAllArtifacts(t *testing.T) {
 	t.Parallel()
 	s := newStager(t)
@@ -48,12 +48,15 @@ func TestStageWritesAllArtifacts(t *testing.T) {
 		t.Fatalf("Stage returned empty Root")
 	}
 
-	// The material carries the raw 32-byte key and the guest paths.
+	// The material carries the raw 32-byte key and both the host-source and
+	// guest-target paths for each bound artifact.
 	if len(st.Material.PublicKeyEd25519) != ed25519.PublicKeySize {
 		t.Fatalf("material public key = %d bytes, want %d", len(st.Material.PublicKeyEd25519), ed25519.PublicKeySize)
 	}
-	if st.Material.ContainerInfoPath == "" || st.Material.PublicKeyPath == "" || st.Material.HostSockDir == "" {
-		t.Fatalf("material has an empty mountpoint: %+v", st.Material)
+	if st.Material.ContainerInfoHostPath == "" || st.Material.ContainerInfoGuestPath == "" ||
+		st.Material.PublicKeyHostPath == "" || st.Material.PublicKeyGuestPath == "" ||
+		st.Material.HostSockDir == "" {
+		t.Fatalf("material has an empty path field: %+v", st.Material)
 	}
 
 	// The sock dir exists on disk at 0700.

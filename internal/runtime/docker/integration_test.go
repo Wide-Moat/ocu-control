@@ -80,9 +80,11 @@ func itStageDir(t *testing.T) string {
 
 // itSpec builds a real, validateSpec-passing SessionSpec backed by on-disk host
 // files (the info JSON, the 32-byte public key, and the 0700 sock dir), so the
-// three HOST-01 binds resolve against a real daemon. The image runs a long sleep
-// so the container stays up for inspection. The staging directory is cleaned up
-// automatically.
+// three HOST-01 binds resolve against a real daemon: the bind SOURCES are the real
+// staged temp files and the bind TARGETS are the in-guest mountpoints (the guest
+// root for container_info, /etc/ocu for the key), so source and target differ as
+// they do in production. The image runs a long sleep so the container stays up for
+// inspection. The staging directory is cleaned up automatically.
 func itSpec(t *testing.T, name runtime.SessionName) runtime.SessionSpec {
 	t.Helper()
 	dir := itStageDir(t)
@@ -123,11 +125,13 @@ func itSpec(t *testing.T, name runtime.SessionName) runtime.SessionSpec {
 			PidsLimit:   &pids,
 		},
 		Handoff: runtime.HandoffMaterial{
-			ContainerInfoJSON: []byte(`{"session":"` + string(name) + `"}`),
-			ContainerInfoPath: infoPath,
-			PublicKeyEd25519:  []byte(pub),
-			PublicKeyPath:     keyPath,
-			HostSockDir:       sockDir,
+			ContainerInfoJSON:      []byte(`{"session":"` + string(name) + `"}`),
+			ContainerInfoHostPath:  infoPath,
+			ContainerInfoGuestPath: "/container_info.json",
+			PublicKeyEd25519:       []byte(pub),
+			PublicKeyHostPath:      keyPath,
+			PublicKeyGuestPath:     "/etc/ocu/auth_public_key",
+			HostSockDir:            sockDir,
 		},
 	}
 }
@@ -184,8 +188,10 @@ func TestIT_MaterializeAndInspect(t *testing.T) {
 	if len(ci.HostConfig.PortBindings) != 0 {
 		t.Errorf("no host port must be published, got %v", ci.HostConfig.PortBindings)
 	}
-	// The three bind destinations are present as inspected mountpoints.
-	wantDests := []string{spec.Handoff.ContainerInfoPath, spec.Handoff.PublicKeyPath, "/run/ocu"}
+	// The three bind destinations (the in-guest TARGETS) are present as inspected
+	// mountpoints: container_info at the guest root default path, the key at the
+	// fleet-canon /etc/ocu path, and the sock dir at /run/ocu.
+	wantDests := []string{spec.Handoff.ContainerInfoGuestPath, spec.Handoff.PublicKeyGuestPath, "/run/ocu"}
 	for _, d := range wantDests {
 		if !hasMountDest(ci.Mounts, d) {
 			t.Errorf("expected a mount at %q, mounts=%+v", d, ci.Mounts)

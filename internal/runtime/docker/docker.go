@@ -417,7 +417,9 @@ func validateSpec(spec runtime.SessionSpec) error {
 	if !spec.Egress.DefaultDeny {
 		return fmt.Errorf("docker: egress policy is not deny-default: %w", runtime.ErrUnsupportedSpec)
 	}
-	if spec.Handoff.ContainerInfoPath == "" || spec.Handoff.PublicKeyPath == "" || spec.Handoff.HostSockDir == "" {
+	if spec.Handoff.ContainerInfoHostPath == "" || spec.Handoff.ContainerInfoGuestPath == "" ||
+		spec.Handoff.PublicKeyHostPath == "" || spec.Handoff.PublicKeyGuestPath == "" ||
+		spec.Handoff.HostSockDir == "" {
 		return fmt.Errorf("docker: missing HOST-01 bind path: %w", runtime.ErrUnsupportedSpec)
 	}
 	return nil
@@ -441,12 +443,13 @@ func validateSpec(spec runtime.SessionSpec) error {
 //     (buildHostConfig) without naming it on the Cmd is exactly as unauthenticated as
 //     not binding it. This is the latent hole behind a listener-only fix.
 //
-// The --auth-public-key value is the SAME spec.Handoff.PublicKeyPath buildHostConfig
-// binds :ro (single source — never a hardcoded literal), so the path the guest is
-// told to read the key from can never drift from the path the host actually mounts.
-// validateSpec has already forced a non-empty PublicKeyPath and a 32-byte key before
-// this runs, so the Cmd can never carry an empty key value. The socket paths derive
-// from the same guestSockDir mountpoint buildHostConfig binds RW at /run/ocu.
+// The --auth-public-key value is the SAME spec.Handoff.PublicKeyGuestPath that is
+// the bind TARGET buildHostConfig mounts the key :ro at (single source — never a
+// hardcoded literal), so the path the guest is told to read the key from can never
+// drift from the in-guest path the host actually mounts it at. validateSpec has
+// already forced a non-empty PublicKeyGuestPath and a 32-byte key before this runs,
+// so the Cmd can never carry an empty key value. The socket paths derive from the
+// same guestSockDir mountpoint buildHostConfig binds RW at /run/ocu.
 //
 // This protects CONSTITUTION invariant V / the host-derived identity binding
 // (NFR-SEC-43): a guest that never verifies the Session JWT cannot enforce the
@@ -465,7 +468,7 @@ func buildContainerConfig(spec runtime.SessionSpec) *container.Config {
 		Cmd: []string{
 			"--listen-uds", guestSockDir + "/" + execSockName,
 			"--control-listen-uds", guestSockDir + "/" + controlSockName,
-			"--auth-public-key", spec.Handoff.PublicKeyPath,
+			"--auth-public-key", spec.Handoff.PublicKeyGuestPath,
 		},
 		Labels: map[string]string{
 			labelManaged:      managedLabelValue,
@@ -504,13 +507,18 @@ func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier) (*conta
 
 	// The THREE binds: container_info.json (:ro), the 32-byte Ed25519 PUBLIC key
 	// (:ro), and the host-owned 0700 sock dir mounted RW at guestSockDir (no :ro).
-	// The guest creates the exec UDS inside the RW dir; the provider never pre-creates
-	// the socket. The mountpoint is the SAME guestSockDir const the guest's listener
-	// Cmd flags derive their socket paths from (buildContainerConfig), so the bind
-	// target and the --listen-uds value can never drift.
+	// Each bind is "host-source:guest-target": the SOURCE is the per-session host
+	// path the Stager actually wrote (a real path on the host — a missing source
+	// would be silently auto-created as an empty dir, breaking guest boot), and the
+	// TARGET is the in-guest mountpoint the guest reads from. The guest creates the
+	// exec UDS inside the RW sock dir; the provider never pre-creates the socket.
+	// The sock-dir target is the SAME guestSockDir const the guest's listener Cmd
+	// flags derive their socket paths from (buildContainerConfig), so the bind
+	// target and the --listen-uds value can never drift; likewise the public-key
+	// target equals the --auth-public-key value.
 	binds := []string{
-		spec.Handoff.ContainerInfoPath + ":" + spec.Handoff.ContainerInfoPath + ":ro",
-		spec.Handoff.PublicKeyPath + ":" + spec.Handoff.PublicKeyPath + ":ro",
+		spec.Handoff.ContainerInfoHostPath + ":" + spec.Handoff.ContainerInfoGuestPath + ":ro",
+		spec.Handoff.PublicKeyHostPath + ":" + spec.Handoff.PublicKeyGuestPath + ":ro",
 		spec.Handoff.HostSockDir + ":" + guestSockDir,
 	}
 

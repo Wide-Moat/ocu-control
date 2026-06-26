@@ -43,11 +43,13 @@ func validSpec() runtime.SessionSpec {
 			PidsLimit:   &pids,
 		},
 		Handoff: runtime.HandoffMaterial{
-			ContainerInfoJSON: []byte(`{"k":"v"}`),
-			ContainerInfoPath: "/etc/ocu/container_info.json",
-			PublicKeyEd25519:  pub,
-			PublicKeyPath:     "/etc/ocu/auth_public_key",
-			HostSockDir:       "/var/run/ocu/sess-a",
+			ContainerInfoJSON:      []byte(`{"k":"v"}`),
+			ContainerInfoHostPath:  "/var/run/ocu/sess-a/container_info.json",
+			ContainerInfoGuestPath: "/container_info.json",
+			PublicKeyEd25519:       pub,
+			PublicKeyHostPath:      "/var/run/ocu/sess-a/auth_public_key",
+			PublicKeyGuestPath:     "/etc/ocu/auth_public_key",
+			HostSockDir:            "/var/run/ocu/sess-a/sock",
 		},
 	}
 }
@@ -119,11 +121,14 @@ func TestBuildHostConfig_HOST01(t *testing.T) {
 		t.Errorf("Tmpfs[/tmp]: want rw,noexec,nosuid,nodev,size=64m, got %q", got)
 	}
 
-	// Exactly THREE binds with the right :ro / RW(:/run/ocu) suffixes.
+	// Exactly THREE binds, each "host-source:guest-target[:ro]": the SOURCE is the
+	// per-session host path the Stager wrote, the TARGET is the in-guest mountpoint.
+	// The info target is the guest's root default-read path; the key target is the
+	// fleet-canon /etc/ocu path; the sock dir is RW at /run/ocu (no :ro).
 	wantBinds := []string{
-		"/etc/ocu/container_info.json:/etc/ocu/container_info.json:ro",
-		"/etc/ocu/auth_public_key:/etc/ocu/auth_public_key:ro",
-		"/var/run/ocu/sess-a:/run/ocu",
+		"/var/run/ocu/sess-a/container_info.json:/container_info.json:ro",
+		"/var/run/ocu/sess-a/auth_public_key:/etc/ocu/auth_public_key:ro",
+		"/var/run/ocu/sess-a/sock:/run/ocu",
 	}
 	if len(hc.Binds) != 3 {
 		t.Fatalf("Binds: want 3, got %d (%v)", len(hc.Binds), hc.Binds)
@@ -283,8 +288,8 @@ func valueAfterFlag(argv []string, flag string) (string, bool) {
 // admission. Mounting the key (buildHostConfig binds it :ro) but omitting the flag
 // is exactly as unauthenticated as not mounting it at all. The prod create path must
 // therefore ALWAYS emit --auth-public-key, and its value must be the SAME
-// spec.Handoff.PublicKeyPath docker.go binds :ro (single source — NOT a hardcoded
-// literal, NOT empty). This guards CONSTITUTION invariant V (the host-derived
+// spec.Handoff.PublicKeyGuestPath docker.go binds the key :ro AT (single source —
+// NOT a hardcoded literal, NOT empty). This guards CONSTITUTION invariant V (the host-derived
 // identity binding, NFR-SEC-43): a guest that never verifies the JWT cannot enforce
 // the host-attested caller identity the Session JWT carries.
 func TestBuildContainerConfigCmd_CarriesAuthPublicKey(t *testing.T) {
@@ -295,21 +300,21 @@ func TestBuildContainerConfigCmd_CarriesAuthPublicKey(t *testing.T) {
 	if !ok {
 		t.Fatalf("Cmd is missing --auth-public-key (keyless fail-OPEN: the guest never checks Session JWT signatures): got %v", cfg.Cmd)
 	}
-	if val != spec.Handoff.PublicKeyPath {
-		t.Errorf("--auth-public-key value: want spec.Handoff.PublicKeyPath %q (single source, the same path bound :ro), got %q",
-			spec.Handoff.PublicKeyPath, val)
+	if val != spec.Handoff.PublicKeyGuestPath {
+		t.Errorf("--auth-public-key value: want spec.Handoff.PublicKeyGuestPath %q (single source, the same in-guest path the key is bound :ro at), got %q",
+			spec.Handoff.PublicKeyGuestPath, val)
 	}
 	if val == "" {
 		t.Errorf("--auth-public-key value is empty (keyless fail-OPEN)")
 	}
 	// The value must be DERIVED from the spec, not a hardcoded literal: prove it by
-	// mutating PublicKeyPath and re-deriving the Cmd. A literal would not move.
+	// mutating PublicKeyGuestPath and re-deriving the Cmd. A literal would not move.
 	spec2 := validSpec()
-	spec2.Handoff.PublicKeyPath = "/some/other/derived/key.pub"
+	spec2.Handoff.PublicKeyGuestPath = "/some/other/derived/key.pub"
 	val2, ok2 := valueAfterFlag(buildContainerConfig(spec2).Cmd, "--auth-public-key")
-	if !ok2 || val2 != spec2.Handoff.PublicKeyPath {
-		t.Errorf("--auth-public-key value is not derived from spec.Handoff.PublicKeyPath: want %q, got %q (ok=%v)",
-			spec2.Handoff.PublicKeyPath, val2, ok2)
+	if !ok2 || val2 != spec2.Handoff.PublicKeyGuestPath {
+		t.Errorf("--auth-public-key value is not derived from spec.Handoff.PublicKeyGuestPath: want %q, got %q (ok=%v)",
+			spec2.Handoff.PublicKeyGuestPath, val2, ok2)
 	}
 }
 
@@ -384,18 +389,18 @@ func TestBuildContainerConfigCmd_ExecFormShape(t *testing.T) {
 
 // TestValidateSpec_EmptyPubkeyRejectsBeforeCmd asserts the keyless-key material is
 // rejected fail-closed at validateSpec BEFORE any Cmd would be emitted. validateSpec
-// already forces a non-empty PublicKeyPath (the "missing pubkey bind" row of
-// TestValidateSpec_FailClosed), so this does NOT duplicate the check: it pins the
-// ORDERING — a prod spec with an empty PublicKeyPath never reaches buildContainerConfig,
+// already forces a non-empty PublicKeyGuestPath (the "missing pubkey guest bind" row
+// of TestValidateSpec_FailClosed), so this does NOT duplicate the check: it pins the
+// ORDERING — a prod spec with an empty PublicKeyGuestPath never reaches buildContainerConfig,
 // so the Cmd can never carry an empty --auth-public-key value derived from it.
 func TestValidateSpec_EmptyPubkeyRejectsBeforeCmd(t *testing.T) {
 	spec := validSpec()
-	spec.Handoff.PublicKeyPath = ""
+	spec.Handoff.PublicKeyGuestPath = ""
 
 	// validateSpec rejects the empty key path fail-closed (the gate Materialize runs
 	// before buildContainerConfig is ever called).
 	if err := validateSpec(spec); !errors.Is(err, runtime.ErrUnsupportedSpec) {
-		t.Fatalf("validateSpec with empty PublicKeyPath: want ErrUnsupportedSpec (before any Cmd is emitted), got %v", err)
+		t.Fatalf("validateSpec with empty PublicKeyGuestPath: want ErrUnsupportedSpec (before any Cmd is emitted), got %v", err)
 	}
 
 	// Materialize must reject with ZERO substrate calls — no ContainerCreate, so no
@@ -406,10 +411,10 @@ func TestValidateSpec_EmptyPubkeyRejectsBeforeCmd(t *testing.T) {
 		t.Fatalf("NewDockerProvider: %v", err)
 	}
 	if _, merr := p.Materialize(context.Background(), spec); !errors.Is(merr, runtime.ErrUnsupportedSpec) {
-		t.Errorf("Materialize with empty PublicKeyPath: want ErrUnsupportedSpec, got %v", merr)
+		t.Errorf("Materialize with empty PublicKeyGuestPath: want ErrUnsupportedSpec, got %v", merr)
 	}
 	if got := len(fake.ops()); got != 0 {
-		t.Errorf("empty-PublicKeyPath Materialize issued %d substrate calls (want 0 — no Cmd emitted): %v", got, fake.ops())
+		t.Errorf("empty-PublicKeyGuestPath Materialize issued %d substrate calls (want 0 — no Cmd emitted): %v", got, fake.ops())
 	}
 }
 
@@ -616,8 +621,10 @@ func TestValidateSpec_FailClosed(t *testing.T) {
 		{"non-32-byte key (long)", func(s *runtime.SessionSpec) { s.Handoff.PublicKeyEd25519 = make([]byte, 33) }},
 		{"nil key", func(s *runtime.SessionSpec) { s.Handoff.PublicKeyEd25519 = nil }},
 		{"permissive egress (DefaultDeny false)", func(s *runtime.SessionSpec) { s.Egress.DefaultDeny = false }},
-		{"missing container_info bind", func(s *runtime.SessionSpec) { s.Handoff.ContainerInfoPath = "" }},
-		{"missing pubkey bind", func(s *runtime.SessionSpec) { s.Handoff.PublicKeyPath = "" }},
+		{"missing container_info host source", func(s *runtime.SessionSpec) { s.Handoff.ContainerInfoHostPath = "" }},
+		{"missing container_info guest target", func(s *runtime.SessionSpec) { s.Handoff.ContainerInfoGuestPath = "" }},
+		{"missing pubkey host source", func(s *runtime.SessionSpec) { s.Handoff.PublicKeyHostPath = "" }},
+		{"missing pubkey guest target", func(s *runtime.SessionSpec) { s.Handoff.PublicKeyGuestPath = "" }},
 		{"missing sock dir bind", func(s *runtime.SessionSpec) { s.Handoff.HostSockDir = "" }},
 	}
 	for _, c := range cases {

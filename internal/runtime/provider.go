@@ -125,18 +125,33 @@ type SessionName string
 // writes each as a host-owned :ro bind; it never synthesizes them.
 type HandoffMaterial struct {
 	// ContainerInfoJSON is the serialized container_info.json the guest reads at
-	// boot. Mounted :ro at ContainerInfoPath.
+	// boot. Written by the Stager to ContainerInfoHostPath and mounted :ro at
+	// ContainerInfoGuestPath.
 	ContainerInfoJSON []byte
-	// ContainerInfoPath is the absolute guest mountpoint for container_info.json.
-	ContainerInfoPath string
+	// ContainerInfoHostPath is the per-session host file the Stager actually wrote
+	// the container_info.json bytes to — the SOURCE side of the :ro bind. It must
+	// be a real path on the host filesystem; the daemon mounts it into the guest.
+	ContainerInfoHostPath string
+	// ContainerInfoGuestPath is the absolute in-guest mountpoint — the TARGET side
+	// of the bind and the path the guest reads container_info.json from. It is the
+	// guest image's hardcoded default, the filesystem root, so no read-path
+	// override is supplied to the guest.
+	ContainerInfoGuestPath string
 
 	// PublicKeyEd25519 is the raw 32-byte Ed25519 PUBLIC key (NOT a secret) the
-	// guest uses to verify host-signed control-RPC frames. Mounted :ro at
-	// PublicKeyPath. The provider fails the create closed if it is not exactly 32
-	// bytes — a malformed key is never substituted by a daemon default.
+	// guest uses to verify host-signed control-RPC frames. Written by the Stager
+	// to PublicKeyHostPath and mounted :ro at PublicKeyGuestPath. The provider
+	// fails the create closed if it is not exactly 32 bytes — a malformed key is
+	// never substituted by a daemon default.
 	PublicKeyEd25519 []byte
-	// PublicKeyPath is the absolute guest mountpoint for the public key.
-	PublicKeyPath string
+	// PublicKeyHostPath is the per-session host file the Stager actually wrote the
+	// public key to — the SOURCE side of the :ro bind. It must be a real path on
+	// the host filesystem; the daemon mounts it into the guest.
+	PublicKeyHostPath string
+	// PublicKeyGuestPath is the absolute in-guest mountpoint — the TARGET side of
+	// the bind and the value the guest is given via --auth-public-key, so the path
+	// the guest reads the key from can never drift from the path the host mounts.
+	PublicKeyGuestPath string
 
 	// HostSockDir is the host-owned 0700 directory bind-mounted RW (no :ro) at
 	// /run/ocu inside the guest, where the GUEST creates the exec UDS. The
