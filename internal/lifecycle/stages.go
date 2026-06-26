@@ -166,6 +166,15 @@ func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compen
 	}, nil
 }
 
+// hasStorageScope reports whether the create requested a storage scope at all. A
+// pure compute/exec session sets neither FilesystemID nor MemoryStoreID (a zero
+// MountIntent), and that is a legitimate first-class case (ADR-0017): the exec
+// lifecycle must not be coupled to the storage leg. The two storage stages share
+// this one predicate so the skip condition has a single source of truth.
+func hasStorageScope(m runtime.MountIntent) bool {
+	return m.FilesystemID != "" || m.MemoryStoreID != ""
+}
+
 // stageMintStorageJWT (S6) mints the weak, edge-only Storage-JWT for the session's
 // mount, keyed on the HOST-DERIVED session key (never a body hint, NFR-SEC-43).
 // The Signer records the jti against that key on the shared Revoker, so the
@@ -179,6 +188,12 @@ func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compen
 // no-op so the base pipeline still runs.
 func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	if m.signer == nil {
+		return nil, nil
+	}
+	if !hasStorageScope(st.in.Mount) {
+		// A no-scope (pure compute/exec) session legitimately mints no Storage-JWT;
+		// failing closed here would couple exec to storage (ADR-0017). Leave
+		// st.storageToken the zero value and let the create boot without a mount.
 		return nil, nil
 	}
 	scope := m.storageScope
@@ -216,6 +231,12 @@ func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (comp
 // Signer/Push are absent (the Phase-3 minimal shelf), the stage is a clean no-op.
 func stageRenderPushMount(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	if m.signer == nil || m.push == nil {
+		return nil, nil
+	}
+	if !hasStorageScope(st.in.Mount) {
+		// No storage scope was requested, so there is no mount-config to render and
+		// nothing to push onto the bind — the matching skip for the no-mint case
+		// above (ADR-0017). The sandbox boots from the handoff binds alone.
 		return nil, nil
 	}
 	mounts := []runtime.MountIntent{st.in.Mount}
