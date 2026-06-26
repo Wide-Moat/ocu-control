@@ -89,6 +89,176 @@ func TestProperty_MaterializeRollback(t *testing.T) {
 	})
 }
 
+// TestProperty_MaterializeRollbackFault is the sibling robustness property: it
+// drives Materialize to a primary failure that TRIGGERS a rollback (ContainerCreate
+// or ContainerStart) AND ALSO injects a failure on the rollback removes themselves
+// (ContainerRemove / NetworkRemove), across the typed/raw flavours of both. It
+// proves the v0.1-cut rollback path is robust when a CLEANUP op also fails — the
+// real-substrate case where a remove is refused (transient/in-use) or races an
+// already-gone object. The invariants, beyond those the clean-rollback sibling
+// (TestProperty_MaterializeRollback) owns:
+//
+//   - NO PANIC / NO HANG: the rollback path issues each remove once with no loop or
+//     retry, so the body returning under rapid IS the termination proof; a panic
+//     fails the rapid check directly.
+//   - FAIL-CLOSED CREATE: a failed rollback op must NEVER turn the failed create
+//     into a reported success — merr stays non-nil and errors.Is ErrMaterialize,
+//     and the primary-flavour typed evidence survives the rollback failure.
+//   - CLEANUP ATTEMPTED, BOUNDED: a swallowed ContainerRemove failure does NOT
+//     short-circuit the following NetworkRemove (sequential best-effort), and the
+//     container-then-network order holds even under a rollback-op failure.
+//   - HONEST RESIDUE: an idempotent (not-found) rollback failure leaves zero
+//     residue; a genuine (raw/conflict) rollback failure leaves a REAL orphan the
+//     fake still holds — and that residue only ever co-occurs with the failed-closed
+//     create (the next Reconcile sweep reclaims it), never with a silent success.
+//
+// failAt is constrained to {ContainerCreate, ContainerStart} on purpose: those are
+// the only arms that drive a rollback, so injecting on a rollback op is reachable
+// and non-vacuous. NetworkCreate is excluded (it rolls back nothing). The fake's
+// errOn is sticky per op, but ContainerRemove/NetworkRemove are issued ONLY by the
+// rollback helpers, so injecting on them collides with nothing the primary arm does
+// — do NOT add a rollback op to failAt.
+func TestProperty_MaterializeRollbackFault(t *testing.T) {
+	rapid.Check(t, func(rt *rapid.T) {
+		// Only the arms that drive a rollback; NetworkCreate rolls back nothing.
+		failAt := rapid.SampledFrom([]string{"ContainerCreate", "ContainerStart"}).Draw(rt, "failAt")
+		// The primary create/start failure flavour (drives materializeError typing).
+		primaryFlavour := rapid.SampledFrom([]string{"raw", "conflict", "notfound"}).Draw(rt, "primaryFlavour")
+		// Which rollback op(s) are made to fail.
+		rbTarget := rapid.SampledFrom([]string{"ContainerRemove", "NetworkRemove", "both"}).Draw(rt, "rbTarget")
+		// The rollback-op failure flavour: notfound is idempotent already-gone (the
+		// fake still drops the object); raw/conflict is a genuine refusal (the fake
+		// keeps the object — a real orphan).
+		rbFlavour := rapid.SampledFrom([]string{"notfound", "raw", "conflict"}).Draw(rt, "rbFlavour")
+
+		flavourErr := func(kind string) error {
+			switch kind {
+			case "conflict":
+				return newConflict("network has active endpoints")
+			case "notfound":
+				return newNotFound("no such object")
+			default:
+				return errors.New("substrate boom")
+			}
+		}
+
+		fake := newFakeAPI()
+		fake.errOn[failAt] = flavourErr(primaryFlavour)
+		rbErr := flavourErr(rbFlavour)
+		if rbTarget == "ContainerRemove" || rbTarget == "both" {
+			fake.errOn["ContainerRemove"] = rbErr
+		}
+		if rbTarget == "NetworkRemove" || rbTarget == "both" {
+			fake.errOn["NetworkRemove"] = rbErr
+		}
+
+		p, err := NewDockerProvider(runtime.TierRunc, Deps{API: fake})
+		if err != nil {
+			rt.Fatalf("NewDockerProvider: %v", err)
+		}
+		spec := validSpec()
+
+		_, merr := p.Materialize(context.Background(), spec)
+
+		// (B) FAIL-CLOSED: a rollback-op failure never masks the create failure.
+		if merr == nil {
+			rt.Fatalf("Materialize with %s failing must error even when rollback %s fails (%s): got nil",
+				failAt, rbTarget, rbFlavour)
+		}
+		if !errors.Is(merr, runtime.ErrMaterialize) {
+			rt.Fatalf("Materialize error must stay ErrMaterialize under a rollback-op failure, got %v", merr)
+		}
+		// The primary-flavour typed evidence must survive the rollback failure — a
+		// failed remove must not corrupt the returned typed cause.
+		switch primaryFlavour {
+		case "conflict":
+			if !errors.Is(merr, runtime.ErrNetworkActive) {
+				rt.Fatalf("conflict primary must thread ErrNetworkActive under rollback failure, got %v", merr)
+			}
+		case "notfound":
+			if !errors.Is(merr, runtime.ErrNoSuchContainer) {
+				rt.Fatalf("not-found primary must thread ErrNoSuchContainer under rollback failure, got %v", merr)
+			}
+		}
+
+		// Rollback ordering survives a rollback-op failure: whenever both removes run,
+		// the container-remove precedes the network-remove (active-endpoints).
+		ri := fake.indexOf("ContainerRemove")
+		ni := fake.indexOf("NetworkRemove")
+		if ri >= 0 && ni >= 0 && ni < ri {
+			rt.Fatalf("rollback order violated under rollback-op failure: %v", fake.ops())
+		}
+
+		// (C) CLEANUP ATTEMPTED, BOUNDED — per failAt, and the load-bearing
+		// non-vacuity guard: the rollback op we injected on actually RAN.
+		switch failAt {
+		case "ContainerCreate":
+			// Only the network was created -> network is rolled back, no container.
+			if fake.countOp("ContainerStart") != 0 {
+				rt.Fatalf("ContainerCreate failed but ContainerStart ran: %v", fake.ops())
+			}
+			if fake.countOp("ContainerRemove") != 0 {
+				rt.Fatalf("ContainerCreate failed but ContainerRemove ran (no container existed): %v", fake.ops())
+			}
+			if fake.countOp("NetworkRemove") != 1 {
+				rt.Fatalf("ContainerCreate failure must roll back the network exactly once even under a rollback-op failure: %v", fake.ops())
+			}
+		case "ContainerStart":
+			// Both created -> both rolled back. The NetworkRemove must STILL run after
+			// a failed (swallowed) ContainerRemove: this proves the swallow is
+			// intentional and bounded, not a short-circuit.
+			if fake.countOp("ContainerRemove") != 1 {
+				rt.Fatalf("ContainerStart failure must roll back the container exactly once: %v", fake.ops())
+			}
+			if fake.countOp("NetworkRemove") != 1 {
+				rt.Fatalf("ContainerStart failure must STILL roll back the network after a failed ContainerRemove: %v", fake.ops())
+			}
+		}
+
+		// NON-VACUITY GUARD: the rollback op we fault-injected was actually reached on
+		// this run (keyed on reachability for the drawn failAt), so a future refactor
+		// that stops calling a rollback helper turns this RED instead of silently
+		// passing. ContainerRemove is only reachable from the ContainerStart arm.
+		injectedContainerRemove := (rbTarget == "ContainerRemove" || rbTarget == "both") && failAt == "ContainerStart"
+		injectedNetworkRemove := rbTarget == "NetworkRemove" || rbTarget == "both"
+		if injectedContainerRemove && fake.countOp("ContainerRemove") < 1 {
+			rt.Fatalf("fault-injected ContainerRemove never ran (dead injection): %v", fake.ops())
+		}
+		if injectedNetworkRemove && fake.countOp("NetworkRemove") < 1 {
+			rt.Fatalf("fault-injected NetworkRemove never ran (dead injection): %v", fake.ops())
+		}
+
+		// (D) RESIDUE ACCOUNTING, split on the rollback-op flavour.
+		held := fake.holdsAnyFor(networkName(spec.Name), fake.nextID)
+		// Did a rollback op that actually ran fail with a genuine (non-idempotent)
+		// error, leaving a real orphan? For ContainerCreate the ContainerRemove never
+		// runs, so only a NetworkRemove failure can strand residue.
+		networkRemoveFailed := injectedNetworkRemove
+		containerRemoveFailed := injectedContainerRemove
+		genuineRollbackFailure := (rbFlavour == "raw" || rbFlavour == "conflict") &&
+			(networkRemoveFailed || containerRemoveFailed)
+
+		if !genuineRollbackFailure {
+			// Idempotent (not-found) rollback failures, or no rollback-op failure on a
+			// reached op, leave ZERO residue — the fake drops on IsNotFound, faithful to
+			// an already-gone object.
+			if held {
+				rt.Fatalf("idempotent/clean rollback must leave zero residue (failAt=%s rbTarget=%s rbFlavour=%s): %v",
+					failAt, rbTarget, rbFlavour, fake.ops())
+			}
+		} else {
+			// A genuine remove refusal leaves an HONEST orphan the fake still holds.
+			// That is acceptable ONLY because the create already failed closed (B): the
+			// orphan is surfaced via the failed create and reclaimed by the next
+			// Reconcile sweep, NEVER reported as a live success. Assert the complement
+			// invariant — held residue co-occurs with a non-nil ErrMaterialize.
+			if held && merr == nil {
+				rt.Fatalf("rollback-failure residue MUST co-occur with a failed create, never a silent success: %v", fake.ops())
+			}
+		}
+	})
+}
+
 // TestProperty_FinalizerStepOrder generates a per-step schedule of failures, a
 // guest-responsiveness grade, the verb (GracefulStop vs ForceKill), and whether the
 // parent context is cancelled. INVARIANTS across every schedule:

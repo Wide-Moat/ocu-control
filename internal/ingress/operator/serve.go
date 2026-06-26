@@ -20,6 +20,15 @@ import (
 // satisfied that no header read is unbounded.
 const readHeaderTimeout = 10 * time.Second
 
+// readTimeout bounds the whole-request read (headers plus body), defeating a slow
+// body that dribbles bytes under the header timeout. 30s suits a small-JSON
+// operator surface without breaking a legitimate slow client on the local socket.
+const readTimeout = 30 * time.Second
+
+// idleTimeout bounds an idle keep-alive connection so a parked socket is reaped
+// rather than held open indefinitely.
+const idleTimeout = 120 * time.Second
+
 // connInfoKey is the unexported context key under which each accepted
 // connection's resolved ingress.ConnInfo is threaded to its HTTP handlers. It is a
 // distinct unexported type so no other package can collide with or read the key.
@@ -55,24 +64,7 @@ func (l *Listener) Serve(ctx context.Context) error {
 	}
 	l.registerRoutes(mux)
 
-	srv := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: readHeaderTimeout,
-		// ConnContext resolves the kernel-attested PeerCred ONCE per connection and
-		// stashes the ConnInfo on the base context every request on that connection
-		// inherits. A failed resolve stashes an unattested ConnInfo (the zero value),
-		// so a handler's identity gate refuses fail-closed rather than reading a body.
-		ConnContext: func(connCtx context.Context, c net.Conn) context.Context {
-			info, err := connCredOf(c)
-			if err != nil {
-				// Carry an unattested ConnInfo: it has a nil PeerCred, so the resolver
-				// refuses with ingress.ErrUnattested before any host state is touched.
-				info = ingress.ConnInfo{Channel: ingress.ChannelOperator}
-			}
-			return context.WithValue(connCtx, connInfoKey{}, info)
-		},
-		BaseContext: func(net.Listener) context.Context { return ctx },
-	}
+	srv := newServer(ctx, mux)
 
 	// Shut the server down when ctx is cancelled so a caller's lifecycle drives the
 	// listener's lifetime; Serve returns http.ErrServerClosed on that path, which we
@@ -90,6 +82,40 @@ func (l *Listener) Serve(ctx context.Context) error {
 		return fmt.Errorf("operator: serve: %w", err)
 	}
 	return nil
+}
+
+// newServer builds the operator HTTP server with the bounded read/idle posture and
+// the per-connection PeerCred ConnContext hook. It is factored out of Serve so the
+// timeout wiring is unit-observable: the read header, whole-request read, and idle
+// bounds are all non-zero and assertable on the returned *http.Server. The mux
+// passed in already carries the routes Serve mounts (healthz, the metrics scrape
+// endpoint when configured, and the registerRoutes surface).
+//
+// WriteTimeout is deliberately not set: Serve drives shutdown via ctx.Done →
+// srv.Close and the handlers are fast unary JSON, so the read+idle pair is the
+// load-bearing defence against a slow body, and a write bound would only risk
+// truncating a legitimate slow consumer without adding Slowloris protection.
+func newServer(ctx context.Context, mux http.Handler) *http.Server {
+	return &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+		ReadTimeout:       readTimeout,
+		IdleTimeout:       idleTimeout,
+		// ConnContext resolves the kernel-attested PeerCred ONCE per connection and
+		// stashes the ConnInfo on the base context every request on that connection
+		// inherits. A failed resolve stashes an unattested ConnInfo (the zero value),
+		// so a handler's identity gate refuses fail-closed rather than reading a body.
+		ConnContext: func(connCtx context.Context, c net.Conn) context.Context {
+			info, err := connCredOf(c)
+			if err != nil {
+				// Carry an unattested ConnInfo: it has a nil PeerCred, so the resolver
+				// refuses with ingress.ErrUnattested before any host state is touched.
+				info = ingress.ConnInfo{Channel: ingress.ChannelOperator}
+			}
+			return context.WithValue(connCtx, connInfoKey{}, info)
+		},
+		BaseContext: func(net.Listener) context.Context { return ctx },
+	}
 }
 
 // connInfoFromRequest extracts the per-connection ingress.ConnInfo the ConnContext

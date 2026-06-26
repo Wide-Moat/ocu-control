@@ -225,6 +225,15 @@ func (h *Handlers) ResumeAll(ctx context.Context, conn ingress.ConnInfo, reason 
 // socket), but the SOAR principal's signature — not the socket — is the authority
 // for a SOAR-driven revoke (P2-R2). An unverifiable signature yields
 // killswitch.ErrSOARUnverified and no Engine call is formed.
+//
+// UNMOUNTED, deliberately. This handler is fully tested (handlers_test.go,
+// operator_test.go) but registerRoutes mounts NO HTTP route that reaches it: the
+// SOAR-webhook transport is DEFERRED, not missing by accident. The absence of a
+// route is the same #205 deferral as the draft contract that mirrors this path —
+// the HTTP route lands together with the #205 SOAR wire. Mount is gated on the
+// frozen #205 soar-revoke.openapi.yaml; the route shape derives from that frozen
+// contract, not invented here. soar_fence_test.go enforces that nothing mounts a
+// SOAR route before that contract freezes.
 func (h *Handlers) RevokeOneViaSOAR(ctx context.Context, conn ingress.ConnInfo, payload, sig []byte, key, reason string) error {
 	if _, err := h.resolveCaller(ctx, conn); err != nil {
 		return err
@@ -238,7 +247,9 @@ func (h *Handlers) RevokeOneViaSOAR(ctx context.Context, conn ingress.ConnInfo, 
 
 // RevokeAllViaSOAR is the SOAR-webhook DENY-ALL path, the verify-then-mint
 // analogue of RevokeAll. The scope is minted only after the SOAR signature
-// verifies.
+// verifies. Like RevokeOneViaSOAR this handler is tested but UNMOUNTED: no
+// registerRoutes route reaches it, and the mount is gated on the frozen #205
+// soar-revoke.openapi.yaml (see RevokeOneViaSOAR and soar_fence_test.go).
 func (h *Handlers) RevokeAllViaSOAR(ctx context.Context, conn ingress.ConnInfo, payload, sig []byte, reason string) error {
 	if _, err := h.resolveCaller(ctx, conn); err != nil {
 		return err

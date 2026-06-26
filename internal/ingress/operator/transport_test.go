@@ -398,6 +398,44 @@ func TestOperatorTransportBadBodyAndMethod(t *testing.T) {
 	}
 }
 
+// TestOperatorTransportOversizedBody413 drives the body-cap over the wire: a POST of
+// a body larger than the cap to a real bound operator socket is refused with 413
+// Request Entity Too Large, NOT 200/201 or normal processing. Identity is attested
+// (a fixedResolver), so the 413 is the size cap and not a 401 — the oversized-body
+// path, not the unattested path. The white-box decode test is the authoritative proof
+// the body is not read whole into memory; this proves the 413 reaches the client.
+func TestOperatorTransportOversizedBody413(t *testing.T) {
+	t.Parallel()
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+
+	// A valid-JSON head followed by a long run, larger than the 64KiB cap, so the
+	// refusal is the size cap rather than a syntax error mid-stream.
+	oversized := append([]byte(`{"session_hint":"`), bytes.Repeat([]byte("A"), 128<<10)...)
+	resp, err := client.Post("http://unix/v1alpha/sessions", "application/json", bytes.NewReader(oversized))
+	if err != nil {
+		// The server may refuse and close the connection while the client is still
+		// uploading, so the client can surface a write/reset error instead of reading
+		// the 413. That is itself a refusal; the white-box decode test is the
+		// deterministic proof the body is rejected and never read whole into memory.
+		t.Logf("oversized POST surfaced a transport error after refusal (acceptable): %v", err)
+		return
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	// The oversized body must be REFUSED, never accepted or normally processed: a 2xx
+	// is the bug the cap closes. The honest, expected refusal is 413, which the
+	// production decode path returns deterministically (proven by the white-box decode
+	// test); the wire assertion here is that the refusal reaches the client.
+	if resp.StatusCode == http.StatusRequestEntityTooLarge {
+		return // the clean, expected outcome
+	}
+	if resp.StatusCode < 400 {
+		t.Fatalf("create with an oversized body = %d; want a refusal (413), got a non-refusal status", resp.StatusCode)
+	}
+	t.Logf("oversized POST refused with %d (expected 413; a non-413 refusal can occur if the client races the server's mid-upload close)", resp.StatusCode)
+}
+
 // TestOperatorTransportDestroyForeignHintNotFound drives the destroy not-addressable
 // path over the wire: a hint that addresses no row in the caller's namespace is 404
 // (indistinguishable from not-found), so a forge attempt cannot probe existence.
