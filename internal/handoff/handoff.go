@@ -4,7 +4,9 @@
 // Package handoff stages the host-side handoff material one session needs at
 // create: the container_info.json the guest reads at boot, the raw 32-byte
 // Ed25519 PUBLIC key the guest verifies host-signed control-RPC frames against,
-// and the 0700 host-owned socket directory the guest creates its exec UDS in. It
+// and the host-owned socket directory the guest creates its exec UDS in (a 0777
+// leaf walled inside the 0700 per-session root, so a CapDrop-ALL'd guest whose
+// possibly userns-remapped uid does not own the dir can still bind(2)). It
 // produces the runtime.HandoffMaterial the lifecycle layer puts on the
 // SessionSpec, plus the per-session root the create's unwind compensator removes
 // on rollback.
@@ -37,10 +39,35 @@ import (
 // base; the three handoff artifacts live at fixed names within it, and the guest
 // mountpoints the provider binds them to are fixed absolute paths.
 const (
-	// dirPerm is the 0700 mode on the per-session root and the sock dir: owner-only
-	// so no other host user can read the handoff material or plant a socket.
+	// dirPerm is the 0700 mode on the per-session root: owner-only so no other host
+	// user can read the handoff material or traverse into the sock dir.
 	dirPerm = 0o700
-	// filePerm is the 0600 mode on the written artifacts (owner read/write only).
+	// sockDirPerm is the 0777 mode on the inner sock LEAF. The guest binds(2) its
+	// exec UDS here under CapDrop ALL (no CAP_DAC_OVERRIDE), and on a daemon with
+	// --userns-remap (or an image whose USER uid differs from the dir owner) the
+	// guest's mapped uid does NOT own the dir — a 0700 leaf would EACCES the bind
+	// and crash-loop the session. Making only the leaf 0777 lets any guest uid
+	// bind(2) the socket while the 0700 root parent (dirPerm above) still walls off
+	// every other host user, who cannot traverse into the leaf at all. This matches
+	// the sandbox driver's bind-proven posture and is config-independent: it holds
+	// regardless of userns-remap or image USER, unlike pinning the container User.
+	sockDirPerm = 0o777
+	// roFilePerm is the 0644 mode on the two :ro handoff artifacts the GUEST reads
+	// at boot — container_info.json and the raw Ed25519 PUBLIC key. The guest reads
+	// them under CapDrop ALL (no CAP_DAC_READ_SEARCH), and on a daemon with
+	// --userns-remap (or an image USER uid != the file owner) the guest's mapped uid
+	// does NOT own the files — a 0600 file would EACCES the read. For the key that is
+	// a fail-closed boot crash (load_verifying_key propagates the error); for
+	// container_info it is a SILENT identity loss (the guest tolerates the unreadable
+	// file and binds an empty name, breaking the JWT sub match). Neither file is a
+	// secret — a container name and a PUBLIC key (NFR-SEC-25 forbids bind-mounting a
+	// secret, these are not) — so 0644 costs no confidentiality: the 0700 root parent
+	// (dirPerm) is the trust gate, no other host user can traverse in to read them.
+	// 0644 is the only userns-/uid-mismatch-safe read mode; pinning the container
+	// User instead would create a new config-asserted contract seam.
+	roFilePerm = 0o644
+	// filePerm is the 0600 mode on a private temp artifact (owner read/write only);
+	// the two staged :ro files are re-moded to roFilePerm by writeFileExact.
 	filePerm = 0o600
 
 	// containerInfoFile is the on-host filename for the serialized
@@ -49,7 +76,8 @@ const (
 	// publicKeyFile is the on-host filename for the raw 32-byte Ed25519 public key.
 	publicKeyFile = "auth_public_key"
 	// sockDirName is the per-session sock-dir name within the root; the guest
-	// creates its exec UDS here (bound RW at /run/ocu inside the guest).
+	// creates its exec UDS here (bound RW at /run/ocu inside the guest). It is the
+	// 0777 leaf (sockDirPerm) inside the 0700 root so the guest can bind(2) it.
 	sockDirName = "sock"
 
 	// guestContainerInfoPath is the absolute in-guest mountpoint for
@@ -93,8 +121,9 @@ type Staged struct {
 // Unstage removes the whole tree and is idempotent. It is pure filesystem; it
 // holds no Store and no clock.
 type Stager interface {
-	// Stage writes container_info.json, the raw 32-byte public key, and the 0700
-	// sock dir under a fresh per-session root derived from name, returning the
+	// Stage writes container_info.json, the raw 32-byte public key, and the 0777
+	// sock leaf (inside the 0700 root) under a fresh per-session root derived from
+	// name, returning the
 	// Staged descriptor. mounts is accepted for the later-phase mount-material
 	// staging; this phase records the intent on the material but writes no secret
 	// (AuthToken stays a placeholder). It returns ErrBadPublicKey on a bad key and
@@ -104,7 +133,7 @@ type Stager interface {
 	// already-gone root returns nil, so the create unwind and a later reconcile may
 	// both call it. An empty Root is a no-op.
 	Unstage(ctx context.Context, st Staged) error
-	// SockDir re-derives the per-session 0700 host-owned sock directory PURELY from
+	// SockDir re-derives the per-session host-owned sock directory PURELY from
 	// the host-derived session name, returning the SAME path Stage created under the
 	// stager's base root. The path is a pure function of name (base/<name>/sock), so
 	// a Destroy path that holds only the session key/name can re-derive the sock dir
@@ -141,8 +170,9 @@ func containerInfoFor(name runtime.SessionName) []byte {
 }
 
 // Stage writes the per-session handoff tree. It validates the public key length
-// FIRST (fail-closed before any filesystem write), creates the 0700 root and sock
-// dir, writes the two :ro artifacts, and returns the Staged descriptor. On any
+// FIRST (fail-closed before any filesystem write), creates the 0700 root and the
+// 0777 sock leaf, writes the two :ro artifacts, and returns the Staged descriptor.
+// On any
 // filesystem error after the root is created it removes the partial root and
 // returns ErrStageFailed, so nothing half-written survives.
 func (s *fsStager) Stage(ctx context.Context, name runtime.SessionName, pubKey []byte, mounts []runtime.MountIntent) (Staged, error) {
@@ -166,15 +196,19 @@ func (s *fsStager) Stage(ctx context.Context, name runtime.SessionName, pubKey [
 	}
 
 	sockDir := filepath.Join(root, sockDirName)
-	if err := os.MkdirAll(sockDir, dirPerm); err != nil {
+	if err := os.MkdirAll(sockDir, sockDirPerm); err != nil {
 		return s.failClosed(root, "create sock dir", err)
 	}
-	if err := chmod(sockDir, dirPerm); err != nil {
+	// The second chmod is load-bearing: MkdirAll honors the process umask, which
+	// would otherwise mask the group/other write bits back off the 0777 leaf. The
+	// explicit chmod re-asserts 0777 so the CapDrop-ALL'd guest can bind(2) here
+	// regardless of the host umask.
+	if err := chmod(sockDir, sockDirPerm); err != nil {
 		return s.failClosed(root, "chmod sock dir", err)
 	}
 
 	infoPath := filepath.Join(root, containerInfoFile)
-	if err := writeFileExact(infoPath, containerInfoFor(name)); err != nil {
+	if err := writeFileExact(infoPath, containerInfoFor(name), roFilePerm); err != nil {
 		return s.failClosed(root, "write container_info.json", err)
 	}
 
@@ -183,7 +217,7 @@ func (s *fsStager) Stage(ctx context.Context, name runtime.SessionName, pubKey [
 	keyCopy := make([]byte, ed25519.PublicKeySize)
 	copy(keyCopy, pubKey)
 	keyPath := filepath.Join(root, publicKeyFile)
-	if err := writeFileExact(keyPath, keyCopy); err != nil {
+	if err := writeFileExact(keyPath, keyCopy, roFilePerm); err != nil {
 		return s.failClosed(root, "write public key", err)
 	}
 
@@ -266,18 +300,20 @@ var createTemp = func(dir, pattern string) (tempFile, error) {
 var _ tempFile = (*os.File)(nil)
 
 // chmod is the directory-mode setter Stage uses to re-assert 0700 on the
-// per-session root and sock dir, indirected through a package var so a test can
-// inject a chmod failure (not portably reproducible on an owned directory) and
-// exercise the chmod failClosed branches. In production it is os.Chmod, never
-// reassigned outside a test.
+// per-session root and 0777 on the sock leaf (beating the umask), indirected
+// through a package var so a test can inject a chmod failure (not portably
+// reproducible on an owned directory) and exercise the chmod failClosed branches.
+// In production it is os.Chmod, never reassigned outside a test.
 var chmod = os.Chmod
 
-// writeFileExact writes data to path with 0600 mode and verifies the whole
+// writeFileExact writes data to path with the given mode and verifies the whole
 // payload landed: a short write (fewer bytes than data) is treated as a failure,
 // so a truncated artifact never reaches a container. It writes to a temp file in
 // the same directory and renames it into place, so a reader never sees a partial
-// file.
-func writeFileExact(path string, data []byte) error {
+// file. The two staged :ro handoff files pass roFilePerm (0644) so a guest whose
+// CapDrop-ALL'd, possibly userns-remapped uid does not own the file can still read
+// it; the explicit Chmod beats the process umask so the mode lands exactly.
+func writeFileExact(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
 	tmp, err := createTemp(dir, ".tmp-handoff-*")
 	if err != nil {
@@ -287,7 +323,7 @@ func writeFileExact(path string, data []byte) error {
 	// Best-effort cleanup of the temp file on any error path below.
 	defer func() { _ = os.Remove(tmpName) }()
 
-	if err := tmp.Chmod(filePerm); err != nil {
+	if err := tmp.Chmod(perm); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("chmod temp: %w", err)
 	}

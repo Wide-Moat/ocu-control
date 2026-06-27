@@ -59,7 +59,10 @@ func TestStageWritesAllArtifacts(t *testing.T) {
 		t.Fatalf("material has an empty path field: %+v", st.Material)
 	}
 
-	// The sock dir exists on disk at 0700.
+	// The sock dir exists on disk at 0777: the sock LEAF is world-writable so a
+	// guest whose CapDrop-ALL'd (possibly userns-remapped) uid does not own the
+	// dir can still bind(2) its exec UDS. The 0700 root parent (asserted below)
+	// still walls off every other host user.
 	info, err := os.Stat(st.Material.HostSockDir)
 	if err != nil {
 		t.Fatalf("stat sock dir: %v", err)
@@ -67,8 +70,8 @@ func TestStageWritesAllArtifacts(t *testing.T) {
 	if !info.IsDir() {
 		t.Fatalf("sock dir is not a directory")
 	}
-	if perm := info.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("sock dir perm = %o, want 0700", perm)
+	if perm := info.Mode().Perm(); perm != 0o777 {
+		t.Fatalf("sock dir perm = %o, want 0777", perm)
 	}
 
 	// The root is 0700.
@@ -81,19 +84,39 @@ func TestStageWritesAllArtifacts(t *testing.T) {
 	}
 
 	// The two artifacts exist with the staged byte content.
-	infoBytes, err := os.ReadFile(filepath.Join(st.Root, "container_info.json"))
+	infoPath := filepath.Join(st.Root, "container_info.json")
+	infoBytes, err := os.ReadFile(infoPath)
 	if err != nil {
 		t.Fatalf("read container_info.json: %v", err)
 	}
 	if len(infoBytes) == 0 {
 		t.Fatalf("container_info.json is empty")
 	}
-	keyBytes, err := os.ReadFile(filepath.Join(st.Root, "auth_public_key"))
+	keyPath := filepath.Join(st.Root, "auth_public_key")
+	keyBytes, err := os.ReadFile(keyPath)
 	if err != nil {
 		t.Fatalf("read public key: %v", err)
 	}
 	if len(keyBytes) != ed25519.PublicKeySize {
 		t.Fatalf("on-disk public key = %d bytes, want %d", len(keyBytes), ed25519.PublicKeySize)
+	}
+
+	// Both :ro artifacts are 0644 (world-READable): the guest reads them under
+	// CapDrop ALL, and on a userns-remapped / User-mismatched daemon its mapped uid
+	// does not own them — a 0600 file would EACCES the read (a fail-closed boot crash
+	// for the key, a SILENT identity loss for container_info). They are not secrets
+	// (a container name and a PUBLIC key) and the 0700 root parent is the trust gate,
+	// so 0644 costs no confidentiality. This is the permanence guard: a future commit
+	// that tightens either file back to 0600 reds here before it can re-break the
+	// guest read on a hardened daemon.
+	for _, f := range []string{infoPath, keyPath} {
+		fi, err := os.Stat(f)
+		if err != nil {
+			t.Fatalf("stat %s: %v", filepath.Base(f), err)
+		}
+		if perm := fi.Mode().Perm(); perm != 0o644 {
+			t.Fatalf("%s perm = %o, want 0644 (the userns/uid-mismatch-safe read mode)", filepath.Base(f), perm)
+		}
 	}
 }
 

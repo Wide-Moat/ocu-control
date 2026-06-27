@@ -41,7 +41,7 @@ func TestWriteFileExactParentUnwritable(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = os.Chmod(roDir, 0o700) }) // let t.TempDir cleanup succeed
 
-	err := writeFileExact(filepath.Join(roDir, "artifact.bin"), []byte("payload"))
+	err := writeFileExact(filepath.Join(roDir, "artifact.bin"), []byte("payload"), roFilePerm)
 	if err == nil {
 		t.Fatal("writeFileExact into an unwritable directory returned nil; want a create-temp error")
 	}
@@ -128,7 +128,7 @@ func TestWriteFileExactRenameOntoDirFails(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dest, "child"), 0o700); err != nil {
 		t.Fatalf("plant non-empty directory at dest: %v", err)
 	}
-	if err := writeFileExact(dest, []byte("payload")); err == nil {
+	if err := writeFileExact(dest, []byte("payload"), roFilePerm); err == nil {
 		t.Fatal("writeFileExact onto a non-empty directory returned nil; want a rename error")
 	}
 }
@@ -289,7 +289,7 @@ func TestWriteFileExactInjectedFaults(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			withFakeTemp(t, c.mut)
 			dir := t.TempDir()
-			err := writeFileExact(filepath.Join(dir, "artifact.bin"), []byte("payload"))
+			err := writeFileExact(filepath.Join(dir, "artifact.bin"), []byte("payload"), roFilePerm)
 			if err == nil {
 				t.Fatalf("writeFileExact with injected %s fault returned nil; want an error", c.name)
 			}
