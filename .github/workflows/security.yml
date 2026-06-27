@@ -90,8 +90,11 @@ jobs:
           # still does `docker run ghcr.io/.../trufflehog:latest` — a fresh
           # upstream image (e.g. 3.95.6) can change findings under a frozen
           # action ref. Pinning the image tag to the action's own release makes
-          # the scanner version reproducible alongside the action.
-          version: v3.95.5
+          # the scanner version reproducible alongside the action. The ghcr
+          # image tags carry NO `v` prefix (`3.95.5`, not `v3.95.5`); a leading
+          # `v` resolves to `manifest unknown`, so the bare release number is
+          # the correct tag.
+          version: 3.95.5
           # `--fail` is appended by the entrypoint; `--no-verification`
           # removes the egress credential-validation calls. Do not also pass
           # --results=... or a second --fail (the action rejects repeats and
