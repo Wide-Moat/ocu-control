@@ -106,7 +106,7 @@ func walkFieldsForCredential(t *testing.T, typ reflect.Type, label string, visit
 		// Descend into a nested struct so a credential cannot hide one level down (e.g.
 		// on SessionRow.Owner Identity). Unwrap a pointer or slice/array element first.
 		ft := f.Type
-		for ft.Kind() == reflect.Ptr || ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array {
+		for ft.Kind() == reflect.Pointer || ft.Kind() == reflect.Slice || ft.Kind() == reflect.Array {
 			ft = ft.Elem()
 		}
 		if ft.Kind() == reflect.Struct {
