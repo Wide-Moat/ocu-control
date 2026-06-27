@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"path/filepath"
@@ -47,6 +48,51 @@ func TestRequestMarshalRejectsTaglessFrame(t *testing.T) {
 	t.Parallel()
 	if _, err := (controlrpc.Request{}).MarshalJSON(); !errors.Is(err, controlrpc.ErrProtocol) {
 		t.Fatalf("empty Request.MarshalJSON() = %v, want ErrProtocol", err)
+	}
+}
+
+// TestReplyMarshalFrameIsByteExact pins the exact bytes of a marshalled Reply
+// frame against an INDEPENDENT oracle: the externally-tagged object is the tag,
+// a colon, the marshalled BoundedReason body, and a closing brace — with NO
+// separator or capacity slack. It is the RED-witness for the wire.go
+// ControlError-arm refactor (the make([]byte,0,len+len+4) capacity hint that
+// read as an allocation-overflow risk was replaced by a bytes.Buffer): if the
+// rewrite shifted a single byte — a stray comma, a reordered field, a dropped
+// brace — this reds. The oracle is built from the contract shape, not from the
+// implementation, so it is not a tautology.
+func TestReplyMarshalFrameIsByteExact(t *testing.T) {
+	t.Parallel()
+
+	// ControlError arm: {"ControlError":<json(BoundedReason)>} exactly.
+	cases := []controlrpc.BoundedReason{
+		{ReasonCode: "GUEST_REFUSED"},
+		{ReasonCode: "INTERNAL", Message: "could not begin SIGTERM phase"},
+		{ReasonCode: "ESCAPES", Message: `quote " backslash \ unicode é 漢`},
+	}
+	for _, br := range cases {
+		body, err := json.Marshal(br)
+		if err != nil {
+			t.Fatalf("oracle marshal BoundedReason(%q): %v", br.ReasonCode, err)
+		}
+		want := append(append([]byte(`{"ControlError":`), body...), '}')
+		rep := controlrpc.Reply{Error: &controlrpc.ControlError{BoundedReason: br}}
+		got, err := rep.MarshalJSON()
+		if err != nil {
+			t.Fatalf("Reply.MarshalJSON(%q): %v", br.ReasonCode, err)
+		}
+		if !bytes.Equal(want, got) {
+			t.Fatalf("ControlError frame not byte-exact for %q\n  want=%q\n  got =%q", br.ReasonCode, want, got)
+		}
+	}
+
+	// ShutdownAccepted arm: the empty-object frame, fixed.
+	acc := controlrpc.Reply{Accepted: &controlrpc.ShutdownAccepted{}}
+	got, err := acc.MarshalJSON()
+	if err != nil {
+		t.Fatalf("Reply.MarshalJSON(accepted): %v", err)
+	}
+	if want := []byte(`{"ShutdownAccepted":{}}`); !bytes.Equal(want, got) {
+		t.Fatalf("ShutdownAccepted frame not byte-exact\n  want=%q\n  got =%q", want, got)
 	}
 }
 

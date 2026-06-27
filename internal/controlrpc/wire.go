@@ -136,13 +136,18 @@ func (r Reply) MarshalJSON() ([]byte, error) {
 		if err != nil {
 			return nil, fmt.Errorf("controlrpc: marshal ControlError: %w", err)
 		}
-		out := make([]byte, 0, len(replyTagError)+len(body)+4)
-		out = append(out, '{', '"')
-		out = append(out, replyTagError...)
-		out = append(out, '"', ':')
-		out = append(out, body...)
-		out = append(out, '}')
-		return out, nil
+		// Assemble {"ControlError":<body>} without a precomputed make capacity:
+		// a size hint summed from the tag and body lengths reads as an
+		// allocation-overflow risk to static analysis, and the bytes.Buffer
+		// grows itself. The emitted frame is byte-for-byte the same closed
+		// externally-tagged object — tag, ':', the marshalled body, '}'.
+		var out bytes.Buffer
+		out.WriteString(`{"`)
+		out.WriteString(replyTagError)
+		out.WriteString(`":`)
+		out.Write(body)
+		out.WriteByte('}')
+		return out.Bytes(), nil
 	default:
 		return nil, fmt.Errorf("%w: reply must carry exactly one variant", ErrProtocol)
 	}
