@@ -46,6 +46,20 @@ jobs:
   e2e:
     runs-on: ubuntu-latest
     needs: build-controld
+    # Pin the Docker client API version to the daemon's maximum so the real-daemon
+    # IT/E2E legs actually execute instead of failing at the version handshake. The
+    # production provider builds its client with client.NewClientWithOpts(
+    # client.FromEnv) and NO WithAPIVersionNegotiation (docker.go), so it speaks the
+    # SDK's compiled-in default (currently API 1.51). The ubuntu-latest runner's
+    # daemon caps at 1.48, which rejects 1.51 on the first `docker network create`
+    # in Materialize — before any assertion runs. client.FromEnv honours
+    # DOCKER_API_VERSION, so pinning it here makes the production client negotiate
+    # down to a version the daemon accepts, and the three IT legs
+    # (materialize / graceful-stop / force-kill) plus the create→destroy capstone
+    # run their real assertions. Without this the only way past the handshake is an
+    # override, which is a vacuous pass — the IT leg never runs (ocu-control#7).
+    env:
+      DOCKER_API_VERSION: "1.48"
     # A Postgres service so the full lifecycle create→destroy e2e drives a REAL
     # state.Store and the REAL Docker daemon the runner ships TOGETHER — the
     # milestone capability (create + manage a container's lifecycle with state in
