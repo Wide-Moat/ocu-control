@@ -209,6 +209,14 @@ jobs:
   # (T2-10, SUPPLY-03). Fails on known-exploitable vulnerabilities in code
   # reachable from this module. govulncheck@v1.3.0 is pinned by module
   # version (the tool ships no separate binary release).
+  #
+  # The raw scan is wrapped by scripts/govulncheck-waiver.sh, which fails on any
+  # reachable, non-waived finding AND on any waived ID that vanishes (upstream fix
+  # landed -> the waiver is dead and must be removed). The waiver currently covers
+  # five docker/docker@v28.5.2 advisories with no upstream fix; see issue #6 for
+  # the IDs, the RuntimeProvider reachability path, and the review-by date.
+  # The red-probe proves the gate reds when neutered (run alongside, like the
+  # mutation and deadcode gates).
   govulncheck:
     runs-on: ubuntu-latest
     steps:
@@ -218,8 +226,10 @@ jobs:
           go-version-file: go.mod
       - name: install govulncheck (pinned)
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
-      - name: govulncheck
-        run: govulncheck ./...
+      - name: govulncheck waiver red-probe (RED-when-neutered)
+        run: bash scripts/govulncheck-waiver-redprobe.sh
+      - name: govulncheck (waiver-gated, issue #6)
+        run: bash scripts/govulncheck-waiver.sh
 
   # schema is the structural-validity gate for every contract this repo carries,
   # distinct from the byte-identity gate below. It compiles the vendored

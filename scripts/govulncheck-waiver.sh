@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# GATE (SUPPLY-03): the govulncheck waiver gate. It runs govulncheck in JSON
+# mode and fails CI on any reachable vulnerability that is NOT on the explicit
+# waiver list. The waiver covers five docker/docker@v28.5.2 advisories that have
+# no upstream fix (Fixed-in = N/A): the Docker Engine SDK is a build-time
+# dependency of the RuntimeProvider, reached via Materialize -> docker-SDK, and
+# the project tracks no alternative SDK at this version. Each waived ID is listed
+# with its tracking issue and an expiry date; see the WAIVED table below.
+#
+# Three structural rules carry this gate (a waiver that only suppresses is a
+# silent hole an auditor opens first):
+#
+#   1. FAIL on any reachable finding whose OSV ID is NOT waived. govulncheck
+#      reports a finding as reachable when its trace carries a called function
+#      (not a bare import); the gate keys on that, never on govulncheck's exit
+#      code, so a new docker (or any) advisory that becomes reachable turns this
+#      RED rather than slipping under the waiver.
+#   2. ANTI-STALE: FAIL when a waived ID is NO LONGER reported. A waived advisory
+#      vanishing from the scan means upstream shipped a fix (or the reachable
+#      path was removed) — the waiver is now dead weight. The gate goes RED and
+#      tells the operator to drop the ID from WAIVED and bump docker, so a waiver
+#      cannot outlive the condition that justified it.
+#   3. EXPIRY: the waiver carries a review-by date. Past it, the gate goes RED
+#      regardless of findings, forcing a fresh reachability + Fixed-in review
+#      rather than letting a one-time judgement ride forever.
+#
+# A run that produces no parseable JSON fails CLOSED — absence of a result is
+# never a pass (mirrors scripts/mutation-floor.sh).
+#
+# Issue: https://github.com/Wide-Moat/ocu-control/issues/6
+set -euo pipefail
+
+# --- waiver table -----------------------------------------------------------
+# OSV ID -> one-line rationale. All five are docker/docker@v28.5.2, Fixed-in=N/A,
+# reachable from RuntimeProvider Materialize -> docker-SDK. Review the set on or
+# before WAIVER_REVIEW_BY; re-confirm each is still Fixed-in=N/A and still the
+# only path, or remove it.
+declare -A WAIVED=(
+  [GO-2026-4883]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
+  [GO-2026-4887]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
+  [GO-2026-5617]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
+  [GO-2026-5668]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
+  [GO-2026-5746]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
+)
+
+# Review-by date (YYYY-MM-DD). Past this the gate fails closed and the waiver set
+# must be re-reviewed. 90 days from the 2026-06-27 firsthand triage.
+WAIVER_REVIEW_BY="2026-09-27"
+
+# --- input ------------------------------------------------------------------
+# Accept a pre-captured JSON stream as $1 (used by the red-probe), else run the
+# pinned govulncheck. JSON mode is a stream of objects; -C "" pins module mode.
+if [[ $# -ge 1 && -f "$1" ]]; then
+  JSON="$(cat "$1")"
+else
+  if ! command -v govulncheck >/dev/null 2>&1; then
+    echo "::error::govulncheck not found on PATH"
+    echo "  Install the pinned version:"
+    echo "    go install golang.org/x/vuln/cmd/govulncheck@v1.3.0"
+    exit 1
+  fi
+  # govulncheck exits non-zero when it finds reachable vulns; we evaluate the
+  # JSON ourselves, so do not let its exit code abort the capture.
+  JSON="$(govulncheck -format json ./... 2>/dev/null || true)"
+fi
+
+if [[ -z "${JSON//[$'\t\r\n ']/}" ]]; then
+  echo "::error::govulncheck produced no JSON output — failing closed"
+  echo "  An empty scan is never a pass; investigate the toolchain before merging."
+  exit 1
+fi
+
+# --- expiry check -----------------------------------------------------------
+# Compare lexically on YYYY-MM-DD; `date -I` is the run date.
+TODAY="$(date -I)"
+if [[ "$TODAY" > "$WAIVER_REVIEW_BY" ]]; then
+  echo "::error::govulncheck waiver expired (review-by ${WAIVER_REVIEW_BY}, today ${TODAY})"
+  echo "  Re-review each waived ID (still Fixed-in=N/A? still reachable? still"
+  echo "  the only SDK?), update WAIVER_REVIEW_BY, and refresh issue #6."
+  exit 1
+fi
+
+# --- parse reachable findings ----------------------------------------------
+# A govulncheck "finding" frame is reachable when its trace carries a called
+# function (a frame with a non-null .function). Collect the distinct OSV IDs of
+# such findings. jq -s slurps the NDJSON stream into an array.
+REACHED="$(printf '%s' "$JSON" | jq -r -s '
+  [ .[]
+    | select(.finding != null)
+    | .finding
+    | select([.trace[]? | select(.function != null)] | length > 0)
+    | .osv
+  ] | unique | .[]' 2>/dev/null || true)"
+
+# --- rule 1: fail on any reachable, non-waived finding ----------------------
+fail=0
+non_waived=()
+while IFS= read -r id; do
+  [[ -z "$id" ]] && continue
+  if [[ -z "${WAIVED[$id]+x}" ]]; then
+    non_waived+=("$id")
+  fi
+done <<<"$REACHED"
+
+if (( ${#non_waived[@]} > 0 )); then
+  fail=1
+  echo "::error::govulncheck: reachable vulnerabilities NOT on the waiver list:"
+  for id in "${non_waived[@]}"; do
+    echo "    - ${id} (https://pkg.go.dev/vuln/${id})"
+  done
+  echo "  Triage each: bump the dependency if a fix exists, else add to WAIVED"
+  echo "  with a tracking issue + Fixed-in=N/A + reachability rationale."
+fi
+
+# --- rule 2: anti-stale — fail on any waived ID no longer reported -----------
+declare -A REACHED_SET=()
+while IFS= read -r id; do
+  [[ -z "$id" ]] && continue
+  REACHED_SET[$id]=1
+done <<<"$REACHED"
+
+stale=()
+for id in "${!WAIVED[@]}"; do
+  if [[ -z "${REACHED_SET[$id]+x}" ]]; then
+    stale+=("$id")
+  fi
+done
+
+if (( ${#stale[@]} > 0 )); then
+  fail=1
+  echo "::error::govulncheck: waived IDs no longer reachable (upstream fix likely landed):"
+  for id in "${stale[@]}"; do
+    echo "    - ${id} — remove from WAIVED and bump docker/docker to the fixed version"
+  done
+  echo "  A waiver must not outlive the condition that justified it."
+fi
+
+if (( fail == 0 )); then
+  echo "govulncheck waiver gate: PASS"
+  echo "  ${#WAIVED[@]} waived advisories all still reachable + Fixed-in=N/A; no"
+  echo "  non-waived reachable findings; waiver valid until ${WAIVER_REVIEW_BY}."
+fi
+
+exit "$fail"
