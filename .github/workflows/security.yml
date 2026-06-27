@@ -85,11 +85,25 @@ jobs:
         uses: trufflesecurity/trufflehog@d411fff7b8879a62509f3fa98c07f247ac089a51 # v3.95.5
         with:
           path: ./
+          # Pin the SCANNER BINARY, not just the action SHA. The action's
+          # `version` input defaults to "latest", so the SHA-pinned composite
+          # still does `docker run ghcr.io/.../trufflehog:latest` — a fresh
+          # upstream image (e.g. 3.95.6) can change findings under a frozen
+          # action ref. Pinning the image tag to the action's own release makes
+          # the scanner version reproducible alongside the action.
+          version: v3.95.5
           # `--fail` is appended by the entrypoint; `--no-verification`
           # removes the egress credential-validation calls. Do not also pass
           # --results=... or a second --fail (the action rejects repeats and
           # errors on equal BASE/HEAD).
-          extra_args: --no-verification
+          #
+          # --exclude-paths: the repo is mounted at /tmp inside the scanner
+          # image (the action runs `docker run -v .:/tmp -w /tmp`), so the
+          # exclude file is addressed at /tmp/.trufflehog-exclude.txt. It scopes
+          # out the four *_test.go fixture JWTs (unverified, authenticate
+          # nothing) — see that file's header. The detector still runs on all
+          # non-test source.
+          extra_args: --no-verification --exclude-paths /tmp/.trufflehog-exclude.txt
 
   sast-semgrep:
     runs-on: ubuntu-latest
