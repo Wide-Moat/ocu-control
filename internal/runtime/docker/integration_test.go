@@ -6,9 +6,9 @@ package docker
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +19,7 @@ import (
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
 
+	"github.com/Wide-Moat/ocu-control/internal/handoff"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 )
 
@@ -52,6 +53,35 @@ func itImage() string {
 		return v
 	}
 	return defaultITImage
+}
+
+// requireGuestImage gates the lifecycle legs (Materialize / GracefulStop /
+// ForceKill) on a guest image whose ENTRYPOINT is process_api. The provider Cmd
+// is [--listen-uds … --control-listen-uds … --auth-public-key …] — ARGUMENTS to
+// the image ENTRYPOINT, not a standalone executable. The default busybox has no
+// such ENTRYPOINT, so docker would exec `--listen-uds` as argv[0] and the
+// container would die on init before any lifecycle assertion ran — a vacuous
+// run, not a pass. process_api also binds(2) its sockets and loads the key
+// fail-closed at boot, which only succeeds against the real handoff mounts
+// itSpec now stages (CONSTITUTION XI perms).
+//
+// The real guest image is built and published from ocu-sandbox; until that image
+// is reachable on the runner (it lands with the sandbox guest-image merge, #47),
+// OCU_RUNTIME_IT_IMAGE is unset and these legs SKIP with this explicit reason —
+// a declared skip, never a fake green. CI wires OCU_RUNTIME_IT_IMAGE to the
+// sandbox-built image once it is in main; locally, the Lima VM provisions it.
+func requireGuestImage(t *testing.T) string {
+	t.Helper()
+	img := os.Getenv("OCU_RUNTIME_IT_IMAGE")
+	if img == "" || img == defaultITImage {
+		t.Skipf("lifecycle e2e: set OCU_RUNTIME_IT_IMAGE to a guest image whose "+
+			"ENTRYPOINT is process_api; the default %q has no such ENTRYPOINT, so the "+
+			"provider Cmd (flags-as-args) would exec %q as the binary and the container "+
+			"would die on init — the lifecycle assertion would be vacuous. The real "+
+			"guest image ships from ocu-sandbox (needs the guest-image merge, #47) — "+
+			"skipping until it is reachable on this runner", defaultITImage, "--listen-uds")
+	}
+	return img
 }
 
 // itStageDir returns the directory the HOST-01 bind sources are staged in. The
@@ -89,23 +119,24 @@ func itSpec(t *testing.T, name runtime.SessionName) runtime.SessionSpec {
 	t.Helper()
 	dir := itStageDir(t)
 
-	infoPath := filepath.Join(dir, "container_info.json")
-	if err := os.WriteFile(infoPath, []byte(`{"session":"`+string(name)+`"}`), 0o600); err != nil {
-		t.Fatalf("write info json: %v", err)
-	}
-
-	pub, _, err := ed25519.GenerateKey(nil)
+	// Stage the handoff with the REAL production Stager, not a hand-rolled
+	// MkdirAll/WriteFile. A real-daemon container runs process_api as PID1, which
+	// binds(2) its exec/control sockets under /run/ocu and loads --auth-public-key
+	// fail-closed on boot. With the host umask masking modes (the old 0700 sock dir
+	// and 0600 :ro files), a CapDrop-ALL'd guest — whose userns-remapped uid does
+	// not own the staged files — would EACCES on the socket bind and on the key
+	// read, so the container would exit before any lifecycle assertion ran. The
+	// Stager sets the load-bearing modes that make the guest viable: the 0777 sock
+	// leaf inside the 0700 root and the 0644 :ro files (CONSTITUTION XI). Using the
+	// production Stager also keeps the IT binds byte-identical to what Materialize
+	// mounts in production — single source of truth, no drift.
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate ed25519 key: %v", err)
 	}
-	keyPath := filepath.Join(dir, "auth_public_key")
-	if err := os.WriteFile(keyPath, pub, 0o600); err != nil {
-		t.Fatalf("write pubkey: %v", err)
-	}
-
-	sockDir := filepath.Join(dir, "sock")
-	if err := os.MkdirAll(sockDir, 0o700); err != nil {
-		t.Fatalf("mkdir sock dir: %v", err)
+	staged, err := handoff.NewStager(dir).Stage(context.Background(), name, pub, nil)
+	if err != nil {
+		t.Fatalf("stage handoff material: %v", err)
 	}
 
 	pids := int64(128)
@@ -124,15 +155,7 @@ func itSpec(t *testing.T, name runtime.SessionName) runtime.SessionSpec {
 			MemoryBytes: 256 << 20,
 			PidsLimit:   &pids,
 		},
-		Handoff: runtime.HandoffMaterial{
-			ContainerInfoJSON:      []byte(`{"session":"` + string(name) + `"}`),
-			ContainerInfoHostPath:  infoPath,
-			ContainerInfoGuestPath: "/container_info.json",
-			PublicKeyEd25519:       []byte(pub),
-			PublicKeyHostPath:      keyPath,
-			PublicKeyGuestPath:     "/etc/ocu/auth_public_key",
-			HostSockDir:            sockDir,
-		},
+		Handoff: staged.Material,
 	}
 }
 
@@ -142,6 +165,7 @@ func itSpec(t *testing.T, name runtime.SessionName) runtime.SessionSpec {
 // ALL hold, and no host port is published.
 func TestIT_MaterializeAndInspect(t *testing.T) {
 	cli := requireIT(t)
+	requireGuestImage(t)
 	ctx := context.Background()
 
 	pullIfNeeded(t, cli)
@@ -205,6 +229,7 @@ func TestIT_MaterializeAndInspect(t *testing.T) {
 // gone too.
 func TestIT_GracefulStopHonorsGrace(t *testing.T) {
 	cli := requireIT(t)
+	requireGuestImage(t)
 	ctx := context.Background()
 	pullIfNeeded(t, cli)
 
@@ -307,6 +332,7 @@ func TestIT_GvisorRuntimeInspect(t *testing.T) {
 // ForceKill on the same Sandbox is idempotent (no error).
 func TestIT_ForceKillBackstop(t *testing.T) {
 	cli := requireIT(t)
+	requireGuestImage(t)
 	ctx := context.Background()
 	pullIfNeeded(t, cli)
 
