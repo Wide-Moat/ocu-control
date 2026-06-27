@@ -65,6 +65,23 @@ func TestDACWitness_NonOwnerUidIsDeniedByMode(t *testing.T) {
 
 	root := t.TempDir() // owned by the real test uid (root here)
 
+	// Make the scratch parent chain TRAVERSABLE (0711) by the seteuid'd probe.
+	// t.TempDir under sudo-root yields /tmp/TestX/NNN with BOTH levels 0700
+	// root-owned, so uidB has no search bit to traverse INTO root — it would EACCES
+	// reaching even the 0644 fixture, a RED for the wrong reason (parent traversal,
+	// not the file mode) that would MASK whether the 0644 fix actually grants the
+	// read. 0711 = traversable-but-not-listable: uidB can reach the fixtures, and the
+	// PER-FILE mode (0600 vs 0644) is then what gates the read — exactly the delta
+	// this witness must isolate. This is SCRATCH-DIR-ONLY: the production Stage root
+	// stays 0700 (the trust gate; the guest reaches /run/ocu via the bind mount, not
+	// via host-parent traversal, so production is unaffected). Walk up to (not
+	// including) the system temp dir so every Go-created ancestor is traversable.
+	for d := root; d != "" && d != os.TempDir() && d != filepath.Dir(d); d = filepath.Dir(d) {
+		if err := os.Chmod(d, 0o711); err != nil {
+			t.Fatalf("chmod scratch ancestor %s to 0711: %v", d, err)
+		}
+	}
+
 	// A helper that, as uidB, attempts an op against a path owned by uidA at a given
 	// mode and reports whether it was permitted. seteuid is process-global, so this
 	// must run with the goroutine locked to its OS thread and the euid restored
