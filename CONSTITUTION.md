@@ -137,6 +137,67 @@ shapes make that impossible to express.
   `internal/cred` and recorded only as a revocation `jti`, never persisted on the
   row or the event.
 
+## VIII. The control↔guest handoff is fail-CLOSED, never fail-open (A+B)
+
+The host-staged handoff binds are sourced from the per-session host paths the
+Stager actually wrote, mounted at the in-guest target the guest actually reads:
+`container_info.json` at the root `/container_info.json`, the public key at
+`/etc/ocu/auth_public_key`. `runtime.HandoffMaterial` carries a separate
+host-source and guest-target field per artifact, so a bind source can never be a
+guest-only path that does not exist on the host (which Docker would auto-create
+as an empty dir → an empty key fail-closed boot crash, or an empty container_info
+silent identity loss). The earlier single-field shape was a fail-open seam.
+
+- **Enforcement:** `internal/handoff/bind_source_exists_test.go`
+  (`TestStageBindSourcesExistOnHost` — runs the real Stager and asserts every bind
+  SOURCE exists on the host, proven RED on the old src==guest-path bind) and
+  `internal/handoff/handoff_test.go` (`TestStageGuestTargetPathsPinned` — pins the
+  guest targets to the guest's hardcoded read paths). Landed `fa71da9`.
+
+## IX. The ingress request surface is DoS-bounded before auth
+
+Both the gateway and operator HTTP ingresses cap the request body at 64KiB
+(`http.MaxBytesReader` wrapped before the decoder → 413 on an oversized body, the
+body never read whole into memory) and bound the whole-request read and idle
+timeouts. The decode happens before any identity check, so an unbounded body or a
+slow body (Slowloris) would be a pre-auth memory/connection denial-of-service.
+
+- **Enforcement:** `internal/ingress/gateway/internal_test.go` and
+  `internal/ingress/operator/decode_internal_test.go`
+  (`TestDecodeJSONOversizedRejected` — proves the 64KiB cap fires with
+  `*http.MaxBytesError` and that the oversized body is short-circuited, not read
+  whole) plus the per-ingress `TestNewServerTimeoutsConfigured`. Landed `bff13b7`.
+
+## X. A create with no storage scope is sandbox-only, not fail-closed (ADR-0017)
+
+A create that requests no storage scope — a zero `MountIntent`, neither
+`FilesystemID` nor `MemoryStoreID` set — is a legitimate pure compute/exec
+session: it skips the Storage-JWT mint and the mount-config render/push rather
+than failing closed at the mint, so the exec lifecycle is not coupled to the
+storage leg. A create that DOES carry a scope still mints and renders unchanged.
+
+- **Enforcement:** `internal/lifecycle/noscope_test.go`
+  (`TestCreateNoStorageScopeSucceeds` — a zero-Mount create with a real Signer and
+  recording Pusher reaches ACTIVE with Push called zero times; defeating the
+  `hasStorageScope` guard reds it at the mint with `ErrMintScope`). Landed `3226c21`.
+
+## XI. The handoff sock-dir DAC posture is User-agnostic by mode
+
+The inner sock leaf is `0777` inside a `0700` per-session root, and the two `:ro`
+handoff files are `0644`, so a guest whose CapDrop-ALL'd (possibly userns-remapped
+or User-mismatched) uid does not own them can still `bind(2)` its exec socket and
+read its identity + key; the `0700` root parent stays the trust gate. Correctness
+is carried by the mode, never by pinning a guest `User` (which would be a new
+config-asserted contract seam).
+
+- **Enforcement (two distinct guards, neither substitutable):**
+  `internal/handoff/handoff_test.go` (`TestStageWritesAllArtifacts` — the
+  permanence mode-assert: leaf 0777 / files 0644 / root 0700, runs everywhere,
+  reds if any is tightened) and `internal/handoff/dac_witness_linux_test.go`
+  (`TestDACWitness_NonOwnerUidIsDeniedByMode`, `//go:build linux`, root-only,
+  skip-if-non-root declared — proves a genuine non-owner uid is EACCES'd at
+  0600/0700 and allowed at 0644/0777; witnessed firsthand on Lima). Landed `c3ea253`.
+
 ---
 
 ## Read before changing any of the above
