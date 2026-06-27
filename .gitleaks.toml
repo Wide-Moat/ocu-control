@@ -10,6 +10,13 @@
 # scoped as tightly as possible (regex on the exact value, confined to the
 # doc file that uses it).
 
-[allowlist]
+# gitleaks 8.30.1 requires the array-of-tables form ([[allowlists]]), and each
+# entry must carry at least one check (commits / paths / regexes / stopwords) or
+# the config fails to load. There are no false positives to allowlist, so this
+# entry scopes a single inert path key to the local-only, gitignored dev-secrets
+# directory — a path that never enters the tree, so it allowlists nothing real
+# while satisfying the schema. Default behaviour still extends (not replaces) the
+# built-in ruleset.
+[[allowlists]]
   description = "No documented false positives; see header."
-  # Default gitleaks behaviour: extend (not replace) the built-in ruleset.
+  paths = ['''^deploy/dev-secrets/''']

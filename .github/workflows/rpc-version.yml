@@ -36,10 +36,18 @@ jobs:
           fetch-depth: 0
       - name: resolve the base ref for the surface diff
         id: base
+        # Pass the event name and base ref through the environment rather than
+        # interpolating ${{ }} directly into the run: script — github.base_ref is
+        # the (attacker-controllable on a fork PR) base branch name, and splicing
+        # it into shell text is a run-shell-injection risk. As env vars the values
+        # are data the shell reads, never script the shell parses.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="origin/${{ github.base_ref }}"
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            base="origin/$BASE_REF"
           else
             base="HEAD^"
           fi
