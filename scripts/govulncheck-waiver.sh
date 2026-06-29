@@ -73,16 +73,35 @@ else
   # fail-closed gate below — hung => FAIL (then retry), never hung => skip => green.
   # The exit code is intentionally not consulted here (govulncheck exits non-zero
   # on findings too); the JSON-or-empty result is the only signal.
-  SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-120}"
+  #
+  # TIMEOUT BUDGET (must finish INSIDE the job's timeout-minutes:5 = 300s backstop,
+  # else the job is killed mid-retry and marked CANCELLED — which blocks the merge
+  # gate AND hides whether the fetch actually stalled): 3 attempts × 60s + (5s+10s)
+  # inter-attempt backoff = 195s worst case, a 105s margin under 300s. The script
+  # therefore always reaches the fail-closed branch on its own and emits a
+  # deterministic red, never a job-kill CANCELLED. Bumping GOVULNCHECK_TIMEOUT above
+  # ~90 reintroduces the conflict — keep 3×T + 15 < the job backstop.
+  SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-60}"
   JSON=""
   for attempt in 1 2 3; do
     JSON="$(timeout "${SCAN_TIMEOUT}" govulncheck -format json ./... 2>/dev/null || true)"
     if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
       break
     fi
-    echo "::warning::govulncheck attempt ${attempt}/3 produced no JSON (network stall or timeout after ${SCAN_TIMEOUT}s); retrying"
-    sleep $(( attempt * 5 ))
+    # Backoff only BETWEEN attempts, never after the last (a trailing sleep just
+    # burns budget toward the job backstop with no retry to follow).
+    if (( attempt < 3 )); then
+      echo "::warning::govulncheck attempt ${attempt}/3 produced no JSON (vuln.go.dev fetch stalled or timed out after ${SCAN_TIMEOUT}s); retrying"
+      sleep $(( attempt * 5 ))
+    fi
   done
+  if [[ -z "${JSON//[$'\t\r\n ']/}" ]]; then
+    # All retries exhausted with no JSON. Name the likely cause so the next run's
+    # log distinguishes a transient stall (retry will eventually win) from a hard
+    # egress block to vuln.go.dev (the runner cannot reach the DB at all → this is
+    # a real, correct fail-closed, not a flake — the scan genuinely cannot run).
+    echo "::error::govulncheck produced no JSON after 3 bounded attempts — the vuln.go.dev DB fetch did not complete. If the runner has no egress to vuln.go.dev, the scan cannot run and this fail-closed is correct; investigate runner egress or switch to an offline DB (GOVULNDB)."
+  fi
 fi
 
 if [[ -z "${JSON//[$'\t\r\n ']/}" ]]; then
