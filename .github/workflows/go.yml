@@ -219,13 +219,14 @@ jobs:
   # mutation and deadcode gates).
   govulncheck:
     runs-on: ubuntu-latest
-    # Backstop the vuln-DB-fetch hang: a normal scan is well under 2 minutes, so a
-    # 5-minute ceiling lets the in-script timeout+retry (scripts/govulncheck-waiver.sh,
-    # 3×120s) run while still killing a wedged job deterministically instead of
-    # leaving it in_progress for the GitHub default (360 min) — a hung job never
-    # reaches a conclusion, so it blocks the merge gate indefinitely. Hung => the
-    # job fails (re-runnable), never hung => stuck-pending.
-    timeout-minutes: 5
+    # Backstop the vuln-scan hang deterministically (vs the GitHub default 360min,
+    # which leaves a wedged job in_progress forever, blocking the merge gate). Set
+    # to 12 minutes TEMPORARILY so the one-shot package-scan timing diagnostic (≤240s)
+    # and the bounded waiver retries (≤225s) both fit in a single run while we
+    # capture the real package-scan wall-time. REVERT to 5 once the diagnostic step
+    # is removed — a normal package scan is seconds, and the in-script process-group
+    # kill already bounds any wedge.
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -248,6 +249,32 @@ jobs:
           echo "Probing egress to the Go vulnerability DB host (diagnostic only):"
           curl -sS --max-time 20 -o /dev/null -w "vuln.go.dev HTTP %{http_code} in %{time_total}s\n" \
             https://vuln.go.dev/index/db.json 2>&1 || echo "vuln.go.dev unreachable or timed out within 20s (runner egress to the vuln DB host is likely blocked)"
+      # TEMPORARY DIAGNOSTIC (non-blocking): time ONE bare package-scan with no
+      # timeout wrapper, capturing wall-time + stderr, to learn the FACT the waiver
+      # script's bounded retries hide — does -scan-level package finish (and in how
+      # long), or does it wedge even at package level on Go 1.26? continue-on-error
+      # so it never fails the job; the job's timeout-minutes:5 backstop bounds it.
+      # If it finishes in Ns < 60 → the 60s per-attempt budget was simply too tight
+      # and the real fix is a realistic SCAN_TIMEOUT (the process-group kill already
+      # removed the hang-masking, so a bigger budget is honest, not a workaround).
+      # If it wedges past the backstop even at package level → the root is deeper
+      # (govulncheck incompatible with this module on Go 1.26 at any scan level) and
+      # the vuln strategy escalates to the owner. Remove this step once the fact is
+      # captured.
+      - name: govulncheck package-scan timing (TEMP diagnostic, non-blocking)
+        continue-on-error: true
+        run: |
+          echo "Timing a bare -scan-level package scan to capture its real wall-time:"
+          # setsid + timeout -s KILL bounds it at 240s (so it cannot eat the whole
+          # job budget) while still revealing the real wall-time when the scan
+          # finishes under that. /usr/bin/time -v records elapsed + peak RSS.
+          setsid timeout -s KILL 240 /usr/bin/time -v govulncheck -scan-level package -format json ./... >/tmp/gv.json 2>/tmp/gv.err || true
+          echo "=== wall-time + resource (from /usr/bin/time -v, tail): ==="
+          tail -22 /tmp/gv.err || true
+          echo "=== govulncheck stderr/progress (head — what stage it reached): ==="
+          head -40 /tmp/gv.err || true
+          echo "=== JSON output size (0 = produced nothing in 240s → wedges even at package level): ==="
+          wc -c /tmp/gv.json || true
       - name: govulncheck (waiver-gated, issue #6)
         run: bash scripts/govulncheck-waiver.sh
 
