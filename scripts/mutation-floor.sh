@@ -57,9 +57,26 @@ declare -A FLOOR=(
   [registry]=1.0
 )
 
+# --exec-timeout raises go-mutesting's per-mutant test-run window from its 10s
+# default. A mutant whose test run does not fail early runs the full suite to
+# completion; that slowest exec is timeout-sensitive on a loaded CI runner. The
+# admission package is the worked case: it has no loops (Decide is a total
+# bounds-check-plus-table-index), so its costliest mutant is a long-but-FINITE
+# exec, not an infinite loop. Firsthand wall-time of the admission run (18
+# mutants, all killed): ~0.48s/mutant unloaded; 8.68s total under a 16-core CPU
+# burn; 14.75s total (worst single compile+test 1.576s) under GOMAXPROCS=1 + a
+# 16-core burn — the closest local model of a weak, contended runner. The 2-vCPU
+# ubuntu-latest runner under co-tenant load (the sibling coverage/race/staticcheck
+# jobs share its cores) cannot be reproduced exactly here, so the exact CI worst
+# case is unmeasured; 60s is chosen with the margin on the side of STRICTNESS
+# (~37x the measured 1.576s worst). This cannot mask a real gap: a genuine
+# survivor is a mutant that is NEVER killed — it reads as survived at 10s, 60s, or
+# 600s alike — so a wider window only removes the infra-timeout flake (a
+# finite mutant killed locally in 1.6s that the 10s CI window intermittently
+# missed), never a true suite gap. The floor is unchanged.
 fail=0
 for pkg in admission killswitch quota registry; do
-  out="$(go-mutesting "./internal/${pkg}/" 2>&1)"
+  out="$(go-mutesting --exec-timeout=60 "./internal/${pkg}/" 2>&1)"
   score="$(printf '%s\n' "$out" | sed -n -E 's/.*mutation score is ([0-9.]+).*/\1/p')"
   if [ -z "$score" ]; then
     echo "::error::go-mutesting produced no score for ${pkg} (it built nothing — the gremlins-blindness regression class; a no-score run fails closed)"
