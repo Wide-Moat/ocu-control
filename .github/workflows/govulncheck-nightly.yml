@@ -21,6 +21,19 @@ name: govulncheck-nightly
 # advisories with no upstream fix; see issue #6 for the IDs, the RuntimeProvider
 # reachability path, and the review-by date. The red-probe proves the gate reds
 # when neutered (the same six Skeptics the PR job ran alongside it).
+#
+# PORTING (this file is the fleet reference for the govulncheck-hang class — any
+# Go 1.26 repo whose synchronous PR-step govulncheck wedges should copy it). Three
+# points are repo-specific and MUST be adjusted, everything else is verbatim:
+#   1. The build target + binary name: `./cmd/<your-main>` -> `<your>-gatescan`
+#      below, and the matching OCU_GATE_BINARY in the final step. Keep it UNSTRIPPED
+#      (no -ldflags='-s -w') — binary mode needs the symbol table.
+#   2. The waiver script's waived-ID set + the issue reference: each repo carries
+#      its own reachable, no-upstream-fix advisories and its own tracking issue.
+#   3. The red-probe's fixtures, if the waived set differs (its control case must
+#      list this repo's actual waived IDs, or Skeptic D goes red on a real run).
+# The schedule, the move-not-weaken rationale, the egress probe, and the
+# fail-closed posture port unchanged.
 
 on:
   schedule:
