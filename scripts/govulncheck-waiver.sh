@@ -74,17 +74,25 @@ else
   # The exit code is intentionally not consulted here (govulncheck exits non-zero
   # on findings too); the JSON-or-empty result is the only signal.
   #
-  # TIMEOUT BUDGET (must finish INSIDE the job's timeout-minutes:5 = 300s backstop,
-  # else the job is killed mid-retry and marked CANCELLED — which blocks the merge
-  # gate AND hides whether the fetch actually stalled): 3 attempts × 60s + (5s+10s)
-  # inter-attempt backoff = 195s worst case, a 105s margin under 300s. The script
-  # therefore always reaches the fail-closed branch on its own and emits a
-  # deterministic red, never a job-kill CANCELLED. Bumping GOVULNCHECK_TIMEOUT above
-  # ~90 reintroduces the conflict — keep 3×T + 15 < the job backstop.
+  # SIGNAL DELIVERY: plain `timeout 60` sends SIGTERM, which a process wedged in an
+  # uninterruptible network wait (govulncheck's child go-process blocked on the
+  # vuln.go.dev fetch) can ignore — `timeout` then waits forever for a SIGTERM that
+  # never lands, so the per-attempt bound silently does nothing and the JOB backstop
+  # kills it at 5min as CANCELLED (observed: no "attempt 1/3 retrying" warning ever
+  # printed, proving attempt 1 never returned). `--kill-after=10` escalates to
+  # SIGKILL (uninterruptible, cannot be ignored) 10s after the SIGTERM deadline, so
+  # a wedged scan is guaranteed dead at ~70s and the retry loop actually advances.
+  #
+  # TIMEOUT BUDGET (must finish INSIDE the job's timeout-minutes:5 = 300s backstop):
+  # 3 attempts × (60s SIGTERM + 10s SIGKILL grace) + (5s+10s) inter-attempt backoff
+  # = 225s worst case, a 75s margin under 300s. The script always reaches its
+  # fail-closed branch on its own and emits a deterministic red, never a job-kill
+  # CANCELLED. Bumping GOVULNCHECK_TIMEOUT above ~80 reintroduces the conflict —
+  # keep 3×(T+10) + 15 < the job backstop.
   SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-60}"
   JSON=""
   for attempt in 1 2 3; do
-    JSON="$(timeout "${SCAN_TIMEOUT}" govulncheck -format json ./... 2>/dev/null || true)"
+    JSON="$(timeout --kill-after=10 -s TERM "${SCAN_TIMEOUT}" govulncheck -format json ./... 2>/dev/null || true)"
     if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
       break
     fi

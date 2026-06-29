@@ -235,6 +235,19 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
       - name: govulncheck waiver red-probe (RED-when-neutered)
         run: bash scripts/govulncheck-waiver-redprobe.sh
+      # Diagnostic only (never fails the job): probe runner egress to the vuln DB
+      # host. The live waiver scan fetches vuln.go.dev; four consecutive CI hangs
+      # suggest the runner may lack egress to that host (separate from
+      # proxy.golang.org, which the install step reaches). This makes the root
+      # cause first-hand-visible in the log — a fast curl success means egress is
+      # fine and a hang is a transient stall; a curl timeout/failure means the
+      # runner cannot reach the DB at all, so a govulncheck fail-closed is correct,
+      # not a flake. Bounded so the diagnostic itself cannot hang the job.
+      - name: probe vuln-DB egress (diagnostic, non-blocking)
+        run: |
+          echo "Probing egress to the Go vulnerability DB host (diagnostic only):"
+          curl -sS --max-time 20 -o /dev/null -w "vuln.go.dev HTTP %{http_code} in %{time_total}s\n" \
+            https://vuln.go.dev/index/db.json 2>&1 || echo "vuln.go.dev unreachable or timed out within 20s (runner egress to the vuln DB host is likely blocked)"
       - name: govulncheck (waiver-gated, issue #6)
         run: bash scripts/govulncheck-waiver.sh
 
