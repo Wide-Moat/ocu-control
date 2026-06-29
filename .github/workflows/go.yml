@@ -205,89 +205,16 @@ jobs:
           name: go-coverage-profile
           path: cover.out
 
-  # govulncheck scans the module graph against the Go vulnerability database
-  # (T2-10, SUPPLY-03). Fails on known-exploitable vulnerabilities in code
-  # reachable from this module. govulncheck@v1.3.0 is pinned by module
-  # version (the tool ships no separate binary release).
-  #
-  # The raw scan is wrapped by scripts/govulncheck-waiver.sh, which fails on any
-  # reachable, non-waived finding AND on any waived ID that vanishes (upstream fix
-  # landed -> the waiver is dead and must be removed). The waiver currently covers
-  # five docker/docker@v28.5.2 advisories with no upstream fix; see issue #6 for
-  # the IDs, the RuntimeProvider reachability path, and the review-by date.
-  # The red-probe proves the gate reds when neutered (run alongside, like the
-  # mutation and deadcode gates).
-  govulncheck:
-    runs-on: ubuntu-latest
-    # TEMPORARILY 15 (revert to 5) for the one-shot A/B/C wrapper-isolation
-    # diagnostic below — it bounds each variant at 90s but needs headroom over the
-    # 5-min default while the waiver step also runs. Backstop vs the GitHub default
-    # 360min regardless.
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
-        with:
-          go-version-file: go.mod
-      - name: install govulncheck (pinned)
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.3.0
-      # Build an UNSTRIPPED controld for binary-mode govulncheck to scan. The waiver
-      # script runs `govulncheck -mode binary` (NOT a source scan: the source scan's
-      # go-toolchain fork wedges on go 1.26 — issue #6). Binary mode needs symbols, so
-      # this build MUST NOT pass -ldflags='-s -w' (default `go build` keeps the symbol
-      # table + DWARF). The waiver script's strip-guard fails closed if the binary is
-      # ever stripped, so a future -s -w here is caught, not silently fail-open.
-      - name: build an unstripped controld for the binary-mode scan
-        run: CGO_ENABLED=0 go build -trimpath -o ocu-controld-gatescan ./cmd/ocu-controld
-      - name: govulncheck waiver red-probe (RED-when-neutered)
-        run: bash scripts/govulncheck-waiver-redprobe.sh
-      # Diagnostic only (never fails the job): probe runner egress to the vuln DB
-      # host. The live waiver scan fetches vuln.go.dev; four consecutive CI hangs
-      # suggest the runner may lack egress to that host (separate from
-      # proxy.golang.org, which the install step reaches). This makes the root
-      # cause first-hand-visible in the log — a fast curl success means egress is
-      # fine and a hang is a transient stall; a curl timeout/failure means the
-      # runner cannot reach the DB at all, so a govulncheck fail-closed is correct,
-      # not a flake. Bounded so the diagnostic itself cannot hang the job.
-      - name: probe vuln-DB egress (diagnostic, non-blocking)
-        run: |
-          echo "Probing egress to the Go vulnerability DB host (diagnostic only):"
-          curl -sS --max-time 20 -o /dev/null -w "vuln.go.dev HTTP %{http_code} in %{time_total}s\n" \
-            https://vuln.go.dev/index/db.json 2>&1 || echo "vuln.go.dev unreachable or timed out within 20s (runner egress to the vuln DB host is likely blocked)"
-      # TEMPORARY structure diagnostic (non-blocking). A/B/C proved the COMMAND runs
-      # in 0.5s in isolation under an OUTER `timeout 90 bash -c` (which reaps the
-      # lingering process group); the waiver script hangs because it runs the inner
-      # `setsid timeout … govulncheck` DIRECTLY in a retry-loop under `bash -e` with
-      # NO outer reaper. Before committing the fix, prove the EXACT structure to be
-      # committed — the full retry-loop with the outer-reaper wrapper, not a single
-      # isolated command — runs to completion on the runner. If this finishes with a
-      # large JSON in seconds → commit the same structure into the script. If the
-      # full loop still wedges (despite each isolated command being fast) → the
-      # retry-loop/mktemp/bash-e/GH-step interaction is deeper → escalate to owner.
-      - name: govulncheck loop-structure diagnostic (TEMP, non-blocking)
-        continue-on-error: true
-        env:
-          OCU_GATE_BINARY: ${{ github.workspace }}/ocu-controld-gatescan
-        run: |
-          SCAN_TIMEOUT=60
-          JSON=""
-          for attempt in 1 2 3; do
-            GVJSON="$(mktemp)"
-            # OUTER `timeout 90 bash -c` reaps the lingering group (the A/B/C-proven
-            # pattern); INNER timeout bounds the scan itself. setsid dropped — A/B/C
-            # showed it is not needed under the outer reaper.
-            timeout 90 bash -c "timeout -s KILL --kill-after=10 ${SCAN_TIMEOUT} govulncheck -mode binary -format json '${OCU_GATE_BINARY}' >'${GVJSON}' 2>/dev/null </dev/null" || true
-            JSON="$(cat "${GVJSON}")"
-            rm -f "${GVJSON}"
-            if [ -n "${JSON//[$'\t\r\n ']/}" ]; then break; fi
-            echo "attempt ${attempt}/3 produced no JSON; retrying"
-            if [ "${attempt}" -lt 3 ]; then sleep $(( attempt * 5 )); fi
-          done
-          echo "loop-exit: JSON size=$(printf '%s' "$JSON" | wc -c)"
-      - name: govulncheck (waiver-gated, issue #6)
-        env:
-          OCU_GATE_BINARY: ${{ github.workspace }}/ocu-controld-gatescan
-        run: bash scripts/govulncheck-waiver.sh
+  # NOTE: the govulncheck job moved OUT of this per-PR pipeline into the standalone
+  # scheduled workflow .github/workflows/govulncheck-nightly.yml. `-mode binary` is
+  # healthy in isolation (~2s) but its process intermittently survives both the
+  # inner and an outer `timeout` when run as a synchronous PR step under `bash -e`,
+  # wedging the PR job until the step timeout (ocu-control#6 — the scan is healthy,
+  # the runner's PR-step process-reap is not). The nightly schedule has no PR-step
+  # reap interaction and also scans on push:[main], so a reachable non-waived
+  # advisory is still caught at merge-integration time. This is a MOVE of the gate,
+  # NOT a removal: the same vuln.go.dev DB, the same waiver + strip-guard + 6-Skeptic
+  # red-probe, fail-closed-on-empty intact. SUPPLY-03 coverage is preserved.
 
   # schema is the structural-validity gate for every contract this repo carries,
   # distinct from the byte-identity gate below. It compiles the vendored
