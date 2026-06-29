@@ -40,6 +40,14 @@ finding() {
   jq -cn --arg id "$1" \
     '{finding: {osv: $id, trace: [{module: "github.com/docker/docker", function: "NetworkCreate"}]}}'
 }
+# A PACKAGE-level reachable finding: the gate runs at -scan-level package, where
+# govulncheck emits a single-frame trace with a .package but NO .function (per the
+# v1.3.0 Finding doc). The gate's reachability test must treat such a frame as
+# reachable too — this fixture proves the package-level arm is not decorative.
+package_finding() {
+  jq -cn --arg id "$1" \
+    '{finding: {osv: $id, trace: [{module: "github.com/docker/docker", package: "github.com/docker/docker/client"}]}}'
+}
 # The five real waived IDs.
 WAIVED_IDS=(GO-2026-4883 GO-2026-4887 GO-2026-5617 GO-2026-5668 GO-2026-5746)
 
@@ -81,4 +89,17 @@ if ! "$GATE" "$TMP/d.json" >/dev/null 2>&1; then
 fi
 echo "ok: Skeptic D — all-waived-present control case PASSES (the gate is not constant-RED)"
 
-echo "govulncheck-waiver-redprobe: non-waived RED, anti-stale RED, fail-closed RED, control GREEN all proven; tree clean"
+# ── Skeptic E: a PACKAGE-level non-waived finding must go RED ──
+# Proves the -scan-level package reachability arm (.package, no .function) is real:
+# the all-waived control stays green, but adding a non-waived PACKAGE-level finding
+# must still fire. If the gate only recognised .function reachability, this stranger
+# would be seen as unreachable and slip through — green — which is the exact gap the
+# scan-level switch would have opened.
+{ all_waived_stream; package_finding "GO-2026-9999"; } >"$TMP/e.json"
+if "$GATE" "$TMP/e.json" >/dev/null 2>&1; then
+  echo "::error::Skeptic E — gate PASSED with a non-waived PACKAGE-level finding (GO-2026-9999); the package-scan reachability arm is unguarded"
+  exit 1
+fi
+echo "ok: Skeptic E — a non-waived package-level finding fires RED (scan-level package arm)"
+
+echo "govulncheck-waiver-redprobe: non-waived RED, anti-stale RED, fail-closed RED, control GREEN, package-level RED all proven; tree clean"

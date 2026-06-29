@@ -74,32 +74,42 @@ else
   # The exit code is intentionally not consulted here (govulncheck exits non-zero
   # on findings too); the JSON-or-empty result is the only signal.
   #
-  # SIGNAL DELIVERY: plain `timeout 60` sends SIGTERM, which a process wedged in an
-  # uninterruptible network wait (govulncheck's child go-process blocked on the
-  # vuln.go.dev fetch) can ignore — `timeout` then waits forever for a SIGTERM that
-  # never lands, so the per-attempt bound silently does nothing and the JOB backstop
-  # kills it at 5min as CANCELLED (observed: no "attempt 1/3 retrying" warning ever
-  # printed, proving attempt 1 never returned). `--kill-after=10` escalates to
-  # SIGKILL (uninterruptible, cannot be ignored) 10s after the SIGTERM deadline, so
-  # a wedged scan is guaranteed dead at ~70s and the retry loop actually advances.
+  # SCAN LEVEL: run at `-scan-level package`, NOT the default `symbol`. On Go 1.26
+  # the symbol scan's SSA/call-graph stage panics on uninstantiated generics
+  # (golang/go#80139, no upstream fix) and is CPU-bound for 30+ minutes on a large
+  # import closure like this module's Docker SDK (golang/go#68307) — the true cause
+  # of the CI hang (an egress probe confirmed vuln.go.dev returns 200 in ~128ms, so
+  # it was never the network). `-scan-level package` skips the SSA/call-graph stage
+  # entirely — the govulncheck maintainers recommend it precisely to avoid #80139 —
+  # and finishes in seconds. It does NOT weaken the gate: it scans every imported
+  # package against the full vuln DB; it only drops symbol-level "is the vulnerable
+  # function actually called" precision (slightly more conservative — an imported
+  # vulnerable package is flagged even if the specific symbol is never called),
+  # which is the safe direction for a security gate.
+  #
+  # SIGNAL DELIVERY: govulncheck forks a child go-process; a plain `timeout` SIGTERM
+  # reaches only the direct child, and the forked grandchild can survive — holding
+  # the pipe open so bash's $(...) never returns (observed: no retry-warning ever
+  # printed, the job hit the 5-min backstop as CANCELLED). `setsid` puts govulncheck
+  # in its own process group and `timeout -s KILL` SIGKILLs the whole group, so a
+  # wedged scan dies for real and the retry loop advances. (With package-scan the
+  # hang should not recur; this is hardening so any future wedge is a bounded
+  # honest-red, never a silent 5-min cancel.)
   #
   # TIMEOUT BUDGET (must finish INSIDE the job's timeout-minutes:5 = 300s backstop):
-  # 3 attempts × (60s SIGTERM + 10s SIGKILL grace) + (5s+10s) inter-attempt backoff
-  # = 225s worst case, a 75s margin under 300s. The script always reaches its
-  # fail-closed branch on its own and emits a deterministic red, never a job-kill
-  # CANCELLED. Bumping GOVULNCHECK_TIMEOUT above ~80 reintroduces the conflict —
-  # keep 3×(T+10) + 15 < the job backstop.
+  # 3 attempts × (60s + 10s SIGKILL grace) + (5s+10s) inter-attempt backoff = 225s
+  # worst case, a 75s margin under 300s. Keep 3×(T+10) + 15 < the job backstop.
   SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-60}"
   JSON=""
   for attempt in 1 2 3; do
-    JSON="$(timeout --kill-after=10 -s TERM "${SCAN_TIMEOUT}" govulncheck -format json ./... 2>/dev/null || true)"
+    JSON="$(setsid timeout -s KILL --kill-after=10 "${SCAN_TIMEOUT}" govulncheck -scan-level package -format json ./... 2>/dev/null || true)"
     if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
       break
     fi
     # Backoff only BETWEEN attempts, never after the last (a trailing sleep just
     # burns budget toward the job backstop with no retry to follow).
     if (( attempt < 3 )); then
-      echo "::warning::govulncheck attempt ${attempt}/3 produced no JSON (vuln.go.dev fetch stalled or timed out after ${SCAN_TIMEOUT}s); retrying"
+      echo "::warning::govulncheck attempt ${attempt}/3 produced no JSON (scan wedged or timed out after ${SCAN_TIMEOUT}s); retrying"
       sleep $(( attempt * 5 ))
     fi
   done
@@ -129,14 +139,22 @@ if [[ "$TODAY" > "$WAIVER_REVIEW_BY" ]]; then
 fi
 
 # --- parse reachable findings ----------------------------------------------
-# A govulncheck "finding" frame is reachable when its trace carries a called
-# function (a frame with a non-null .function). Collect the distinct OSV IDs of
-# such findings. jq -s slurps the NDJSON stream into an array.
+# Reachability is scan-level-aware. At symbol scan a reachable finding's trace
+# carries a called function (a frame with a non-null .function). At PACKAGE scan
+# (what this gate runs — see the -scan-level rationale above) govulncheck emits a
+# single-frame trace with NO .function/.symbol, only .package/.module: per the
+# govulncheck v1.3.0 Finding doc, "for package level source findings, the trace
+# will contain a single-frame with no symbol or position." A package-level finding
+# is emitted ONLY for a package actually in the import graph, so the presence of a
+# frame with a non-null .package is itself the reachability signal at that level.
+# Accept either, so the same gate stays correct under both scan levels — a frame
+# with a function (symbol) OR a frame with a package (package) marks the OSV
+# reachable. Collect the distinct OSV IDs. jq -s slurps the NDJSON stream.
 REACHED="$(printf '%s' "$JSON" | jq -r -s '
   [ .[]
     | select(.finding != null)
     | .finding
-    | select([.trace[]? | select(.function != null)] | length > 0)
+    | select([.trace[]? | select(.function != null or .package != null)] | length > 0)
     | .osv
   ] | unique | .[]' 2>/dev/null || true)"
 
