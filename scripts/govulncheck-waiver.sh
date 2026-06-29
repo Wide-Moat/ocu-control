@@ -91,14 +91,21 @@ else
   # exits 2 (unknown flag, instant) on the pinned v1.3.0 — re-check the flag name
   # against the pinned version before any govulncheck bump.
   #
-  # SIGNAL DELIVERY: govulncheck forks a child go-process; a plain `timeout` SIGTERM
-  # reaches only the direct child, and the forked grandchild can survive — holding
-  # the pipe open so bash's $(...) never returns (observed: no retry-warning ever
-  # printed, the job hit the 5-min backstop as CANCELLED). `setsid` puts govulncheck
-  # in its own process group and `timeout -s KILL` SIGKILLs the whole group, so a
-  # wedged scan dies for real and the retry loop advances. (With package-scan the
-  # hang should not recur; this is hardening so any future wedge is a bounded
-  # honest-red, never a silent 5-min cancel.)
+  # OUTPUT CAPTURE — write stdout to a FILE, do NOT wrap govulncheck in $(...). Under
+  # go 1.26 the go toolchain forks a child toolchain process into its own session
+  # that inherits fd1; the scan itself finishes in ~3s with full JSON (diagnostic:
+  # `-scan package` = Elapsed 0:02.82, exit 0, 506KB), but a command-substitution
+  # `$(...)` waits for EVERY writer end of the pipe to close, and the detached
+  # grandchild keeps fd1 open — so `$(govulncheck ...)` hangs for ~15 minutes until
+  # the job backstop kills it, with no retry-warning ever printed (firsthand). A
+  # `setsid` + `timeout -s KILL` made it WORSE: the SIGKILL targets govulncheck's
+  # process group, but the grandchild already moved to another session, so the
+  # signal never reaches it. The fix is to break the pipe inheritance, not chase
+  # signals: redirect stdout to a temp FILE (no command-substitution pipe for bash
+  # to wait on) and detach stdin with `</dev/null` so the grandchild holds neither
+  # end, then read the file. `timeout` still bounds a genuinely wedged scan; an
+  # empty file then flows into the fail-closed branch below — honest-red, never a
+  # silent cancel.
   #
   # TIMEOUT BUDGET (must finish INSIDE the job's timeout-minutes:5 = 300s backstop):
   # 3 attempts × (60s + 10s SIGKILL grace) + (5s+10s) inter-attempt backoff = 225s
@@ -106,7 +113,11 @@ else
   SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-60}"
   JSON=""
   for attempt in 1 2 3; do
-    JSON="$(setsid timeout -s KILL --kill-after=10 "${SCAN_TIMEOUT}" govulncheck -scan package -format json ./... 2>/dev/null || true)"
+    GVJSON="$(mktemp)"
+    setsid timeout -s KILL --kill-after=10 "${SCAN_TIMEOUT}" \
+      govulncheck -scan package -format json ./... >"${GVJSON}" 2>/dev/null </dev/null || true
+    JSON="$(cat "${GVJSON}")"
+    rm -f "${GVJSON}"
     if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
       break
     fi
