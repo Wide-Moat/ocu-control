@@ -219,12 +219,14 @@ jobs:
   # mutation and deadcode gates).
   govulncheck:
     runs-on: ubuntu-latest
-    # Backstop the vuln-scan deterministically (vs the GitHub default 360min, which
-    # leaves a wedged job in_progress forever, blocking the merge gate). A correct
-    # `-scan package` run is seconds; the in-script setsid + SIGKILL bounds any
-    # future wedge to ≤225s, so a 5-minute job ceiling has ample margin while still
-    # failing a truly stuck job re-runnably instead of hanging.
-    timeout-minutes: 5
+    # TEMPORARILY 15 (revert to 5) so the one-shot CORRECT-FLAG timing diagnostic
+    # (≤600s) PLUS the waiver retries (≤225s) both fit one run — the diagnostic
+    # reveals the real `-scan package` wall-time on this Go-1.26 module (the prior
+    # diagnostic measured the WRONG flag, -scan-level → instant exit 2, so it never
+    # timed the real scan). This run decides: realistic timeout bump (scan finishes,
+    # just slow) vs escalate to owner (wedges even at package level = structural
+    # Go-1.26 incompatibility). Backstop vs the GitHub default 360min.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -247,6 +249,30 @@ jobs:
           echo "Probing egress to the Go vulnerability DB host (diagnostic only):"
           curl -sS --max-time 20 -o /dev/null -w "vuln.go.dev HTTP %{http_code} in %{time_total}s\n" \
             https://vuln.go.dev/index/db.json 2>&1 || echo "vuln.go.dev unreachable or timed out within 20s (runner egress to the vuln DB host is likely blocked)"
+      # TEMPORARY decisive diagnostic (non-blocking): time ONE CORRECT-FLAG
+      # `-scan package` run with a generous 600s bound, so the log shows the real
+      # wall-time even if it is 6–8 minutes (the prior diagnostic measured the wrong
+      # `-scan-level` flag → instant exit 2, so it never timed the real scan). The
+      # `tail` of stderr shows WHERE govulncheck spends the time (loading packages /
+      # building / scanning). This decides the path ONCE: (A) finishes in N<600s →
+      # govulncheck honestly needs >5min on this graph → realistic timeout bump (not
+      # a workaround — the scan really runs, the process-group kill already gives an
+      # honest-red on a true wedge); (B) wedges past 600s even with the correct flag
+      # → structural Go-1.26 incompatibility at package level → escalate to owner
+      # (offline GOVULNDB / -mode binary / waive-with-ADR — gate policy, not
+      # tactical). Removed once the fact is captured.
+      - name: govulncheck -scan package timing (TEMP decisive diagnostic)
+        continue-on-error: true
+        run: |
+          echo "Timing a CORRECT-FLAG -scan package run (600s bound) to capture real wall-time + stage:"
+          setsid timeout -s KILL 600 /usr/bin/time -v govulncheck -scan package -format json ./... >/tmp/gv.json 2>/tmp/gv.err
+          echo "exit=$?"
+          echo "=== JSON output size (0 = produced nothing in 600s → wedges even with the correct flag): ==="
+          wc -c /tmp/gv.json || true
+          echo "=== wall-time + peak RSS (/usr/bin/time -v, tail): ==="
+          tail -24 /tmp/gv.err || true
+          echo "=== govulncheck progress/stage (head — loading / building / scanning): ==="
+          head -40 /tmp/gv.err || true
       - name: govulncheck (waiver-gated, issue #6)
         run: bash scripts/govulncheck-waiver.sh
 
