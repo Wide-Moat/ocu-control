@@ -48,6 +48,14 @@ package_finding() {
   jq -cn --arg id "$1" \
     '{finding: {osv: $id, trace: [{module: "github.com/docker/docker", package: "github.com/docker/docker/client"}]}}'
 }
+# A MODULE-ONLY finding: what binary mode emits when the scanned binary is stripped
+# (-s -w) — the trace frame carries only .module, no .function and no .package. The
+# strip-guard must treat findings that are ALL module-only as a fail-open hazard
+# (reachability unresolvable) and fail closed, not silently pass.
+module_only_finding() {
+  jq -cn --arg id "$1" \
+    '{finding: {osv: $id, trace: [{module: "github.com/docker/docker"}]}}'
+}
 # The five real waived IDs.
 WAIVED_IDS=(GO-2026-4883 GO-2026-4887 GO-2026-5617 GO-2026-5668 GO-2026-5746)
 
@@ -102,4 +110,22 @@ if "$GATE" "$TMP/e.json" >/dev/null 2>&1; then
 fi
 echo "ok: Skeptic E — a non-waived package-level finding fires RED (scan-level package arm)"
 
-echo "govulncheck-waiver-redprobe: non-waived RED, anti-stale RED, fail-closed RED, control GREEN, package-level RED all proven; tree clean"
+# ── Skeptic F: a stripped binary (findings present, ALL module-only) must go RED ──
+# Binary mode against a stripped binary (-s -w) emits findings whose only trace
+# frame is .module (no .function/.package) — reachability is unresolvable. Such a
+# stream MUST fail closed. The strip-guard fires first with the correct diagnosis
+# ("binary is stripped"); anti-stale is a defense-in-depth backstop (the waived IDs
+# also read as unresolved). Both are correct — the test asserts the stream is RED,
+# the strip-guard's value is the ACCURATE diagnosis (vs anti-stale's misleading
+# "upstream fix landed") AND catching a NON-waived module-only finding that rule 1
+# would otherwise miss when reachability is empty. NOTE: this is not isolated to
+# the strip-guard alone (anti-stale co-fires on the waived-only stream); the
+# guard's unique contribution is the diagnosis + the non-waived-in-stripped case.
+{ for id in "${WAIVED_IDS[@]}"; do module_only_finding "$id"; done; } >"$TMP/f.json"
+if "$GATE" "$TMP/f.json" >/dev/null 2>&1; then
+  echo "::error::Skeptic F — gate PASSED on an all-module-only stream (stripped binary); fail-open on an unresolvable scan"
+  exit 1
+fi
+echo "ok: Skeptic F — an all-module-only (stripped-binary) stream fires RED"
+
+echo "govulncheck-waiver-redprobe: non-waived RED, anti-stale RED, fail-closed RED, control GREEN, package-level RED, strip-guard RED all proven; tree clean"

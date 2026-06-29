@@ -65,57 +65,43 @@ else
   # govulncheck exits non-zero when it finds reachable vulns; we evaluate the
   # JSON ourselves, so do not let its exit code abort the capture.
   #
-  # The scan fetches the Go vulnerability database over the network (vuln.go.dev);
-  # an unbounded fetch can stall indefinitely (observed: a ~30-minute CI hang that
-  # blocked merge). Bound each attempt with `timeout` and retry with backoff so a
-  # transient network stall recovers rather than hanging. A `timeout`-killed run
-  # exits non-zero and emits no usable JSON, so a hang flows into the empty-output
-  # fail-closed gate below — hung => FAIL (then retry), never hung => skip => green.
-  # The exit code is intentionally not consulted here (govulncheck exits non-zero
-  # on findings too); the JSON-or-empty result is the only signal.
+  # MODE: `-mode binary`, NOT the default source scan. The source scan
+  # (`-scan source`/`-scan package`) loads packages and shells out to the `go`
+  # toolchain; under go 1.26 that fork detaches a toolchain grandchild that wedges
+  # the process group / command-substitution for ~15 minutes until the job backstop
+  # (the original CI hang — NOT the network: an egress probe confirmed vuln.go.dev
+  # returns 200 in ~128ms, and `-scan package` itself runs in ~3s but its wrapper
+  # hung). Binary mode reads the symbol table of an ALREADY-BUILT binary
+  # (runBinary -> ExtractPackagesAndSymbols -> vulncheck.Binary in govulncheck
+  # v1.3.0) — no package loading, no SSA, no `go` toolchain shell-out at all — so it
+  # structurally cannot spawn the detaching grandchild. It finishes in ~1s and is
+  # deterministic. Same vuln.go.dev DB; the only coverage delta is GOOS/GOARCH-bound
+  # (the one built platform) and a superset of symbol-present-but-unreachable
+  # findings — both safe for a single-platform CI gate.
   #
-  # SCAN LEVEL: run at `-scan package`, NOT the default `symbol`. On Go 1.26 the
-  # symbol scan's SSA/call-graph stage panics on uninstantiated generics
-  # (golang/go#80139, no upstream fix) and is CPU-bound for 30+ minutes on a large
-  # import closure like this module's Docker SDK (golang/go#68307) — the original
-  # CI hang (an egress probe confirmed vuln.go.dev returns 200 in ~128ms, so it was
-  # never the network). `-scan package` skips the SSA/call-graph stage entirely and
-  # finishes in seconds. It does NOT weaken the gate: it scans every imported
-  # package against the full vuln DB; it only drops symbol-level "is the vulnerable
-  # function actually called" precision (slightly more conservative — an imported
-  # vulnerable package is flagged even if the specific symbol is never called),
-  # which is the safe direction for a security gate.
+  # INVOCATION: `-mode binary` takes a positional path to ONE built binary, NOT
+  # `./...`. The binary path is OCU_GATE_BINARY, an UNSTRIPPED controld the
+  # govulncheck CI job builds (`go build -trimpath`, no `-s -w`). The JSON shape is
+  # identical to source mode (the same NDJSON {"finding":{...}} Frame stream), so
+  # the waiver evaluation, the reachability filter, anti-stale, and expiry are all
+  # unchanged. `-mode` is the v1.3.0 flag (internal/scan/flags.go:43 supports
+  # 'source'/'binary'/'extract'); re-check the flag spelling on any govulncheck bump.
   #
-  # FLAG NAME: this is `-scan` in govulncheck v1.3.0 (internal/scan/flags.go:48
-  # registers "scan"); the `-scan-level` spelling is a LATER-version rename and
-  # exits 2 (unknown flag, instant) on the pinned v1.3.0 — re-check the flag name
-  # against the pinned version before any govulncheck bump.
-  #
-  # OUTPUT CAPTURE — write stdout to a FILE, do NOT wrap govulncheck in $(...). Under
-  # go 1.26 the go toolchain forks a child toolchain process into its own session
-  # that inherits fd1; the scan itself finishes in ~3s with full JSON (diagnostic:
-  # `-scan package` = Elapsed 0:02.82, exit 0, 506KB), but a command-substitution
-  # `$(...)` waits for EVERY writer end of the pipe to close, and the detached
-  # grandchild keeps fd1 open — so `$(govulncheck ...)` hangs for ~15 minutes until
-  # the job backstop kills it, with no retry-warning ever printed (firsthand). A
-  # `setsid` + `timeout -s KILL` made it WORSE: the SIGKILL targets govulncheck's
-  # process group, but the grandchild already moved to another session, so the
-  # signal never reaches it. The fix is to break the pipe inheritance, not chase
-  # signals: redirect stdout to a temp FILE (no command-substitution pipe for bash
-  # to wait on) and detach stdin with `</dev/null` so the grandchild holds neither
-  # end, then read the file. `timeout` still bounds a genuinely wedged scan; an
-  # empty file then flows into the fail-closed branch below — honest-red, never a
-  # silent cancel.
-  #
-  # TIMEOUT BUDGET (must finish INSIDE the job's timeout-minutes:5 = 300s backstop):
-  # 3 attempts × (60s + 10s SIGKILL grace) + (5s+10s) inter-attempt backoff = 225s
-  # worst case, a 75s margin under 300s. Keep 3×(T+10) + 15 < the job backstop.
+  # The scan still runs under setsid + a bounded timeout as a seatbelt (binary mode
+  # does not hang, but the bound makes any future regression a deterministic
+  # honest-red rather than a stuck job) with stdout to a FILE (never a $()-pipe a
+  # detached child could keep open).
+  if [[ -z "${OCU_GATE_BINARY:-}" || ! -f "${OCU_GATE_BINARY:-/nonexistent}" ]]; then
+    echo "::error::OCU_GATE_BINARY is unset or not a file — binary-mode govulncheck needs an unstripped built binary to scan; failing closed"
+    echo "  The govulncheck CI job must build an UNSTRIPPED controld (go build -trimpath, no -s -w) and export OCU_GATE_BINARY=<path>."
+    exit 1
+  fi
   SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-60}"
   JSON=""
   for attempt in 1 2 3; do
     GVJSON="$(mktemp)"
     setsid timeout -s KILL --kill-after=10 "${SCAN_TIMEOUT}" \
-      govulncheck -scan package -format json ./... >"${GVJSON}" 2>/dev/null </dev/null || true
+      govulncheck -mode binary -format json "${OCU_GATE_BINARY}" >"${GVJSON}" 2>/dev/null </dev/null || true
     JSON="$(cat "${GVJSON}")"
     rm -f "${GVJSON}"
     if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
@@ -154,17 +140,13 @@ if [[ "$TODAY" > "$WAIVER_REVIEW_BY" ]]; then
 fi
 
 # --- parse reachable findings ----------------------------------------------
-# Reachability is scan-level-aware. At symbol scan a reachable finding's trace
-# carries a called function (a frame with a non-null .function). At PACKAGE scan
-# (what this gate runs — see the -scan-level rationale above) govulncheck emits a
-# single-frame trace with NO .function/.symbol, only .package/.module: per the
-# govulncheck v1.3.0 Finding doc, "for package level source findings, the trace
-# will contain a single-frame with no symbol or position." A package-level finding
-# is emitted ONLY for a package actually in the import graph, so the presence of a
-# frame with a non-null .package is itself the reachability signal at that level.
-# Accept either, so the same gate stays correct under both scan levels — a frame
-# with a function (symbol) OR a frame with a package (package) marks the OSV
-# reachable. Collect the distinct OSV IDs. jq -s slurps the NDJSON stream.
+# Reachability keys on a trace frame carrying a non-null .function (a called
+# symbol) OR a non-null .package (the package is present in the scanned binary's
+# symbol table). Binary mode against an UNSTRIPPED binary populates both, so this
+# filter is correct here; it also stays correct for a source/package scan (where a
+# package-level finding's single frame carries .package, not .function), so the
+# gate does not depend on the scan mode. Collect the distinct OSV IDs of reachable
+# findings. jq -s slurps the NDJSON stream into an array.
 REACHED="$(printf '%s' "$JSON" | jq -r -s '
   [ .[]
     | select(.finding != null)
@@ -172,6 +154,27 @@ REACHED="$(printf '%s' "$JSON" | jq -r -s '
     | select([.trace[]? | select(.function != null or .package != null)] | length > 0)
     | .osv
   ] | unique | .[]' 2>/dev/null || true)"
+
+# --- strip-guard: a stripped binary is a FAIL-OPEN hole, refuse it --------------
+# Binary mode needs symbols. If the scanned binary was built with `-ldflags=-s -w`
+# (symtab + DWARF stripped), govulncheck falls back to MODULE granularity: every
+# finding's trace then carries only .module — no .function, no .package — so the
+# reachability filter above returns ZERO even when findings exist. That would
+# silently miss non-waived vulns AND falsely fire anti-stale (every waived ID
+# "vanished"). Detect it: findings present but NOT ONE frame carries .function or
+# .package across the whole stream => the binary is stripped, the gate cannot
+# resolve reachability, fail closed. (Distinct from "no findings at all", which is
+# a legitimate clean scan handled by the rules below.)
+FINDING_COUNT="$(printf '%s' "$JSON" | jq -s '[ .[] | select(.finding != null) ] | length' 2>/dev/null || echo 0)"
+RESOLVABLE_COUNT="$(printf '%s' "$JSON" | jq -s '
+  [ .[] | select(.finding != null) | .finding
+    | select([.trace[]? | select(.function != null or .package != null)] | length > 0)
+  ] | length' 2>/dev/null || echo 0)"
+if [[ "${FINDING_COUNT:-0}" -gt 0 && "${RESOLVABLE_COUNT:-0}" -eq 0 ]]; then
+  echo "::error::govulncheck binary-mode produced ${FINDING_COUNT} finding(s) but NONE carry a .function or .package frame — the scanned binary is stripped (-s -w), so reachability cannot be resolved. Failing closed."
+  echo "  Build the gate's binary WITHOUT -ldflags='-s -w' (default go build keeps symbols); OCU_GATE_BINARY must be unstripped."
+  exit 1
+fi
 
 # --- rule 1: fail on any reachable, non-waived finding ----------------------
 fail=0
