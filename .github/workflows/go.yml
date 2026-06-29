@@ -219,11 +219,11 @@ jobs:
   # mutation and deadcode gates).
   govulncheck:
     runs-on: ubuntu-latest
-    # Backstop deterministically (vs the GitHub default 360min). The binary-mode
-    # scan runs in ~1s; the waiver script's setsid+SIGKILL+file-capture bound any
-    # future regression to ≤225s, so a 5-minute ceiling has ample margin while still
-    # failing a truly stuck job re-runnably instead of hanging.
-    timeout-minutes: 5
+    # TEMPORARILY 15 (revert to 5) for the one-shot A/B/C wrapper-isolation
+    # diagnostic below — it bounds each variant at 90s but needs headroom over the
+    # 5-min default while the waiver step also runs. Backstop vs the GitHub default
+    # 360min regardless.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
@@ -254,6 +254,27 @@ jobs:
           echo "Probing egress to the Go vulnerability DB host (diagnostic only):"
           curl -sS --max-time 20 -o /dev/null -w "vuln.go.dev HTTP %{http_code} in %{time_total}s\n" \
             https://vuln.go.dev/index/db.json 2>&1 || echo "vuln.go.dev unreachable or timed out within 20s (runner egress to the vuln DB host is likely blocked)"
+      # TEMPORARY one-shot wrapper-isolation diagnostic (non-blocking). The scan
+      # COMMAND changed 3× (source -scan package → tmpfile-capture → -mode binary)
+      # but the CI hang was IDENTICAL each time (zero retry-warnings, ~4.5-5min to
+      # job-timeout). The one invariant across all three is the wrapper
+      # `setsid timeout -s KILL --kill-after=10 60 <cmd> >file 2>/dev/null </dev/null`.
+      # Bare binary-mode is 2.09s locally — but nobody has run it UNDER that wrapper
+      # on a Linux runner. A/B/C isolates the variable: A = current wrapper, B =
+      # timeout without setsid, C = bare. Each bounded by an outer `timeout 90` so the
+      # diagnostic itself cannot wedge. If C is fast + A wedges → setsid is the
+      # culprit, drop it. If C also wedges → runner/govulncheck-under-CI, escalate.
+      - name: govulncheck wrapper isolation A/B/C (TEMP diagnostic, non-blocking)
+        continue-on-error: true
+        env:
+          OCU_GATE_BINARY: ${{ github.workspace }}/ocu-controld-gatescan
+        run: |
+          echo "=== A: setsid timeout (current wrapper) ==="
+          timeout 90 bash -c 'setsid timeout -s KILL --kill-after=10 60 govulncheck -mode binary -format json "$OCU_GATE_BINARY" >/tmp/a.json 2>/dev/null </dev/null; echo "A exit=$? size=$(wc -c </tmp/a.json)"' || echo "A WEDGED >90s"
+          echo "=== B: timeout WITHOUT setsid ==="
+          timeout 90 bash -c 'timeout -s KILL --kill-after=10 60 govulncheck -mode binary -format json "$OCU_GATE_BINARY" >/tmp/b.json 2>/dev/null </dev/null; echo "B exit=$? size=$(wc -c </tmp/b.json)"' || echo "B WEDGED >90s"
+          echo "=== C: BARE, no setsid no timeout ==="
+          timeout 90 bash -c 'govulncheck -mode binary -format json "$OCU_GATE_BINARY" >/tmp/c.json 2>/dev/null </dev/null; echo "C exit=$? size=$(wc -c </tmp/c.json)"' || echo "C WEDGED >90s"
       - name: govulncheck (waiver-gated, issue #6)
         env:
           OCU_GATE_BINARY: ${{ github.workspace }}/ocu-controld-gatescan
