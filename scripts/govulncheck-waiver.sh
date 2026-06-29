@@ -64,7 +64,25 @@ else
   fi
   # govulncheck exits non-zero when it finds reachable vulns; we evaluate the
   # JSON ourselves, so do not let its exit code abort the capture.
-  JSON="$(govulncheck -format json ./... 2>/dev/null || true)"
+  #
+  # The scan fetches the Go vulnerability database over the network (vuln.go.dev);
+  # an unbounded fetch can stall indefinitely (observed: a ~30-minute CI hang that
+  # blocked merge). Bound each attempt with `timeout` and retry with backoff so a
+  # transient network stall recovers rather than hanging. A `timeout`-killed run
+  # exits non-zero and emits no usable JSON, so a hang flows into the empty-output
+  # fail-closed gate below — hung => FAIL (then retry), never hung => skip => green.
+  # The exit code is intentionally not consulted here (govulncheck exits non-zero
+  # on findings too); the JSON-or-empty result is the only signal.
+  SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-120}"
+  JSON=""
+  for attempt in 1 2 3; do
+    JSON="$(timeout "${SCAN_TIMEOUT}" govulncheck -format json ./... 2>/dev/null || true)"
+    if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
+      break
+    fi
+    echo "::warning::govulncheck attempt ${attempt}/3 produced no JSON (network stall or timeout after ${SCAN_TIMEOUT}s); retrying"
+    sleep $(( attempt * 5 ))
+  done
 fi
 
 if [[ -z "${JSON//[$'\t\r\n ']/}" ]]; then
