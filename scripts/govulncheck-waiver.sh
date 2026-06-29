@@ -74,18 +74,22 @@ else
   # The exit code is intentionally not consulted here (govulncheck exits non-zero
   # on findings too); the JSON-or-empty result is the only signal.
   #
-  # SCAN LEVEL: run at `-scan-level package`, NOT the default `symbol`. On Go 1.26
-  # the symbol scan's SSA/call-graph stage panics on uninstantiated generics
+  # SCAN LEVEL: run at `-scan package`, NOT the default `symbol`. On Go 1.26 the
+  # symbol scan's SSA/call-graph stage panics on uninstantiated generics
   # (golang/go#80139, no upstream fix) and is CPU-bound for 30+ minutes on a large
-  # import closure like this module's Docker SDK (golang/go#68307) — the true cause
-  # of the CI hang (an egress probe confirmed vuln.go.dev returns 200 in ~128ms, so
-  # it was never the network). `-scan-level package` skips the SSA/call-graph stage
-  # entirely — the govulncheck maintainers recommend it precisely to avoid #80139 —
-  # and finishes in seconds. It does NOT weaken the gate: it scans every imported
+  # import closure like this module's Docker SDK (golang/go#68307) — the original
+  # CI hang (an egress probe confirmed vuln.go.dev returns 200 in ~128ms, so it was
+  # never the network). `-scan package` skips the SSA/call-graph stage entirely and
+  # finishes in seconds. It does NOT weaken the gate: it scans every imported
   # package against the full vuln DB; it only drops symbol-level "is the vulnerable
   # function actually called" precision (slightly more conservative — an imported
   # vulnerable package is flagged even if the specific symbol is never called),
   # which is the safe direction for a security gate.
+  #
+  # FLAG NAME: this is `-scan` in govulncheck v1.3.0 (internal/scan/flags.go:48
+  # registers "scan"); the `-scan-level` spelling is a LATER-version rename and
+  # exits 2 (unknown flag, instant) on the pinned v1.3.0 — re-check the flag name
+  # against the pinned version before any govulncheck bump.
   #
   # SIGNAL DELIVERY: govulncheck forks a child go-process; a plain `timeout` SIGTERM
   # reaches only the direct child, and the forked grandchild can survive — holding
@@ -102,7 +106,7 @@ else
   SCAN_TIMEOUT="${GOVULNCHECK_TIMEOUT:-60}"
   JSON=""
   for attempt in 1 2 3; do
-    JSON="$(setsid timeout -s KILL --kill-after=10 "${SCAN_TIMEOUT}" govulncheck -scan-level package -format json ./... 2>/dev/null || true)"
+    JSON="$(setsid timeout -s KILL --kill-after=10 "${SCAN_TIMEOUT}" govulncheck -scan package -format json ./... 2>/dev/null || true)"
     if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
       break
     fi
