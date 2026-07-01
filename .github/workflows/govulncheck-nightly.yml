@@ -2,18 +2,23 @@
 # Copyright (c) 2025 Open Computer Use Contributors
 name: govulncheck-nightly
 
-# govulncheck scans the module graph against the Go vulnerability database
-# (T2-10, SUPPLY-03). It runs here as a SCHEDULED job rather than a per-PR gate:
-# `govulncheck -mode binary` works correctly in isolation (~2s, the five waived
-# docker advisories reachable) but its process intermittently survives both the
-# inner and an outer `timeout` when run as a synchronous PR step under `bash -e`,
-# wedging the PR job until the step timeout (ocu-control#6 — the scan is healthy,
-# the runner's PR-step process-reap is not). A nightly schedule has no PR-step
-# reap interaction: it does not block merge, it owns its whole runner, and a hang
-# fails the scheduled run loudly without holding a PR hostage. The reachability
-# waiver, the strip-guard, and the RED-when-neutered red-probe are carried over
-# 1:1 from the PR job — this is a MOVE of the gate, NOT a weakening: the same
-# vuln.go.dev DB, the same waiver logic, the same fail-closed-on-empty posture.
+# govulncheck scans the built binary against the Go vulnerability database
+# (T2-10, SUPPLY-03). It runs here as a SCHEDULED job plus a push-to-main scan:
+# it does not block PR merge, and a reachable non-waived advisory still surfaces
+# loudly at merge-integration time or the next night. The reachability waiver,
+# the strip-guard, and the RED-when-neutered red-probe are the same gate the PR
+# pipeline carried — a MOVE of the gate, NOT a weakening: the same vuln.go.dev
+# DB, the same waiver logic, the same fail-closed-on-empty posture.
+#
+# HISTORY (issue #6): the "govulncheck CI hang" this job was quarantined for was
+# NEVER the scan, the toolchain, timeout/setsid, or the runner's process-reap.
+# The waiver script's is-the-JSON-non-empty check used a bash pattern
+# SUBSTITUTION (${JSON//[$'\t\r\n ']/}) that is quadratic over the ~540 KB scan
+# stream on the runners' bash — measured NOT finishing within 240 s on the exact
+# platform, a >20-minute pure-CPU spin at full size, while the scan itself takes
+# ~1 s. The check is an O(n) glob match now and the whole job completes in
+# seconds (scripts/govulncheck-waiver.sh). The nightly+push placement is kept as
+# the chosen depth, on the corrected rationale above.
 #
 # The waiver (scripts/govulncheck-waiver.sh) fails on any reachable, non-waived
 # finding AND on any waived ID that vanishes (upstream fix landed -> the waiver is
@@ -22,9 +27,12 @@ name: govulncheck-nightly
 # reachability path, and the review-by date. The red-probe proves the gate reds
 # when neutered (the same six Skeptics the PR job ran alongside it).
 #
-# PORTING (this file is the fleet reference for the govulncheck-hang class — any
-# Go 1.26 repo whose synchronous PR-step govulncheck wedges should copy it). Three
-# points are repo-specific and MUST be adjusted, everything else is verbatim:
+# PORTING (this file is the fleet reference for the govulncheck gate). A repo
+# that copied an earlier waiver script MUST carry the O(n) non-emptiness fix —
+# the quadratic substitution IS the "govulncheck-hang" class, and it wedges any
+# bash step that assigns a large scan stream to a variable and pattern-substitutes
+# over it, per-PR and scheduled alike. Three points are repo-specific and MUST be
+# adjusted, everything else is verbatim:
 #   1. The build target + binary name: `./cmd/<your-main>` -> `<your>-gatescan`
 #      below, and the matching OCU_GATE_BINARY in the final step. Keep it UNSTRIPPED
 #      (no -ldflags='-s -w') — binary mode needs the symbol table.
