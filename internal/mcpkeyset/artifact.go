@@ -4,6 +4,7 @@
 package mcpkeyset
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,37 +42,55 @@ const keySetPerm = 0o644
 // world/group-readable hashed-entries file is a store-disclosure surface.
 const entriesPerm = 0o600
 
-// ---- in-process wire shape (A2-FENCED) -------------------------------------
+// ---- published wire shape (A2 — Control→gateway hashed-key-set) -------------
 //
-// The following types carry the in-process versioned envelope that WriteKeySet
-// serializes. The Control→gateway published FIELD SET is A2-FENCED to the
-// architect's canon wire-freeze (Q4/Q7, 08-RESEARCH.md). Plan 08-05 maps the
-// record fields to the canon-frozen set at the wire-freeze checkpoint.
+// The following types carry the canon-frozen Artifact-2 envelope that
+// WriteKeySet serializes: the Control→gateway hashed-key-set contract
+// (contracts/mcp/mcp-key-set.schema.json, JSON-Schema-2020-12). The field set
+// is FROZEN — it matches the ratified ADR-0027 §Storage record verbatim and is
+// the surface the gateway boot-loads to validate a presented sk-ocu- key.
 //
-// DO NOT treat these field names as a frozen wire contract. They are an
-// in-process shape chosen for correctness of the active-filter + atomic-write
-// machinery; the canonical field names come from the architect's wire-freeze.
+// Frozen HashedKeyRecord field set (required: key_id, key_hash, salt, tenant,
+// deployment, status, created_at; optional: expires_at):
+//   - key_id      string (opaque handle; the --id arg of revoke)
+//   - key_hash    lowercase-hex sha256(salt‖secret), 64 hex chars
+//   - salt        lowercase-hex per-key salt, ≥16 hex chars (≥64-bit)
+//   - tenant      the binding tenant (read from the RECORD, never the key)
+//   - deployment  the binding deployment (absent-from-set ⇒ gateway 401)
+//   - status      closed enum "active" | "revoked"
+//   - expires_at  RFC3339 date-time, OPTIONAL (absent ⇒ non-expiring)
+//   - created_at  RFC3339 date-time
+//
+// FENCED-SURFACE INVARIANT: NO plaintext secret, NO sk-ocu- key, NO unsalted
+// digest, NO signing key ever appears here — the artifact is hashes + salts
+// only. The schema is additionalProperties:false at both levels, so no extra
+// field can smuggle a secret in. The published subset is fail-closed to the
+// ACTIVE, non-expired records (revoked/expired are omitted before reaching
+// here), so every emitted record carries status "active"; the "revoked" enum
+// value exists for schema-generality with the at-rest record, not because a
+// revoked key is ever published.
 
-// keySetRecord is the per-record slice element in the in-process boot-set
-// envelope. It carries the fields the gateway needs to recompute sha256(salt‖
-// presented) and resolve the binding; revoked/expired records are OMITTED by
-// the caller before reaching here.
-//
-// FIELD SET IS A2-FENCED — the authoritative list comes from canon at the
-// wire-freeze checkpoint (08-05). Do not code external consumers against these
-// field names.
+// keySetRecord is the per-record slice element in the published hashed-key-set
+// envelope. key_hash and salt are lowercase-hex strings (the byte slices are
+// hex-encoded at projection time to satisfy the frozen ^[0-9a-f]+$ patterns);
+// the RFC3339 timestamps are formatted from the record's time.Time fields.
 type keySetRecord struct {
 	KeyID      string `json:"key_id"`
-	KeyHash    []byte `json:"key_hash"`
-	Salt       []byte `json:"salt"`
+	KeyHash    string `json:"key_hash"`
+	Salt       string `json:"salt"`
 	Tenant     string `json:"tenant"`
 	Deployment string `json:"deployment"`
+	Status     string `json:"status"`
+	// ExpiresAt is omitted when the record is non-expiring (zero ExpiresAt),
+	// matching the frozen "absent ⇒ non-expiring" semantics.
+	ExpiresAt string `json:"expires_at,omitempty"`
+	CreatedAt string `json:"created_at"`
 }
 
-// keySetDoc is the versioned in-process boot-set envelope written by WriteKeySet.
-// Version 1 is the only defined version; a format migration will bump this.
-//
-// FIELD SET IS A2-FENCED — see keySetRecord note above.
+// keySetDoc is the versioned published hashed-key-set envelope written by
+// WriteKeySet. version is the const 1 the frozen schema pins; a format
+// migration bumps it. The schema is additionalProperties:false, so this struct
+// carries exactly the two frozen top-level fields and nothing else.
 type keySetDoc struct {
 	Version int            `json:"version"`
 	Records []keySetRecord `json:"records"`
@@ -81,16 +100,17 @@ type keySetDoc struct {
 // hashed-entries file. It holds the FULL at-rest record set (both active and
 // revoked), written 0600, and is NOT the same artifact as the boot-set.
 type entriesDoc struct {
-	Version int              `json:"version"`
-	Records []mcpkey.Record  `json:"records"`
+	Version int             `json:"version"`
+	Records []mcpkey.Record `json:"records"`
 }
 
 // ---- WriteKeySet ------------------------------------------------------------
 
-// WriteKeySet renders the active, non-expired subset of records as a versioned
-// in-process boot-set envelope and writes it ATOMICALLY to path (temp+fsync+
-// rename, mirroring jwks.WriteArtifact). Revoked and expired records are OMITTED
-// — fail-closed — so a revoked key cannot survive in the published boot-set.
+// WriteKeySet renders the active, non-expired subset of records as the
+// canon-frozen Artifact-2 hashed-key-set envelope and writes it ATOMICALLY to
+// path (temp+fsync+rename, mirroring jwks.WriteArtifact). Revoked and expired
+// records are OMITTED — fail-closed — so a revoked key cannot survive in the
+// published boot-set; every emitted record therefore carries status "active".
 //
 // It is fail-closed on an empty active subset (ErrEmptyKeySet): the artifact is
 // never written when there is nothing to publish, so the gateway cannot end up
@@ -100,9 +120,9 @@ type entriesDoc struct {
 // The deploy layer or the gateway boot-loader reads the file; this package never
 // serves it over a listener (NFR-SEC-52, two-listener invariant untouched).
 //
-// The published FIELD SET is A2-FENCED (see package doc). Plan 08-05 maps the
-// in-process keySetRecord fields to the canon-frozen field list at the wire-freeze
-// checkpoint. Do not treat the current field names as a frozen gateway contract.
+// The published field set is the FROZEN A2 contract (see the keySetRecord doc):
+// key_hash and salt are lowercase-hex, timestamps are RFC3339, and no plaintext
+// secret is ever projected into the record.
 func WriteKeySet(path string, records []mcpkey.Record, now time.Time) error {
 	// Filter to the active, non-expired subset FIRST — before any filesystem
 	// touch. Revoked or expired records are OMITTED (fail-closed).
@@ -111,13 +131,24 @@ func WriteKeySet(path string, records []mcpkey.Record, now time.Time) error {
 		if !r.IsActive(now) {
 			continue
 		}
-		active = append(active, keySetRecord{
+		rec := keySetRecord{
 			KeyID:      r.KeyID,
-			KeyHash:    r.KeyHash,
-			Salt:       r.Salt,
+			KeyHash:    hex.EncodeToString(r.KeyHash),
+			Salt:       hex.EncodeToString(r.Salt),
 			Tenant:     r.Tenant,
 			Deployment: r.Deployment,
-		})
+			// Every published record is active by construction (the IsActive
+			// filter above); the field is emitted explicitly because the frozen
+			// schema marks status required.
+			Status:    string(mcpkey.StatusActive),
+			CreatedAt: r.CreatedAt.UTC().Format(time.RFC3339),
+		}
+		// expires_at is optional: a zero ExpiresAt is a non-expiring key and the
+		// field is omitted entirely (frozen "absent ⇒ non-expiring" semantics).
+		if !r.ExpiresAt.IsZero() {
+			rec.ExpiresAt = r.ExpiresAt.UTC().Format(time.RFC3339)
+		}
+		active = append(active, rec)
 	}
 
 	// Fail-closed BEFORE any filesystem touch: an empty active subset is never

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -24,13 +25,13 @@ import (
 // write tests (the set must be non-empty so we reach the filesystem).
 func activeRecord() mcpkey.Record {
 	return mcpkey.Record{
-		KeyID:     "kid-test-001",
-		KeyHash:   []byte("hashbytes"),
-		Salt:      []byte("saltbytes"),
-		Tenant:    "tenant-a",
+		KeyID:      "kid-test-001",
+		KeyHash:    []byte("hashbytes"),
+		Salt:       []byte("saltbytes"),
+		Tenant:     "tenant-a",
 		Deployment: "deploy-1",
-		Status:    mcpkey.StatusActive,
-		CreatedAt: time.Now(),
+		Status:     mcpkey.StatusActive,
+		CreatedAt:  time.Now(),
 	}
 }
 
@@ -48,6 +49,31 @@ func expiredRecord() mcpkey.Record {
 	r.KeyID = "kid-expired-001"
 	r.ExpiresAt = time.Now().Add(-time.Hour)
 	return r
+}
+
+// realShapeRecord returns an active Record whose KeyHash is a full 32-byte
+// (sha256-width) value and Salt is a 32-byte value, so the projected hex strings
+// match the frozen A2 patterns (^[0-9a-f]{64}$ for key_hash, ^[0-9a-f]{16,}$ for
+// salt). The activeRecord() helper above uses short literal bytes that suffice for
+// the omission/atomic tests but not for the frozen-shape assertion.
+func realShapeRecord() mcpkey.Record {
+	hash := make([]byte, 32)
+	salt := make([]byte, 32)
+	for i := range hash {
+		hash[i] = byte(i + 1)
+	}
+	for i := range salt {
+		salt[i] = byte(i + 33)
+	}
+	return mcpkey.Record{
+		KeyID:      "kid-real-001",
+		KeyHash:    hash,
+		Salt:       salt,
+		Tenant:     "tenant-a",
+		Deployment: "deploy-1",
+		Status:     mcpkey.StatusActive,
+		CreatedAt:  time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC),
+	}
 }
 
 // ---- fakeTempFile seam -------------------------------------------------------
@@ -152,6 +178,95 @@ func TestWriteKeySetAtomic(t *testing.T) {
 	// The document must exist and be non-empty.
 	if len(data) == 0 {
 		t.Fatal("WriteKeySet wrote an empty file")
+	}
+}
+
+// TestWriteKeySetFrozenA2Shape is the RED-when-neutered proof that the published
+// record matches the FROZEN Artifact-2 hashed-key-set contract: key_hash is
+// lowercase-hex matching ^[0-9a-f]{64}$ (NOT base64 — a []byte marshals to base64
+// by default, which this test would catch), salt is ^[0-9a-f]{16,}$, status is the
+// literal "active", created_at is RFC3339, and expires_at is present only for an
+// expiring key and omitted for a non-expiring one. It also asserts NO plaintext
+// secret and NO extra fields leak into the record.
+func TestWriteKeySetFrozenA2Shape(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keyset.json")
+	now := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+
+	nonExpiring := realShapeRecord() // zero ExpiresAt → non-expiring
+	expiring := realShapeRecord()
+	expiring.KeyID = "kid-real-002"
+	expiring.ExpiresAt = now.Add(24 * time.Hour) // future → still active
+
+	if err := WriteKeySet(path, []mcpkey.Record{nonExpiring, expiring}, now); err != nil {
+		t.Fatalf("WriteKeySet: %v", err)
+	}
+
+	var doc struct {
+		Version int              `json:"version"`
+		Records []map[string]any `json:"records"`
+	}
+	data, _ := os.ReadFile(path)
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if doc.Version != 1 {
+		t.Fatalf("version = %d; want 1 (frozen const)", doc.Version)
+	}
+	if len(doc.Records) != 2 {
+		t.Fatalf("got %d records; want 2", len(doc.Records))
+	}
+
+	hexHash := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	hexSalt := regexp.MustCompile(`^[0-9a-f]{16,}$`)
+	rfc3339 := regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}`)
+
+	// The frozen required field set: key_id, key_hash, salt, tenant, deployment,
+	// status, created_at. expires_at is optional. NO other field may appear.
+	allowed := map[string]bool{
+		"key_id": true, "key_hash": true, "salt": true, "tenant": true,
+		"deployment": true, "status": true, "expires_at": true, "created_at": true,
+	}
+	required := []string{"key_id", "key_hash", "salt", "tenant", "deployment", "status", "created_at"}
+
+	for i, rec := range doc.Records {
+		for k := range rec {
+			if !allowed[k] {
+				t.Errorf("record[%d] has forbidden field %q (additionalProperties:false)", i, k)
+			}
+		}
+		for _, k := range required {
+			if _, ok := rec[k]; !ok {
+				t.Errorf("record[%d] missing required field %q", i, k)
+			}
+		}
+		if kh, _ := rec["key_hash"].(string); !hexHash.MatchString(kh) {
+			t.Errorf("record[%d] key_hash %q is not 64-char lowercase hex (base64 leak?)", i, kh)
+		}
+		if s, _ := rec["salt"].(string); !hexSalt.MatchString(s) {
+			t.Errorf("record[%d] salt %q is not lowercase hex ≥16 chars", i, s)
+		}
+		if st, _ := rec["status"].(string); st != "active" {
+			t.Errorf("record[%d] status = %q; want active (only active records are published)", i, st)
+		}
+		if ca, _ := rec["created_at"].(string); !rfc3339.MatchString(ca) {
+			t.Errorf("record[%d] created_at %q is not RFC3339", i, ca)
+		}
+	}
+
+	// The non-expiring record (index 0) must OMIT expires_at; the expiring one
+	// (index 1) must carry a RFC3339 expires_at.
+	if _, present := doc.Records[0]["expires_at"]; present {
+		t.Errorf("non-expiring record carries expires_at; want it omitted")
+	}
+	if ea, _ := doc.Records[1]["expires_at"].(string); !rfc3339.MatchString(ea) {
+		t.Errorf("expiring record expires_at %q is not RFC3339", ea)
+	}
+
+	// No plaintext secret marker anywhere in the artifact bytes.
+	if strings.Contains(string(data), "sk-ocu-") {
+		t.Fatal("plaintext sk-ocu- marker found in the published keyset")
 	}
 }
 

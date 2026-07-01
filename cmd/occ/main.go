@@ -11,9 +11,9 @@
 //	occ mcp-key revoke --id <ID> [--reason <R>]
 //
 // The operator socket is addressed by the -socket flag (default:
-// /run/ocu-control/operator.sock). The daemon side wires the mcp-key routes when
-// the architect's canon wire-freeze lands (Q7 of 08-RESEARCH.md); until then the
-// command plumbing + flag parsing + shown-once render are fully tested and ready.
+// /run/ocu-control/operator.sock). The daemon mounts the mcp-key routes at
+// POST /v1alpha/mcp-keys and POST /v1alpha/mcp-keys/revoke; this CLI is their
+// shipped client.
 //
 // Security notes:
 //   - The raw sk-ocu- key is SHOWN ONCE on stdout at create time; the operator is
@@ -113,11 +113,11 @@ func runMCPKey(ctx context.Context, args []string, socket string, out io.Writer,
 }
 
 // mcpKeyCreateRequest is the JSON body the occ CLI sends to the daemon for
-// mcp-key create. The wire route is deferred (Q7); the body shape mirrors the
-// daemon-side handler signature (tenant, deployment, expires_at).
-//
-// The field names are stable in-process names — the A2 wire-freeze maps them to
-// canon field names at the checkpoint; do not treat them as a frozen wire contract.
+// mcp-key create at POST /v1alpha/mcp-keys. The body shape matches the daemon's
+// mcpKeyCreateBody (tenant, deployment, expires_at). This is the operator-CLI
+// transport (Artifact 1), distinct from the Control→gateway hashed-key-set
+// (Artifact 2) — no key material crosses this request except the shown-once raw
+// key in the response.
 type mcpKeyCreateRequest struct {
 	Tenant     string `json:"tenant"`
 	Deployment string `json:"deployment,omitempty"`
@@ -128,9 +128,8 @@ type mcpKeyCreateRequest struct {
 // mcpKeyCreateResponse is the minimal response the daemon sends back on a
 // successful mcp-key create. RawKey is the shown-once sk-ocu- key (Reveal()
 // was called on the daemon side before serialization). KeyID is the public
-// handle for subsequent revoke --id calls.
-//
-// Like the request body, these are in-process field names pending the wire-freeze.
+// handle for subsequent revoke --id calls. It matches the daemon's
+// mcpKeyCreateResponse field-for-field.
 type mcpKeyCreateResponse struct {
 	RawKey string `json:"raw_key"`
 	KeyID  string `json:"key_id"`

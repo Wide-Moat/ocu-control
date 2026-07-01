@@ -5,11 +5,19 @@ package operator
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 )
+
+// ErrMCPKeyEngineUnset is the fail-closed refusal returned when an mcp-key
+// handler is reached with no MCPKeyEngine wired (a nil Deps.MCPKeyEngine). The
+// route is mounted unconditionally, so a deployment that omits the engine must
+// get a clean refusal, NOT a nil-pointer panic — the handler denies the action
+// before any attestation or scope mint. The transport maps it to 503.
+var ErrMCPKeyEngineUnset = errors.New("operator: mcp-key engine not configured, action refused (fail-closed)")
 
 // MCPKeyCreate is the operator handler for minting a new sk-ocu- MCP API key. The
 // conn is the operator ingress connection whose caller is resolved via
@@ -27,15 +35,14 @@ import (
 //
 // expiresAt is optional: nil means non-expiring (ADR-0027 §Storage).
 //
-// UNMOUNTED, deliberately. This handler is complete and tested in-process but its
-// wire route is DEFERRED, not missing by accident: the mcp-key HTTP/CLI route is
-// gated on the architect's canon wire-freeze (operator-REST verb + Control→gateway
-// hashed-key-set contract, Q7 of the research). It is on the deferredHandlers
-// allow-list, which TestDeferredHandlers_AllowListIsExact enforces — a dead-code
-// pass cannot delete it, and a premature mount fails the build. It is the same
-// design-fenced class as LiftDeny and OverrideQuota. Plan 08-05 mounts the route
-// after the canon wire-freeze checkpoint passes.
+// MOUNTED at POST /v1alpha/mcp-keys on the operator plane ONLY (registerRoutes) —
+// never on the gateway listener (NFR-SEC-52). The route landed once the canon
+// Artifact-2 hashed-key-set contract was frozen; before that it was held on the
+// deferredHandlers allow-list. The occ CLI is the shipped client of this route.
 func (h *Handlers) MCPKeyCreate(ctx context.Context, conn ingress.ConnInfo, tenant, deployment string, expiresAt *time.Time) (mcpkey.SecretKey, mcpkey.Record, error) {
+	if h.mcpKeyEngine == nil {
+		return mcpkey.SecretKey{}, mcpkey.Record{}, ErrMCPKeyEngineUnset
+	}
 	caller, err := h.resolveCaller(ctx, conn)
 	if err != nil {
 		return mcpkey.SecretKey{}, mcpkey.Record{}, err
@@ -51,10 +58,14 @@ func (h *Handlers) MCPKeyCreate(ctx context.Context, conn ingress.ConnInfo, tena
 // keyID is the public handle the operator passes to "revoke --id"; reason is
 // operator-supplied context for the audit trail.
 //
-// UNMOUNTED, deliberately. Same deferral class as MCPKeyCreate — see that method's
-// doc for the rationale. Plan 08-05 mounts both mcp-key routes together at the
-// wire-freeze checkpoint.
+// MOUNTED at POST /v1alpha/mcp-keys/revoke on the operator plane ONLY, alongside
+// MCPKeyCreate — see that method's doc. The store Revoke is idempotent: revoking
+// an already-revoked or absent key_id is a no-op success (no cross-tenant
+// existence oracle), so this route returns 200 rather than 404 for an unknown id.
 func (h *Handlers) MCPKeyRevoke(ctx context.Context, conn ingress.ConnInfo, keyID, reason string) error {
+	if h.mcpKeyEngine == nil {
+		return ErrMCPKeyEngineUnset
+	}
 	caller, err := h.resolveCaller(ctx, conn)
 	if err != nil {
 		return err

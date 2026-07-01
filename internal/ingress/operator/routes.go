@@ -8,10 +8,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
@@ -126,6 +128,47 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 			return
 		}
 		writeStatus(w, http.StatusOK, "deny-all lifted")
+	})
+
+	// The mcp-key operator surface (ADR-0027) mints and revokes the sk-ocu- MCP
+	// API keys. Both are POST-only on the operator plane ONLY — never mounted on
+	// the gateway listener (NFR-SEC-52). The literal /revoke segment outranks the
+	// bare create path so the two cannot conflict. The caller is host-attested from
+	// SO_PEERCRED inside the handler; no body field carries the acting identity.
+	mux.HandleFunc("POST /v1alpha/mcp-keys", func(w http.ResponseWriter, r *http.Request) {
+		conn := connInfoFromRequest(r)
+		var body mcpKeyCreateBody
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeDecodeError(w, err)
+			return
+		}
+		sk, rec, err := h.MCPKeyCreate(r.Context(), conn, body.Tenant, body.Deployment, body.ExpiresAt)
+		if err != nil {
+			writeMCPKeyError(w, err)
+			return
+		}
+		// Reveal the raw key exactly once here, for the shown-once CLI render. The
+		// SecretKey redacts on every other surface; this is the single escape hatch,
+		// mirroring the occ create-response contract.
+		writeJSON(w, http.StatusCreated, mcpKeyCreateResponse{
+			RawKey: sk.Reveal(),
+			KeyID:  rec.KeyID,
+			Tenant: rec.Tenant,
+		})
+	})
+
+	mux.HandleFunc("POST /v1alpha/mcp-keys/revoke", func(w http.ResponseWriter, r *http.Request) {
+		conn := connInfoFromRequest(r)
+		var body mcpKeyRevokeBody
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeDecodeError(w, err)
+			return
+		}
+		if err := h.MCPKeyRevoke(r.Context(), conn, body.KeyID, body.Reason); err != nil {
+			writeMCPKeyError(w, err)
+			return
+		}
+		writeStatus(w, http.StatusOK, "revoked")
 	})
 
 	// The admin read-surface (ADR-0022) is mounted only when a reader was supplied.
@@ -260,6 +303,35 @@ type sessionResponse struct {
 	State int    `json:"state"`
 }
 
+// mcpKeyCreateBody is the mcp-key create request. Tenant and Deployment are the
+// operator-supplied SCOPE of the new key (legitimate operator input — the
+// operator chooses which tenant/deployment the key serves, distinct from the
+// NFR-SEC-43 caller-identity rule). ExpiresAt is optional: nil means a
+// non-expiring key (ADR-0027 §Storage). No field carries the acting caller's
+// identity — that is derived from SO_PEERCRED in the handler.
+type mcpKeyCreateBody struct {
+	Tenant     string     `json:"tenant"`
+	Deployment string     `json:"deployment,omitempty"`
+	ExpiresAt  *time.Time `json:"expires_at,omitempty"`
+}
+
+// mcpKeyCreateResponse is the mcp-key create success body. RawKey is the
+// shown-once sk-ocu- key (Reveal() was called in the route handler); the CLI
+// prints it once and it is never served again. KeyID is the public handle for a
+// subsequent revoke --id.
+type mcpKeyCreateResponse struct {
+	RawKey string `json:"raw_key"`
+	KeyID  string `json:"key_id"`
+	Tenant string `json:"tenant"`
+}
+
+// mcpKeyRevokeBody is the mcp-key revoke request: the public key_id handle and an
+// operator-supplied reason for the audit trail.
+type mcpKeyRevokeBody struct {
+	KeyID  string `json:"key_id"`
+	Reason string `json:"reason,omitempty"`
+}
+
 // maxBodyBytes caps the request body the operator decode admits before the
 // decoder is refused — a pre-auth memory / slow-body guard. 64KiB mirrors the
 // control-RPC frame cap; the operator bodies are small JSON. An oversized body
@@ -355,5 +427,23 @@ func writeRevokeError(w http.ResponseWriter, err error) {
 		writeStatus(w, http.StatusUnauthorized, "caller identity unattested")
 	default:
 		writeStatus(w, http.StatusConflict, "revoke refused")
+	}
+}
+
+// writeMCPKeyError maps an mcp-key create/revoke error onto an HTTP status. An
+// unattested caller is 401. A ErrScopeInvalid (the runtime backstop to the
+// compile-time operator-only seal) is 403 — a call reached the engine without a
+// genuine operator scope. Every other failure (mint, audit-emit deny, store,
+// re-render) is a fail-closed 503: the action did NOT take effect, and the body
+// discloses nothing about the internal cause. The audit-first engine guarantees
+// no durable mutation was acknowledged when any of these fire.
+func writeMCPKeyError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ingress.ErrUnattested):
+		writeStatus(w, http.StatusUnauthorized, "caller identity unattested")
+	case errors.Is(err, mcpkey.ErrScopeInvalid):
+		writeStatus(w, http.StatusForbidden, "operator scope required")
+	default:
+		writeStatus(w, http.StatusServiceUnavailable, "mcp-key operation refused")
 	}
 }
