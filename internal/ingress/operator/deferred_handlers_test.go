@@ -36,6 +36,12 @@ var deferredHandlers = map[string]bool{
 	"RevokeAllViaSOAR": true,
 	"LiftDeny":         true,
 	"OverrideQuota":    true,
+	// MCPKeyCreate/MCPKeyRevoke are complete and tested in-process but their HTTP
+	// routes are DEFERRED, gated on the architect's canon wire-freeze (operator-REST
+	// verb + Control→gateway hashed-key-set contract, Q7 of 08-RESEARCH.md). Plan
+	// 08-05 mounts them after the wire-freeze checkpoint passes.
+	"MCPKeyCreate": true,
+	"MCPKeyRevoke": true,
 }
 
 // TestDeferredHandlers_AllowListIsExact is the enforced fence for the deliberately
