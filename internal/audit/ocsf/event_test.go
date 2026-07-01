@@ -101,6 +101,8 @@ func TestActivityForMapsEveryPrivilegedAction(t *testing.T) {
 		{audit.ActionOverrideQuota, activityUpdate},
 		{audit.ActionRetentionPolicy, activityUpdate},
 		{audit.ActionResumeGlobal, activityUpdate},
+		{audit.ActionMCPKeyCreate, activityUpdate},
+		{audit.ActionMCPKeyRevoke, activityUpdate},
 		{audit.ActionCreateRejected, activityOther},
 		{audit.Action(200), activityOther},
 	}
