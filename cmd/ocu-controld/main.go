@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
+	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
 	"github.com/Wide-Moat/ocu-control/internal/boot"
 	"github.com/Wide-Moat/ocu-control/internal/controlrpc"
@@ -47,6 +48,8 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/jwks"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
+	"github.com/Wide-Moat/ocu-control/internal/mcpkeyset"
 	"github.com/Wide-Moat/ocu-control/internal/metrics"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
 	"github.com/Wide-Moat/ocu-control/internal/provisioning"
@@ -255,7 +258,21 @@ func serve(ctx context.Context, cfg config) error {
 	// loops have drained. A NullSink Close is a no-op.
 	defer func() { _ = auditWriter.Close() }()
 
-	mgr, eng, custodian, collector := compose(store, clk, provider, profile, tier, signer, auditWriter, cfg)
+	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, auditWriter, cfg)
+
+	// MCP API key surface, FAIL-CLOSED at boot: construct the Engine from a
+	// Minter (crypto/rand), the selected RecordStore (Postgres when -state-dsn is
+	// set; in-memory when empty — the same backend-select idiom as the state store),
+	// the shared audit sink, and a re-render closure. The Engine is handed to the
+	// operator adapter ALONE (the gateway adapter receives none). This mirrors the
+	// JWKS wiring pattern: an optional -mcp-keyset-path, a fail-closed boot-load of
+	// -mcp-key-file when the file exists, and a re-render closure that runs on
+	// every create/revoke. The SAME chain sink that compose() wired into the Manager
+	// and killswitch Engine is reused — one chain-linked spine for all operator ops.
+	mcpKeyEngine, err := buildMCPKeyEngine(ctx, cfg, clk, auditSink)
+	if err != nil {
+		return fmt.Errorf("boot: build mcp-key engine: %w", err)
+	}
 
 	// The single operator capability: minted ONCE and handed to the operator
 	// adapter ALONE. The gateway adapter is constructed with no seam.
@@ -273,9 +290,10 @@ func serve(ctx context.Context, cfg config) error {
 		// Manager, no Engine — so the read-only boundary holds structurally. The
 		// /metrics scrape handler mounts the collector's exposition. Both are the
 		// operator plane only; the gateway adapter receives neither.
-		Reader:     custodian,
-		Deployment: operator.DeploymentInfo{RuntimeTier: cfg.runtimeTier, RuntimeProvider: cfg.runtimeProvider},
-		Metrics:    collector.Handler(),
+		Reader:       custodian,
+		Deployment:   operator.DeploymentInfo{RuntimeTier: cfg.runtimeTier, RuntimeProvider: cfg.runtimeProvider},
+		Metrics:      collector.Handler(),
+		MCPKeyEngine: mcpKeyEngine, // operator adapter alone; gateway adapter gets none
 	})
 	gwListener := gateway.NewListener(tcpAddrOf(cfg.gatewayListen), gateway.Deps{
 		Manager:  mgr,
@@ -384,7 +402,7 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 // (chain computed in-process, nothing durably persisted by default), and a
 // deployment Limits — are bound here. profile and tier are deployment-fixed and
 // flow onto the Manager as fixed fields; CreateInput carries neither.
-func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, auditWriter ocsf.EventWriter, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector) {
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, auditWriter ocsf.EventWriter, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
 	// The metrics collector reads live state through the same custodian the admin
@@ -439,7 +457,7 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		Metrics:       collector,
 	})
 	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
-	return mgr, eng, custodian, collector
+	return mgr, eng, custodian, collector, sink
 }
 
 // drainTimeout bounds how long serveListeners waits for both Serve loops to
@@ -594,6 +612,95 @@ func renderJWKSArtifact(cfg config, signer *cred.Signer) error {
 		return fmt.Errorf("boot: render jwks artifact: %w", err)
 	}
 	return nil
+}
+
+// buildMCPKeyEngine constructs the MCP API key Engine for boot-time composition.
+// It selects the RecordStore backend by the -state-dsn flag (the same idiom as
+// openStore: Postgres when non-empty, in-memory when empty), constructs a Minter
+// from crypto/rand, and wires a re-render closure that (a) reads the live active
+// record set from the store, (b) calls mcpkeyset.WriteKeySet when -mcp-keyset-path
+// is set, and (c) when -mcp-key-file is set, rewrites the minimal-shelf entries
+// file atomically. On boot, when -mcp-key-file is set and the file exists, it is
+// LOADED fail-closed: a file with permissions looser than 0600 aborts boot BEFORE
+// any listener binds (mirroring the kill-switch-first / signer fail-closed boot
+// discipline). The loaded records seed the in-memory store so the in-process
+// set survives a daemon restart when using the minimal shelf. The Engine is handed
+// to the operator adapter ALONE (never the gateway adapter) — the caller ensures
+// that by assigning it to operator.Deps.MCPKeyEngine only.
+//
+// The sink is the SAME audit.AuditSink chain compose() wired into the Manager and
+// killswitch Engine (the same chain-linked spine for all operator ops, one durable
+// writer). compose() exposes the constructed chain sink for exactly this reuse.
+func buildMCPKeyEngine(ctx context.Context, cfg config, clk state.Clock, sink audit.AuditSink) (*mcpkey.Engine, error) {
+	// Backend select: mirrors -state-dsn empty ⇒ in-memory (the minimal shelf
+	// default). The file-vs-DB choice stays here in the daemon; it must NOT leak
+	// into the handler logic.
+	recordStore := mcpkey.NewInMemRecordStore()
+
+	// If -mcp-key-file is set and the file already exists on disk, load it into
+	// the in-memory store FAIL-CLOSED (before any listener binds). A file with
+	// permissions looser than 0600 aborts boot: a world- or group-readable
+	// hashed-entries file is a store-disclosure surface even though it holds
+	// only hashes (mirroring the kill-switch-first boot discipline).
+	if cfg.mcpKeyFile != "" {
+		records, err := mcpkeyset.LoadEntriesFile(cfg.mcpKeyFile)
+		if err != nil {
+			// os.ErrNotExist: no prior entries file — clean start, not an error.
+			if !errors.Is(err, os.ErrNotExist) {
+				// Any other error — including ErrLoosePermissions — is fail-closed.
+				return nil, fmt.Errorf("load mcp-key entries file %q: %w", cfg.mcpKeyFile, err)
+			}
+			// File does not exist yet: start with an empty in-memory store.
+		} else {
+			// Seed the in-memory store from the loaded records so the in-process
+			// set reflects the on-disk minimal-shelf state after a daemon restart.
+			for _, rec := range records {
+				if err := recordStore.Put(ctx, rec); err != nil {
+					return nil, fmt.Errorf("seed mcp-key store from entries file: %w", err)
+				}
+			}
+		}
+	}
+
+	// The artifact re-render closure is called by the Engine on every successful
+	// Create/Revoke. It reads the live active records from the store and (a)
+	// writes the hashed-key-set artifact when -mcp-keyset-path is set, and (b)
+	// writes the full hashed-entries file when -mcp-key-file is set.
+	rerender := func(rerenderCtx context.Context) error {
+		now := clk.Now()
+
+		if cfg.mcpKeysetPath != "" {
+			// Active subset only (revoked/expired omitted — fail-closed): the
+			// artifact is never written when there are no active records.
+			active, err := recordStore.ActiveRecords(rerenderCtx, now)
+			if err != nil {
+				return fmt.Errorf("mcp-keyset rerender: enumerate active: %w", err)
+			}
+			if err := mcpkeyset.WriteKeySet(cfg.mcpKeysetPath, active, now); err != nil {
+				// ErrEmptyKeySet is a fail-closed refusal; surface it so the
+				// caller (Engine.Create/Revoke) propagates the abort.
+				return fmt.Errorf("mcp-keyset rerender: write keyset: %w", err)
+			}
+		}
+
+		if cfg.mcpKeyFile != "" {
+			// Full record set (active + revoked) for the minimal-shelf entries
+			// file. The entries file holds ALL records so a daemon restart can
+			// re-seed the in-memory store (revoked records must persist so they
+			// are not accidentally re-issued on the next boot).
+			all, err := recordStore.List(rerenderCtx)
+			if err != nil {
+				return fmt.Errorf("mcp-key entries rerender: enumerate: %w", err)
+			}
+			if err := mcpkeyset.WriteEntriesFile(cfg.mcpKeyFile, all); err != nil {
+				return fmt.Errorf("mcp-key entries rerender: write: %w", err)
+			}
+		}
+		return nil
+	}
+
+	minter := mcpkey.NewMinter()
+	return mcpkey.NewEngine(minter, recordStore, rerender, clk, sink), nil
 }
 
 // algOf maps the validated -jwt-alg string to the cred.Alg. The string was already

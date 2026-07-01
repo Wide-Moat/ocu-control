@@ -42,6 +42,8 @@ type config struct {
 	auditSink       string // OCSF audit fan-in sink
 	stateDSN        string // Postgres DSN for durable state; empty selects the in-memory store
 	jwksPath        string // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
+	mcpKeysetPath   string // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
+	mcpKeyFile      string // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
 	create          bool   // a create request presented at startup (smoke hook)
 }
 
@@ -76,6 +78,16 @@ func parse(args []string) (config, runMode, error) {
 		"OPTIONAL path to write the static JWKS artifact the deploy layer serves at the "+
 			"egress edge's remote_jwks URI (ADR-0019 §35); unset disables the emit. Control "+
 			"adds NO listener — it writes a file the deploy layer serves")
+	fs.StringVar(&cfg.mcpKeysetPath, "mcp-keyset-path", "",
+		"OPTIONAL path to write the static hashed-key-set artifact the deploy layer serves "+
+			"to the gateway's config plane; unset disables the emit. Control adds NO listener — "+
+			"it writes a file atomically (temp+fsync+rename). The artifact is re-rendered on "+
+			"every mcp-key create/revoke. Mirrors -jwks-path (ADR-0027)")
+	fs.StringVar(&cfg.mcpKeyFile, "mcp-key-file", "",
+		"OPTIONAL path to the minimal-shelf 0600 root-owned hashed-entries file; unset selects "+
+			"in-memory-only storage (the minimal shelf default). If set and the file exists on boot, "+
+			"it is loaded fail-closed (looser-than-0600 perms abort boot). Written on every "+
+			"mcp-key create/revoke via a full atomic temp+fsync+rename rewrite")
 	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	fs.BoolVar(&healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")
