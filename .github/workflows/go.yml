@@ -206,15 +206,15 @@ jobs:
           path: cover.out
 
   # NOTE: the govulncheck job moved OUT of this per-PR pipeline into the standalone
-  # scheduled workflow .github/workflows/govulncheck-nightly.yml. `-mode binary` is
-  # healthy in isolation (~2s) but its process intermittently survives both the
-  # inner and an outer `timeout` when run as a synchronous PR step under `bash -e`,
-  # wedging the PR job until the step timeout (ocu-control#6 — the scan is healthy,
-  # the runner's PR-step process-reap is not). The nightly schedule has no PR-step
-  # reap interaction and also scans on push:[main], so a reachable non-waived
-  # advisory is still caught at merge-integration time. This is a MOVE of the gate,
-  # NOT a removal: the same vuln.go.dev DB, the same waiver + strip-guard + 6-Skeptic
-  # red-probe, fail-closed-on-empty intact. SUPPLY-03 coverage is preserved.
+  # workflow .github/workflows/govulncheck-nightly.yml (scheduled + push:[main]),
+  # so a reachable non-waived advisory is still caught at merge-integration time.
+  # This is a MOVE of the gate, NOT a removal: the same vuln.go.dev DB, the same
+  # waiver + strip-guard + 6-Skeptic red-probe, fail-closed-on-empty intact.
+  # SUPPLY-03 coverage is preserved. The "hang" that motivated the move was
+  # root-caused later (issue #6): a quadratic bash pattern substitution in the
+  # waiver script's non-emptiness check spinning >20 minutes on the ~540 KB scan
+  # stream — never the scan, timeout/setsid, or the runner. The check is an O(n)
+  # glob match now; the nightly placement is kept as the chosen depth.
 
   # schema is the structural-validity gate for every contract this repo carries,
   # distinct from the byte-identity gate below. It compiles the vendored

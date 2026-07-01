@@ -65,19 +65,17 @@ else
   # govulncheck exits non-zero when it finds reachable vulns; we evaluate the
   # JSON ourselves, so do not let its exit code abort the capture.
   #
-  # MODE: `-mode binary`, NOT the default source scan. The source scan
-  # (`-scan source`/`-scan package`) loads packages and shells out to the `go`
-  # toolchain; under go 1.26 that fork detaches a toolchain grandchild that wedges
-  # the process group / command-substitution for ~15 minutes until the job backstop
-  # (the original CI hang — NOT the network: an egress probe confirmed vuln.go.dev
-  # returns 200 in ~128ms, and `-scan package` itself runs in ~3s but its wrapper
-  # hung). Binary mode reads the symbol table of an ALREADY-BUILT binary
-  # (runBinary -> ExtractPackagesAndSymbols -> vulncheck.Binary in govulncheck
-  # v1.3.0) — no package loading, no SSA, no `go` toolchain shell-out at all — so it
-  # structurally cannot spawn the detaching grandchild. It finishes in ~1s and is
-  # deterministic. Same vuln.go.dev DB; the only coverage delta is GOOS/GOARCH-bound
-  # (the one built platform) and a superset of symbol-present-but-unreachable
-  # findings — both safe for a single-platform CI gate.
+  # MODE: `-mode binary`, NOT the default source scan. Binary mode reads the
+  # symbol table of an ALREADY-BUILT binary (runBinary ->
+  # ExtractPackagesAndSymbols -> vulncheck.Binary in govulncheck v1.3.0) — no
+  # package loading, no SSA — so it finishes in ~1s, is deterministic, and needs
+  # no `go` toolchain at scan time. Same vuln.go.dev DB; the only coverage delta
+  # is GOOS/GOARCH-bound (the one built platform) and a superset of
+  # symbol-present-but-unreachable findings — both safe for a single-platform CI
+  # gate. (The 2026-06/07 "CI hang" was once blamed on the source scan's
+  # toolchain fork; the proven root cause was this script's own quadratic
+  # non-emptiness check — see the O(n) note below. Binary mode stays on its own
+  # merits: speed, determinism, no toolchain at scan time.)
   #
   # INVOCATION: `-mode binary` takes a positional path to ONE built binary, NOT
   # `./...`. The binary path is OCU_GATE_BINARY, an UNSTRIPPED controld the
@@ -87,10 +85,9 @@ else
   # unchanged. `-mode` is the v1.3.0 flag (internal/scan/flags.go:43 supports
   # 'source'/'binary'/'extract'); re-check the flag spelling on any govulncheck bump.
   #
-  # The scan still runs under setsid + a bounded timeout as a seatbelt (binary mode
-  # does not hang, but the bound makes any future regression a deterministic
-  # honest-red rather than a stuck job) with stdout to a FILE (never a $()-pipe a
-  # detached child could keep open).
+  # The scan runs under setsid + a bounded timeout as a seatbelt (the bound makes
+  # any future scanner-side regression a deterministic honest-red rather than a
+  # stuck job) with stdout to a FILE.
   if [[ -z "${OCU_GATE_BINARY:-}" || ! -f "${OCU_GATE_BINARY:-/nonexistent}" ]]; then
     echo "::error::OCU_GATE_BINARY is unset or not a file — binary-mode govulncheck needs an unstripped built binary to scan; failing closed"
     echo "  The govulncheck CI job must build an UNSTRIPPED controld (go build -trimpath, no -s -w) and export OCU_GATE_BINARY=<path>."
@@ -104,7 +101,13 @@ else
       govulncheck -mode binary -format json "${OCU_GATE_BINARY}" >"${GVJSON}" 2>/dev/null </dev/null || true
     JSON="$(cat "${GVJSON}")"
     rm -f "${GVJSON}"
-    if [[ -n "${JSON//[$'\t\r\n ']/}" ]]; then
+    # Non-emptiness = "carries at least one non-whitespace char", tested with a
+    # glob MATCH (one left-to-right scan, O(n)). NEVER test this with the
+    # ${JSON//[$'\t\r\n ']/} substitution: on the runners' bash that
+    # substitution is quadratic over the ~540 KB scan stream and spins the
+    # shell for >20 minutes of pure CPU — the original "CI hang" of issue #6
+    # in its entirety (the scan, setsid, timeout, and the runner were healthy).
+    if [[ "$JSON" == *[![:space:]]* ]]; then
       break
     fi
     # Backoff only BETWEEN attempts, never after the last (a trailing sleep just
@@ -114,7 +117,8 @@ else
       sleep $(( attempt * 5 ))
     fi
   done
-  if [[ -z "${JSON//[$'\t\r\n ']/}" ]]; then
+  # Glob match, not substitution — see the O(n) note above.
+  if [[ "$JSON" != *[![:space:]]* ]]; then
     # All retries exhausted with no JSON. Name the likely cause so the next run's
     # log distinguishes a transient stall (retry will eventually win) from a hard
     # egress block to vuln.go.dev (the runner cannot reach the DB at all → this is
@@ -123,7 +127,8 @@ else
   fi
 fi
 
-if [[ -z "${JSON//[$'\t\r\n ']/}" ]]; then
+# Glob match, not substitution — see the O(n) note above.
+if [[ "$JSON" != *[![:space:]]* ]]; then
   echo "::error::govulncheck produced no JSON output — failing closed"
   echo "  An empty scan is never a pass; investigate the toolchain before merging."
   exit 1
