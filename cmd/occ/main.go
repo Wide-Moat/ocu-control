@@ -7,7 +7,7 @@
 // admin-API/CLI channel already uses). It adds NO third listener — the two-listener
 // invariant (NFR-SEC-52) is untouched. Usage:
 //
-//	occ mcp-key create --tenant <T> [--deployment <D>] [--expires <dur>]
+//	occ mcp-key create --tenant <T> --deployment <D> [--expires <dur>]
 //	occ mcp-key revoke --id <ID> [--reason <R>]
 //
 // The operator socket is addressed by the -socket flag (default:
@@ -149,7 +149,7 @@ func runMCPKeyCreate(ctx context.Context, args []string, socket string, out io.W
 	fs := flag.NewFlagSet("occ mcp-key create", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	tenant := fs.String("tenant", "", "target tenant the new key is scoped to (required)")
-	deployment := fs.String("deployment", "", "deployment scope within the tenant (optional)")
+	deployment := fs.String("deployment", "", "deployment scope within the tenant (required)")
 	expires := fs.String("expires", "", "key expiry as a Go duration (e.g. 720h); absent means non-expiring")
 
 	if err := fs.Parse(args); err != nil {
@@ -157,6 +157,11 @@ func runMCPKeyCreate(ctx context.Context, args []string, socket string, out io.W
 	}
 	if *tenant == "" {
 		return usageError("mcp-key create: --tenant is required")
+	}
+	// The canon create-request marks deployment required (ADR-0027): the daemon
+	// refuses an empty one with 400, so the CLI refuses before dialing.
+	if *deployment == "" {
+		return usageError("mcp-key create: --deployment is required")
 	}
 
 	req := mcpKeyCreateRequest{

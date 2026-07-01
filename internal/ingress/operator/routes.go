@@ -443,6 +443,10 @@ func writeMCPKeyError(w http.ResponseWriter, err error) {
 		writeStatus(w, http.StatusUnauthorized, "caller identity unattested")
 	case errors.Is(err, mcpkey.ErrScopeInvalid):
 		writeStatus(w, http.StatusForbidden, "operator scope required")
+	case errors.Is(err, mcpkey.ErrTenantMissing), errors.Is(err, mcpkey.ErrDeploymentMissing):
+		// The canon create-request marks both required; an empty value would mint
+		// a record the published A2 artifact cannot legally render (minLength 1).
+		writeStatus(w, http.StatusBadRequest, "tenant and deployment are required")
 	default:
 		writeStatus(w, http.StatusServiceUnavailable, "mcp-key operation refused")
 	}

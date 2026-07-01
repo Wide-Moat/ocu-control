@@ -19,6 +19,11 @@
 # against this SHA; bump it deliberately when re-vendoring and verify byte-identity
 # (cmp) before bumping.
 #
+# mcp/mcp-key-set.schema.json is vendored from a LATER canon rev: 09b00fc —
+# "feat(contracts): freeze the mcp-key-set artifact and operator mcp-key verbs
+# (ADR-0027) (#318)" (git blob 25329b0f…). The other pins are unchanged at
+# 5100e14; bump per-file, deliberately, and verify byte-identity (cmp) first.
+#
 # The canon is a SEPARATE repository, so this check runs wherever a checkout
 # is reachable (set OCU_CANON_DIR, default ../open-computer-use) and skips
 # with a notice where it is not (CI without the sibling checkout). The
@@ -39,6 +44,7 @@ readonly -a CONTRACTS=(
   'exec/exec-channel.schema.json'
   'storage/mount-config.schema.json'
   'audit/audit-fanin.asyncapi.yaml'
+  'mcp/mcp-key-set.schema.json'
 )
 
 # Resolve the canon side once: probe the first declared contract to decide

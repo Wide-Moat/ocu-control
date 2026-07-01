@@ -85,12 +85,31 @@ func Test_MCPKey_Create_MissingTenant(t *testing.T) {
 	}
 }
 
+// Test_MCPKey_Create_MissingDeployment mirrors the tenant check: the canon
+// create-request marks deployment required (ADR-0027) and the daemon refuses
+// an empty one with 400, so the CLI refuses before dialing.
+func Test_MCPKey_Create_MissingDeployment(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	err := run(context.Background(), []string{"mcp-key", "create", "--tenant", "acme"}, &out, unixHTTPClient)
+	if err == nil {
+		t.Fatal("mcp-key create without --deployment returned nil; want usageError")
+	}
+	var ue usageError
+	if !isUsageError(err, &ue) {
+		t.Fatalf("error %T (%v) is not a usageError", err, err)
+	}
+	if !strings.Contains(err.Error(), "--deployment") {
+		t.Fatalf("usageError %q does not name '--deployment'", err)
+	}
+}
+
 // Test_MCPKey_Create_BadExpires asserts an invalid --expires duration returns
 // a non-usage error.
 func Test_MCPKey_Create_BadExpires(t *testing.T) {
 	t.Parallel()
 	var out bytes.Buffer
-	err := run(context.Background(), []string{"mcp-key", "create", "--tenant", "acme", "--expires", "notaduration"}, &out, unixHTTPClient)
+	err := run(context.Background(), []string{"mcp-key", "create", "--tenant", "acme", "--deployment", "prod", "--expires", "notaduration"}, &out, unixHTTPClient)
 	if err == nil {
 		t.Fatal("mcp-key create with invalid --expires returned nil; want error")
 	}
@@ -186,7 +205,7 @@ func Test_MCPKey_Create_DaemonRefusal(t *testing.T) {
 
 	var out bytes.Buffer
 	err := run(context.Background(), []string{
-		"mcp-key", "create", "--tenant", "acme",
+		"mcp-key", "create", "--tenant", "acme", "--deployment", "prod",
 	}, &out, fakeDialFunc(srv))
 	if err == nil {
 		t.Fatal("mcp-key create with a 404 response returned nil; want error")

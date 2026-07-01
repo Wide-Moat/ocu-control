@@ -21,6 +21,16 @@ import (
 // by reflection or an accidental struct copy. Callers match it with errors.Is.
 var ErrScopeInvalid = errors.New("mcpkey: operator scope invalid, action refused (fail-closed)")
 
+// ErrTenantMissing and ErrDeploymentMissing refuse a mint whose tenant or
+// deployment is empty, before any side effect. The published A2 record pins
+// both fields with minLength 1 (contracts/mcp/mcp-key-set.schema.json) and the
+// canon create-request marks both required, so admitting either empty would
+// mint a record the hashed-key-set artifact cannot legally render.
+var (
+	ErrTenantMissing     = errors.New("mcpkey: tenant is required (fail-closed)")
+	ErrDeploymentMissing = errors.New("mcpkey: deployment is required (fail-closed)")
+)
+
 // Engine is the composition core for the MCP API key operator verbs. It owns
 // Create (mint → persist → re-render) and Revoke (flip status → re-render), both
 // AUDIT-FIRST and fail-closed: the audit Record is emitted BEFORE any durable
@@ -81,6 +91,12 @@ func NewEngine(minter *Minter, store RecordStore, rerender func(context.Context)
 func (e *Engine) Create(ctx context.Context, scope ingress.OperatorScope, tenant, deployment string, expiresAt *time.Time) (SecretKey, Record, error) {
 	if !scope.Valid() {
 		return SecretKey{}, Record{}, ErrScopeInvalid
+	}
+	if tenant == "" {
+		return SecretKey{}, Record{}, ErrTenantMissing
+	}
+	if deployment == "" {
+		return SecretKey{}, Record{}, ErrDeploymentMissing
 	}
 
 	// Step 1: Mint the sk and build the full Record, which produces the key_id we
