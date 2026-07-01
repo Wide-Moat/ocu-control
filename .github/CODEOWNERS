@@ -1,0 +1,16 @@
+# CODEOWNERS — automatic review assignment.
+#
+# NOTE: @Wide-Moat/maintainers is a placeholder team handle. The repository
+# owner must confirm that this GitHub team exists (or create it) before
+# CODEOWNERS enforcement takes effect.
+
+# Default: all paths require a maintainer review.
+* @Wide-Moat/maintainers
+
+# Security-sensitive paths — tighter explicit ownership.
+/.github/                         @Wide-Moat/maintainers
+/contracts/                       @Wide-Moat/maintainers
+/internal/admission/              @Wide-Moat/maintainers
+/internal/killswitch/             @Wide-Moat/maintainers
+/internal/registry/               @Wide-Moat/maintainers
+/internal/quota/                  @Wide-Moat/maintainers

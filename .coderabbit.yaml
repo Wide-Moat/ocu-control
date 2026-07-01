@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# CodeRabbit AI review configuration for ocu-control.
+#
+# CodeRabbit is ADVISORY here: it posts review comments, it is not a required
+# status check. Merge gating is enforced by branch protection and the CI
+# workflows, never by this file. The settings below steer the bot to flag the
+# things that matter for a security-sensitive control plane and to hold prose
+# to the project's documentation standard (docs/documentation-standard.md).
+#
+# Schema: https://docs.coderabbit.ai/reference/configuration
+
+language: "en-US"
+
+# Max 250 chars. Terse, security-minded, anti-slop.
+tone_instructions: >-
+  Be terse and security-minded. Cite identifiers, not line coordinates. Flag
+  fail-open paths, swallowed errors, and deny-by-default gaps. Skip praise and
+  filler; one finding per comment.
+
+reviews:
+  # "assertive" gives fuller feedback, appropriate for a security repo.
+  profile: "assertive"
+  # Advisory only: do not gate merges from this file.
+  request_changes_workflow: false
+  high_level_summary: true
+  poem: false
+  collapse_walkthrough: true
+  # Flag low-effort / generated-looking changes; advisory label, no merge gate.
+  slop_detection:
+    enabled: true
+
+  auto_review:
+    enabled: true
+    drafts: false
+    base_branches:
+      - "main"
+
+  # Glob excludes: do not spend review on generated fixtures or build output.
+  path_filters:
+    - "!**/testdata/rapid/**"
+    - "!dist/**"
+    - "!build/**"
+
+  path_instructions:
+    - path: "**/*.go"
+      instructions: >-
+        Enforce fail-closed behaviour. The kill-switch / denylist is
+        host-initiated and DENY-ALL engages before any listener binds; flag any
+        branch where a create proceeds before admission, quota, and the
+        kill-switch gate pass. A body-supplied session/tenant/container_name id
+        is a hint, never the authority — flag any code that binds or addresses a
+        session from a request field instead of the host-attested identity.
+        Errors must be wrapped and inspected with errors.Is / errors.As, never
+        compared with ==; flag swallowed or discarded errors (assignment to _,
+        empty error branches). The Storage-JWT signing key and any other secret
+        must never reach a log, error, metric label, or response. Confirm the
+        two-line SPDX header is present. Comments and identifiers English only.
+
+    - path: "**/*.md"
+      instructions: >-
+        Hold prose to docs/documentation-standard.md. Rule 1: refer to code by
+        identifier and filename in sentences; never embed a (file:line)
+        coordinate in prose — line refs belong only in one trailing "Code:" line
+        per section. Rule 2: structure must earn its shape (a short README per
+        package, a deep reference only when a wire protocol or large API needs
+        one; a Mermaid diagram only for a non-linear flow, a linear chain is a
+        sentence). Rule 3: state each fact once, where a reader looks for it.
+        Flag LLM register: uniform sentence rhythm, repeated em-dash beats,
+        "it is worth noting", a doc longer than the code it documents, or a
+        parenthetical claimed exhaustive when the code defines more.
+        Mermaid must render: no "Note over"; no ";" inside a Note.
+
+    - path: "docs/**"
+      instructions: >-
+        Apply docs/documentation-standard.md as above: names not line
+        coordinates in prose, structure that earns its shape, each fact stated
+        once, and Mermaid that renders (no "Note over", no ";" in a Note).
+
+    - path: ".github/workflows/**"
+      instructions: >-
+        Every action in a `uses:` must be pinned to a full 40-hex commit SHA
+        annotated with ` # vX.Y.Z`; flag any bare tag or branch ref. Workflow
+        and job `permissions:` must be least-privilege — flag a broad grant
+        where a narrower scope suffices. Confirm the two-line SPDX header is
+        present.
+
+chat:
+  auto_reply: true

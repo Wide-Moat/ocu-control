@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# One-per-deployment control plane. Bring it up with a single command from the
+# repo root:
+#
+#   docker compose -f deploy/docker-compose.yml up -d --build
+#
+# (With a published release image available, drop --build and set
+# OCU_CONTROL_TAG to the release tag.)
+#
+# The command below carries EVERY required flag the daemon's boot validator
+# demands (operator-listen, gateway-listen, runtime-tier, runtime-provider,
+# workload-profile, jwt-signing-key, audit-sink); omitting any one is a fail-
+# closed boot refusal, so the full set is supplied here. The daemon boots,
+# loads the deny posture, and serves both ingress listeners; a writable
+# -audit-sink path is backed by a durable, fsync-on-write OCSF trail.
+#
+# RUNTIME PREREQUISITE — the Storage-JWT signing key. -jwt-signing-key names a
+# real file that MUST exist at runtime (there is no daemon-default key): the
+# daemon aborts fail-closed at boot without it. The volume mount below points it
+# at OCU_JWT_SIGNING_KEY (default ./deploy/dev-secrets/storage-jwt-signing.key);
+# supply your own secret source there before `up`. To materialize the defaulted
+# dev key from the repo root (idempotent — never overwrites), run:
+#
+#   make dev-secrets
+#
+# or the byte-compatible openssl equivalent:
+#
+#   openssl genpkey -algorithm ed25519 \
+#     -out deploy/dev-secrets/storage-jwt-signing.key \
+#     && chmod 600 deploy/dev-secrets/storage-jwt-signing.key
+#
+# This is a DEV key (default eddsa alg); production provisions the key out of
+# band. The deploy/dev-secrets/ dir is gitignored so a dev key is never staged.
+#
+# Posture notes:
+# - The root filesystem is read-only; the writable surfaces are the audit sink
+#   (fail-closed OCSF records) and the runtime directory for the operator
+#   ingress socket.
+# - The Storage-JWT signing key and the operator credential are read-only
+#   secret mounts the deployment supplies. They are never baked into the image
+#   and never written by the daemon.
+# - RuntimeProvider: Docker is the v1 backend. The control plane drives
+#   per-session executor containers through the provider seam, so it needs a
+#   path to the runtime. The Docker socket is mounted read-only here as the
+#   provider endpoint; tighten this to a brokered/rootless socket in a hardened
+#   deployment. The control plane carries no customer payload.
+# - stop_grace_period covers the host-driven teardown finalizer (credential
+#   revoke, egress-route drop, writable-surface scrub) before the SIGKILL
+#   fallback.
+
+services:
+  controld:
+    image: ghcr.io/wide-moat/ocu-control:${OCU_CONTROL_TAG:-latest}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    user: "65532:65532"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      # Compose resolves a relative seccomp path against the CWD of the
+      # `docker compose` invocation, which the docs pin to the repo root
+      # (`docker compose -f deploy/docker-compose.yml ...`). The profile lives
+      # at deploy/seccomp/, so it must be referenced as ./deploy/seccomp/ for
+      # the default-deny hardening to actually apply.
+      - seccomp:./deploy/seccomp/ocu-controld.json
+    stop_grace_period: 30s
+    command:
+      - -operator-listen
+      - unix:///run/ocu-control/operator.sock
+      - -gateway-listen
+      - 127.0.0.1:9466
+      - -runtime-tier
+      - ${OCU_RUNTIME_TIER:-runc}
+      - -runtime-provider
+      - docker
+      # Deployment-declared trust profile feeding the admission matrix. It is
+      # REQUIRED and deployment-wide (never per-request); the daemon refuses to
+      # boot without it. `untrusted` is the safe default — the most restrictive
+      # admission cell. Override per deployment with OCU_WORKLOAD_PROFILE set to
+      # one of: trusted_operator | internal_workforce | untrusted.
+      - -workload-profile
+      - ${OCU_WORKLOAD_PROFILE:-untrusted}
+      - -jwt-signing-key
+      - /run/secrets/storage-jwt-signing.key
+      - -audit-sink
+      - /var/log/ocu-control/audit.ocsf.jsonl
+      # OPTIONAL — Storage-JWT JWKS artifact (ADR-0019 §35). Uncomment the two
+      # lines below (and the `jwks:` volume + mount) to have Control EMIT the
+      # static JWKS document at this path. Control emits the JWKS artifact at
+      # -jwks-path; the deploy layer serves it over HTTP at the egress edge's
+      # remote_jwks URI (ADR-0019 §35). Control adds no third listener — the
+      # two-listener invariant (§39 / NFR-SEC-52) is unchanged; the file is
+      # served by the deploy layer (the commented jwks-server sidecar below),
+      # not by Control. The artifact re-renders on boot/restart (v1 has no live
+      # rotation hook).
+      # - -jwks-path
+      # - /var/lib/ocu-control/jwks/jwks.json
+    volumes:
+      - audit:/var/log/ocu-control
+      - runtime:/run/ocu-control
+      # OPTIONAL — writable volume for the JWKS artifact (paired with -jwks-path
+      # above). The root filesystem is read-only, so the emit needs a writable
+      # mount; this volume is shared read-only with the served-by sidecar below.
+      # - jwks:/var/lib/ocu-control/jwks
+      # Storage-JWT signing key — a read-only secret mount the deployment
+      # supplies. Replace the host path with your own secret source.
+      - ${OCU_JWT_SIGNING_KEY:-./deploy/dev-secrets/storage-jwt-signing.key}:/run/secrets/storage-jwt-signing.key:ro
+      # RuntimeProvider endpoint (Docker, v1). Read-only; tighten in a
+      # hardened deployment.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    healthcheck:
+      # The probe re-derives the operator socket from the SAME -operator-listen
+      # the serving command binds, so it dials exactly the socket the daemon
+      # serves /healthz on. It exits 0 only when /healthz answers 200 (ready).
+      test:
+        - CMD
+        - /usr/local/bin/ocu-controld
+        - -health-check
+        - -operator-listen
+        - unix:///run/ocu-control/operator.sock
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # OPTIONAL — static-file sidecar that SERVES the JWKS artifact (commented
+  # example, not active, so we do not over-engineer). Control only EMITS the
+  # file at -jwks-path; THIS deploy-layer service serves it over HTTP at the
+  # egress edge's remote_jwks URI (ADR-0019 §35). Control adds no third listener
+  # — the two-listener invariant (§39 / NFR-SEC-52) is unchanged. Uncomment this
+  # service, the `-jwks-path` command lines, and the `jwks` volume to enable.
+  # jwks-server:
+  #   image: nginx:alpine
+  #   read_only: true
+  #   volumes:
+  #     # Read-only mount of the same volume Control writes the artifact into.
+  #     - jwks:/usr/share/nginx/html/.well-known:ro
+  #   # The egress edge fetches remote_jwks from, e.g.,
+  #   #   http://jwks-server/.well-known/jwks.json
+  #   ports:
+  #     - "127.0.0.1:9467:80"
+
+volumes:
+  # Fail-closed audit sink: an audit-write failure denies the privileged
+  # action, so this volume filling up stops privileged actions, not auditing.
+  audit:
+  # Runtime directory for the operator ingress socket (0700, host-owned).
+  runtime:
+  # OPTIONAL — writable volume for the emitted JWKS artifact (paired with the
+  # commented -jwks-path command line and the jwks-server sidecar above).
+  # jwks:

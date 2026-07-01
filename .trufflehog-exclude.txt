@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# trufflehog --exclude-paths: newline-separated regexes matched against the
+# scanned file path. These four *_test.go files carry inert example JWTs used as
+# test fixtures — trufflehog reports them as UNVERIFIED (verified_secrets: 0),
+# i.e. structurally-shaped tokens that authenticate nothing. They are not
+# credentials. The exclusion is scoped to these exact test paths only; the
+# detector still runs against all non-test source, so a real leaked JWT
+# anywhere else still fails the gate.
+internal/audit/ocsf/sink_test\.go
+internal/provisioning/push_test\.go
+internal/runtime/docker/teardown_residue_internal_test\.go
+internal/runtime/docker/teardown_scrub_test\.go

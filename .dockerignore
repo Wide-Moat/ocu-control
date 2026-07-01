@@ -1,0 +1,22 @@
+# .dockerignore — minimize the build context sent to the Docker daemon.
+#
+# The Dockerfile does `COPY . .` into the builder. Without this file the entire
+# working directory (VCS history, planning notes, coverage artifacts, docs, CI
+# config, deploy assets, and any local-only working material) is shipped into
+# the build context and baked into the builder layer — slow, and it pulls in
+# files that are not build inputs.
+#
+# Strategy: ALLOWLIST. Exclude everything, then re-include only the inputs the
+# build actually needs. The build needs the Go module graph (go.mod/go.sum) and
+# the Go packages under cmd/ and internal/; there is no go:embed, so nothing
+# else is required. An allowlist cannot silently drift: a new top-level tree is
+# excluded by default and only ships if it is explicitly re-included here.
+
+# Exclude everything by default.
+*
+
+# Re-include the build inputs.
+!go.mod
+!go.sum
+!cmd
+!internal

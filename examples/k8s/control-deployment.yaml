@@ -1,0 +1,193 @@
+---
+# examples/k8s/control-deployment.yaml
+#
+# Control-plane Deployment for the ocu-controld daemon (component-02).
+#
+# ONE-PER-DEPLOYMENT. This manifest runs the single control plane that owns
+# session lifecycle, admission/quota, the kill-switch/denylist, and the
+# Storage-JWT signer for the whole deployment. It is NOT scaled out: the
+# kill-switch-under-saturation target reserves admission priority for the
+# revoke route rather than adding replicas (component-02 Operational concerns).
+#
+# The args below carry EVERY required flag the daemon's boot validator demands
+# (operator-listen, gateway-listen, runtime-tier, runtime-provider,
+# workload-profile, jwt-signing-key, audit-sink); omitting any one is a fail-
+# closed boot refusal, so the full set is supplied here. The daemon boots, loads
+# the deny posture, and serves both ingress listeners. The -jwt-signing-key path
+# MUST resolve to a real key at runtime (the ocu-control-jwt-signing-key Secret
+# mounted below) or the daemon aborts fail-closed at boot. The per-session
+# executor is a separate deployable (ocu-sandbox, container-05, [1..N]) the
+# control plane drives over the host-dialled control channel; it is not part of
+# this manifest.
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ocu-controld
+  labels:
+    app.kubernetes.io/name: ocu-controld
+    app.kubernetes.io/component: control-plane
+    app.kubernetes.io/part-of: open-computer-use
+spec:
+  # Recreate, NOT RollingUpdate: this is the single deployment-wide control
+  # plane and the sole custodian of the session registry and the denylist.
+  # Two live instances would split-brain that state. Recreate fully terminates
+  # the old pod before the new one starts, so there is exactly one custodian at
+  # every instant.
+  strategy:
+    type: Recreate
+
+  # One replica — the control plane is one-per-deployment. Do NOT increase.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ocu-controld
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ocu-controld
+        app.kubernetes.io/component: control-plane
+    spec:
+      # The grace period must cover the host-driven teardown finalizer for
+      # every live session (credential revoke, egress-route drop,
+      # writable-surface scrub). The value below is a conservative default
+      # that matches the systemd unit's TimeoutStopSec; tune it to the
+      # finalizer bound for your session ceiling.
+      terminationGracePeriodSeconds: 120
+
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        seccompProfile:
+          # RuntimeDefault is the portable choice. For tighter confinement,
+          # deploy deploy/seccomp/ocu-controld.json to each node and switch to
+          #   type: Localhost
+          #   localhostProfile: ocu-controld/ocu-controld.json
+          type: RuntimeDefault
+
+      volumes:
+        # Fail-closed hash-chained OCSF JSONL audit sink. emptyDir here is a
+        # stub; a real deployment points this at a durable, single-writer
+        # volume or streams to the audit pipeline.
+        - name: audit
+          emptyDir: {}
+        # Runtime dir for the operator-ingress Unix socket.
+        - name: runtime
+          emptyDir: {}
+        # Storage-JWT signing key — a read-only Secret mount. Create the Secret
+        # out of band; the key is never baked into the image.
+        - name: jwt-signing-key
+          secret:
+            secretName: ocu-control-jwt-signing-key
+            defaultMode: 0400
+        # OPTIONAL — writable volume for the emitted JWKS artifact (paired with
+        # the commented -jwks-path arg above). readOnlyRootFilesystem is true, so
+        # the emit needs a writable mount; an emptyDir shared read-only with a
+        # static-file sidecar (or fronted by an Ingress) is the served-by-deploy-
+        # layer surface. Control only EMITS the file; the deploy layer SERVES it.
+        # - name: jwks
+        #   emptyDir: {}
+
+      containers:
+        - name: ocu-controld
+          image: ghcr.io/wide-moat/ocu-control:latest
+          imagePullPolicy: Always
+
+          args:
+            - -operator-listen
+            - unix:///run/ocu-control/operator.sock
+            - -gateway-listen
+            - 127.0.0.1:9466
+            - -runtime-tier
+            - runc
+            - -runtime-provider
+            - docker
+            # Deployment-declared trust profile feeding the admission matrix.
+            # REQUIRED and deployment-wide (never per-request): the daemon
+            # refuses to boot without it. Set this per deployment to one of
+            # trusted_operator | internal_workforce | untrusted. `untrusted` is
+            # the safe default here — the most restrictive admission cell.
+            - -workload-profile
+            - untrusted
+            - -jwt-signing-key
+            - /run/secrets/ocu-control/storage-jwt-signing.key
+            - -audit-sink
+            - /var/log/ocu-control/audit.ocsf.jsonl
+            # OPTIONAL — Storage-JWT JWKS artifact (ADR-0019 §35). Uncomment the
+            # two args below (and the `jwks` volume + mount) to have Control EMIT
+            # the static JWKS document at this path. Control emits the JWKS
+            # artifact at -jwks-path; the deploy layer (an in-pod static-file
+            # sidecar, an Ingress, or a CDN) serves it over HTTP at the egress
+            # edge's remote_jwks URI (ADR-0019 §35). Control adds no third
+            # listener — the two-listener invariant (§39 / NFR-SEC-52) is
+            # unchanged. The artifact re-renders on boot/restart (v1 has no live
+            # rotation hook). The mount must be writable (readOnlyRootFilesystem
+            # is true), so back it with the emptyDir volume hinted below.
+            # - -jwks-path
+            # - /var/lib/ocu-control/jwks/jwks.json
+
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            seccompProfile:
+              type: RuntimeDefault
+
+          volumeMounts:
+            - name: audit
+              mountPath: /var/log/ocu-control
+            - name: runtime
+              mountPath: /run/ocu-control
+            - name: jwt-signing-key
+              mountPath: /run/secrets/ocu-control
+              readOnly: true
+            # OPTIONAL — writable mount for the emitted JWKS artifact (paired
+            # with the commented -jwks-path arg and the jwks volume above). A
+            # static-file sidecar mounts the SAME volume read-only and serves it
+            # at the egress edge's remote_jwks URI; Control adds no third listener.
+            # - name: jwks
+            #   mountPath: /var/lib/ocu-control/jwks
+
+          # Liveness/readiness use the daemon's own -health-check self-probe as
+          # an exec probe (distroless has no shell or curl, and the operator
+          # ingress is a Unix socket — an httpGet from the node never reaches
+          # it). The probe re-derives the socket from the SAME -operator-listen
+          # the serving args bind, so it dials exactly the socket the daemon
+          # serves /healthz on, and exits 0 only when /healthz answers 200.
+          livenessProbe:
+            exec:
+              command:
+                - /usr/local/bin/ocu-controld
+                - -health-check
+                - -operator-listen
+                - unix:///run/ocu-control/operator.sock
+            initialDelaySeconds: 5
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command:
+                - /usr/local/bin/ocu-controld
+                - -health-check
+                - -operator-listen
+                - unix:///run/ocu-control/operator.sock
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 1000m
+              memory: 512Mi

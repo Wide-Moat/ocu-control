@@ -1,0 +1,140 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# ocu-controld.service — systemd unit for the control-plane daemon
+#
+# Requires systemd >= 207 (Type=notify). Tested on systemd >= 240.
+#
+# INSTALLATION:
+#   cp contrib/systemd/ocu-controld.service /etc/systemd/system/
+#   cp contrib/sysusers.d/ocu-control.conf /etc/sysusers.d/
+#   systemd-sysusers              # creates the ocucontrol system user + group
+#   systemctl daemon-reload
+#   systemctl enable --now ocu-controld
+#
+# The unit runs as User=ocucontrol / Group=ocucontrol (see [Service] below); the
+# systemd-sysusers step above provisions that locked, non-login service account
+# from contrib/sysusers.d/ocu-control.conf. Without it the first start fails
+# user-not-found.
+#
+# SITE CUSTOMISATION — use a drop-in rather than editing this file:
+#   mkdir /etc/systemd/system/ocu-controld.service.d/
+#   # create site.conf with [Service] Environment= overrides
+#   systemctl daemon-reload
+#
+# The two ReadWritePaths entries cover the only mutable surfaces:
+#   1. Audit sink — fail-closed OCSF JSONL hash-chained records.
+#   2. Runtime dir — the operator-ingress Unix socket.
+# The Storage-JWT signing key and the operator credential are read-only secret
+# mounts the deployment supplies; they are never written by the daemon.
+#
+# IMPORTANT — log rotation: NEVER use copytruncate on the audit sink.
+# The sink is hash-chained; copytruncate breaks the chain. The correct
+# procedure is stop -> rotate (move/rename) -> start.
+
+[Unit]
+Description=Open Computer Use control plane daemon (component-02)
+Documentation=https://github.com/Wide-Moat/ocu-control
+# The control plane dials guests and the RuntimeProvider endpoint over the
+# network, so it needs the network up before it serves.
+After=network.target local-fs.target
+
+[Service]
+# Type=notify: the daemon sends READY=1 via NOTIFY_SOCKET after both ingress
+# listeners begin accepting connections, and STOPPING=1 on SIGTERM/SIGINT.
+# systemd waits for READY=1 before declaring the unit active.
+Type=notify
+NotifyAccess=main
+
+User=ocucontrol
+Group=ocucontrol
+
+# ExecStart: every required serving flag. Adjust per deployment. The flags can
+# also be supplied via OCU_CONTROL_* environment variables in a drop-in
+# [Service] Environment= block.
+#
+# This invocation carries EVERY required flag the daemon's boot validator
+# demands (operator-listen, gateway-listen, runtime-tier, runtime-provider,
+# workload-profile, jwt-signing-key, audit-sink); omitting any one is a fail-
+# closed boot refusal. -workload-profile is the deployment-declared trust
+# profile feeding the admission matrix (one of trusted_operator |
+# internal_workforce | untrusted; never per-request); `untrusted` is the safe
+# default — the most restrictive admission cell. Override it per deployment.
+#
+# RUNTIME PREREQUISITE — -jwt-signing-key names a real file that MUST exist at
+# runtime (there is no daemon-default key); the daemon aborts fail-closed at boot
+# without it. Provision /etc/ocu-control/storage-jwt-signing.key out of band.
+#
+# OPTIONAL — Storage-JWT JWKS artifact (ADR-0019 §35). To have Control EMIT the
+# static JWKS document, append `-jwks-path /var/lib/ocu-control/jwks/jwks.json`
+# to the ExecStart line below and add the ReadWritePaths entry hinted near the
+# write surfaces. Control emits the JWKS artifact at -jwks-path; the deploy layer
+# (a local web server / nginx / CDN) serves it over HTTP at the egress edge's
+# remote_jwks URI (ADR-0019 §35). Control adds no third listener — the
+# two-listener invariant (§39 / NFR-SEC-52) is unchanged. The artifact re-renders
+# on boot/restart (v1 has no live rotation hook).
+ExecStart=/usr/local/bin/ocu-controld \
+    -operator-listen unix:///run/ocu-control/operator.sock \
+    -gateway-listen 127.0.0.1:9466 \
+    -runtime-tier runc \
+    -runtime-provider docker \
+    -workload-profile untrusted \
+    -jwt-signing-key /etc/ocu-control/storage-jwt-signing.key \
+    -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+
+# Graceful stop must cover the host-driven teardown finalizer (credential
+# revoke, egress-route drop, writable-surface scrub) for every live session
+# before the SIGKILL fallback, or systemd kills the daemon mid-teardown and
+# leaves a session live. Tune TimeoutStopSec to the deployment's finalizer
+# bound once the lifecycle engine lands; the value below is a conservative
+# scaffold default.
+TimeoutStopSec=120s
+KillMode=mixed
+KillSignal=SIGTERM
+
+Restart=on-failure
+RestartSec=5s
+
+# ── Security hardening ────────────────────────────────────────────────────
+# The control plane needs no elevated capabilities: it binds two listeners,
+# appends to a log file, reads a signing key, and dials the runtime endpoint.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Allow only the syscall groups a normal service daemon needs.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+# The two mutable write surfaces (everything else is read-only under
+# ProtectSystem=strict):
+ReadWritePaths=/var/log/ocu-control
+ReadWritePaths=/run/ocu-control
+# OPTIONAL — writable dir for the emitted JWKS artifact (paired with the
+# -jwks-path ExecStart flag noted above). ProtectSystem=strict makes the rest of
+# the filesystem read-only, so the emit needs this entry. Control only EMITS the
+# file here; the deploy layer (a local web server / nginx / CDN) SERVES it at the
+# egress edge's remote_jwks URI — Control adds no third listener.
+# ReadWritePaths=/var/lib/ocu-control/jwks
+
+# Let systemd manage the runtime, log, and state directories (created with
+# correct ownership before ExecStart runs).
+RuntimeDirectory=ocu-control
+RuntimeDirectoryMode=0700
+LogsDirectory=ocu-control
+StateDirectory=ocu-control
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,765 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Operator/lifecycle REST surface (operator console / CLI / SOAR-caller -> Control).
+# OPERATOR scope only: this is the privileged ingress where session create/destroy,
+# the per-session and deployment-wide kill-switch, the denylist edit, and the quota
+# override live. A human never calls it directly; a console/CLI/SOAR caller does, over
+# the host-owned operator transport. The gateway service-identity ingress (the MCP
+# session-setup gRPC, contracts/proto/session_setup.proto) is a SEPARATE endpoint and
+# reaches NONE of these routes: no rendered deploy manifest grants the gateway a network
+# route here, and a missed route fails CI rather than runtime (NFR-SEC-52, NFR-SEC-26).
+#
+# Identity is HOST-ATTESTED, never a body field. The caller is derived from the operator
+# transport's peer credential (SO_PEERCRED on the host-owned 0700 operator socket); a
+# request body carries only HINTS (a session_hint, an image ref, mount/egress/resource
+# INTENTS, a reason). No body field names a caller, tenant, session-authority, or
+# container_name id — a body-supplied id is a hint, never the authority that binds or
+# addresses a session (NFR-SEC-43). These route bodies therefore mirror the in-process
+# operator handler shapes (internal/ingress/operator), which carry the same hint-only
+# fields onto the lifecycle/kill-switch surface.
+#
+# Every privileged operator/SOAR action on this surface emits a chain-linked OCSF event
+# before the call is acknowledged; the action is DENIED if that audit write fails
+# (fail-closed, NFR-SEC-45) — a 2xx here means the action took effect AND was recorded.
+#
+# DENY responses carry the shared BoundedReason envelope (NFR-SEC-51): a stable
+# reason_code and a length-capped message with no stack trace or internal topology.
+#
+# STATUS: draft (#205, define-surface). The freeze lands in canon contracts/openapi/ via
+# the gatekeeper canon-PR; until then this is the OCU-side draft of an OCU-`define`
+# surface (08-contracts.md §1). The SOAR inbound-revoke surface is a sibling OpenAPI file
+# (contracts/openapi/soar-revoke.openapi.yaml); the gateway session-setup surface is the
+# sibling proto. See x-ocu-open-questions for the one known reconciliation against the
+# gatekeeper-frozen gateway CreateRequest.
+
+openapi: 3.1.0
+
+info:
+  title: OCU Control — Operator REST
+  version: 0.1.0-draft
+  summary: Operator/lifecycle ingress to the OCU Control plane (operator scope only).
+  description: >-
+    The privileged operator/lifecycle ingress to Control: session create and destroy,
+    the per-session revoke (RevokeOne), the deployment-wide DENY-ALL (RevokeAll), the
+    denylist lift (LiftDeny), and the quota override (OverrideQuota). The caller is
+    host-attested from the operator transport's peer credential (NFR-SEC-43); request
+    bodies carry hints only. The kill-switch and force-kill routes exist ONLY on this
+    ingress — the gateway service identity reaches none of them (NFR-SEC-52, NFR-SEC-26).
+    Every privileged action is audit-gated before acknowledgement (NFR-SEC-45). This is a
+    draft of an OCU-`define` surface (#205); the canon freeze is the gatekeeper's.
+  license:
+    name: FSL-1.1-Apache-2.0
+    url: https://fsl.software/
+
+# No `servers` block. The operator plane is a host-owned local transport (the 0700
+# operator socket), not a routable network origin: the binding is a deployment/IaC
+# concern and the NFR-SEC-52 separation is enforced at the rendered manifest, not by a
+# URL declared here. Declaring an origin would wrongly imply a network-reachable operator
+# endpoint. (x-ocu-design: the absence is deliberate, not an omission.)
+
+# Host-attested transport authentication. The operator transport (the host-owned 0700
+# operator socket) IS the credential: possession of an operator-scoped connection, whose
+# peer credential the host attests, is the operator authority (ADR-0004 fixes the
+# substrate). There is no body-borne or bearer-token identity on this surface — the
+# scheme below documents the host-attested gate, it does not introduce a wire token
+# (NFR-SEC-43).
+security:
+  - operatorPeerCred: []
+
+paths:
+  /v1alpha/sessions:
+    post:
+      operationId: createSession
+      summary: Create a session (operator scope).
+      description: >-
+        Run the lifecycle create pipeline for an operator-channel caller. The caller is
+        host-attested from the operator transport's peer credential; the body fields are
+        HINTS carried onto the create input (a session_hint, an image ref, mount/egress/
+        resource intents, the staged control public key), never identity (NFR-SEC-43).
+        Admission and quota run fail-closed before any host state exists; a refusal
+        returns a BoundedReason and writes no reservation. The minted weak Storage-JWT is
+        NEVER returned here — Control mints and pushes it on the separate mount-config
+        plane; a create body carrying it would be a custody leak, so it is absent from
+        both the request and the response.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateRequest'
+      responses:
+        '201':
+          description: >-
+            Session reserved. Returns the host-assigned session handle. The body carries
+            no credential and no authority token — only the host-minted handle for
+            correlation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionHandle'
+        '403':
+          $ref: '#/components/responses/Denied'
+        '409':
+          $ref: '#/components/responses/Denied'
+        '422':
+          $ref: '#/components/responses/Denied'
+        '503':
+          $ref: '#/components/responses/Denied'
+    get:
+      operationId: listSessions
+      summary: List sessions (operator read scope) — enriched, read-only.
+      description: >-
+        Project the reservation registry as an enriched, read-only list for the operator
+        console (the EnrichedLister read seam). The caller is host-attested from the
+        operator transport's peer credential; there is no body and no mutating effect. By
+        default only live rows (reserved, active) are returned; include_released=true adds
+        released tombstones. This is a registry projection — it mints nothing, mutates
+        nothing, and adds no control-plane state. Operator-sees-all: the read is
+        deployment-wide, not scoped per operator (ADR-0022 accepted limitation).
+      parameters:
+        - $ref: '#/components/parameters/IncludeReleasedQuery'
+      responses:
+        '200':
+          description: >-
+            The enriched session list. Read-only projection of the registry; carries no
+            credential and no authority token.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SessionView'
+        '401':
+          $ref: '#/components/responses/Denied'
+        '503':
+          $ref: '#/components/responses/Denied'
+
+  /v1alpha/sessions/{key}:
+    get:
+      operationId: getSession
+      summary: Read one session by key (operator read scope) — read-only.
+      description: >-
+        Project a single session row by its host-derived session key. The caller is
+        host-attested from the operator transport's peer credential. A key that addresses
+        no row returns 404 — a plain not-found, since this read-surface is deployment-wide
+        and carries no cross-tenant secret to protect. Read-only: no body, no mutation.
+      parameters:
+        - $ref: '#/components/parameters/SessionKeyPath'
+      responses:
+        '200':
+          description: The enriched session row.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionView'
+        '401':
+          $ref: '#/components/responses/Denied'
+        '404':
+          description: No session row addresses this key. No body.
+        '503':
+          $ref: '#/components/responses/Denied'
+
+  /v1alpha/deployment:
+    get:
+      operationId: getDeployment
+      summary: Read deployment-wide singletons (operator read scope) — read-only.
+      description: >-
+        Return the deployment-wide runtime singletons the console renders once, not
+        per-session: the runtime tier and the runtime provider. Tier is a deployment-wide
+        value set at deploy time (--runtime-tier), NEVER a per-row field. Read-only: no
+        body, no mutation.
+      responses:
+        '200':
+          description: The deployment-wide runtime singletons.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeploymentView'
+        '401':
+          $ref: '#/components/responses/Denied'
+        '503':
+          $ref: '#/components/responses/Denied'
+
+  /v1alpha/sessions/destroy:
+    post:
+      operationId: destroySession
+      summary: Destroy a session (operator scope).
+      description: >-
+        Run the lifecycle destroy path for an operator-channel caller. The host-attested
+        caller gates the row lookup; the body `session_hint` is a HINT used only to
+        address the operator's own handle (NFR-SEC-43). A foreign or unknown hint returns
+        the same not-found-shaped DENY (a not-owned row is indistinguishable from a
+        missing row), never another principal's teardown. Teardown is host-driven and
+        idempotent — a repeat destroy of an already-gone session is a satisfied no-op.
+        It is a POST with a hint body (not a DELETE on a hint path) because the hint is
+        request data the host re-derives the key from, never an addressable resource id.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DestroyRequest'
+      responses:
+        '200':
+          description: Session destroyed (or already gone — idempotent).
+        '403':
+          $ref: '#/components/responses/Denied'
+        '404':
+          $ref: '#/components/responses/Denied'
+        '503':
+          $ref: '#/components/responses/Denied'
+
+  /v1alpha/revoke/one:
+    post:
+      operationId: revokeOne
+      summary: Revoke one session — denylist it and force-kill its live row (operator scope).
+      description: >-
+        Denylist a single session key and force-kill its live row. Force-kill exists ONLY
+        on this operator ingress; the gateway audience cannot reach it (NFR-SEC-26,
+        NFR-SEC-52). The recorded audit actor is the host-attested operator who acted —
+        WHO ACTED, distinct from the revoke TARGET. The action is audit-gated: it is
+        denied if its OCSF event fails to write (NFR-SEC-45). The `key` is the
+        host-derived session key the operator names; `reason` is operator-supplied text.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokeOneRequest'
+      responses:
+        '200':
+          description: Session revoked and its live row force-killed. Audit event recorded.
+        '403':
+          $ref: '#/components/responses/Denied'
+        '503':
+          $ref: '#/components/responses/Denied'
+
+  /v1alpha/revoke/all:
+    post:
+      operationId: revokeAll
+      summary: Engage deployment-wide DENY-ALL and force-kill every live row (operator scope).
+      description: >-
+        Engage the deployment-wide kill-switch (DENY-ALL) and force-kill every live row.
+        This is the host-initiated stop, not a cooperative guest action — an unreachable
+        guest control channel grants the guest no new authority and does not defeat it
+        (NFR-SEC-01). It exists ONLY on this operator ingress (NFR-SEC-52). The audit
+        actor is the host-attested operator; the action is denied if its OCSF event fails
+        to write (NFR-SEC-45). After DENY-ALL is durable, every subsequent create is
+        refused fail-closed until a lift.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RevokeAllRequest'
+      responses:
+        '200':
+          description: DENY-ALL engaged and every live row force-killed. Audit event recorded.
+        '403':
+          $ref: '#/components/responses/Denied'
+        '503':
+          $ref: '#/components/responses/Denied'
+
+  /v1alpha/resume/all:
+    post:
+      operationId: resumeAll
+      summary: Lift the deployment-wide DENY-ALL (operator scope).
+      description: >-
+        Lift the deployment-wide kill-switch (the in-band resume of DENY-ALL), so creates
+        are admitted again. This exists ONLY on this operator ingress; the gateway audience
+        cannot reach it (NFR-SEC-26). The audit actor is the host-attested operator; the
+        action is denied if its OCSF event fails to write (NFR-SEC-45). `reason` is
+        operator-supplied text. It is the deliberate inverse of revoke/all; a parameterless
+        POST with no body is accepted (the reason defaults to empty).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResumeAllRequest'
+      responses:
+        '200':
+          description: DENY-ALL lifted. Audit event recorded.
+        '403':
+          $ref: '#/components/responses/Denied'
+        '503':
+          $ref: '#/components/responses/Denied'
+
+# NOTE: the operator denylist-edit (lift one deny) and quota-override are COMPLETE,
+# tested in-process operator handlers (operator.Handlers.LiftDeny / .OverrideQuota)
+# whose HTTP route is deliberately NOT mounted yet — the same design-fenced class as
+# the SOAR-revoke pair. They are intentionally ABSENT from this spec because this
+# document describes only the routes the operator socket actually serves
+# (TestDeferredHandlers_AllowListIsExact enforces that they stay unmounted until their
+# wire route lands deliberately). When their routes are mounted, their path items are
+# added here in the same change.
+
+components:
+  securitySchemes:
+    operatorPeerCred:
+      type: mutualTLS
+      description: >-
+        Host-attested operator identity. The operator transport is the host-owned 0700
+        operator socket; the caller is derived from its peer credential (SO_PEERCRED), and
+        possession of an operator-scoped connection IS the operator credential (ADR-0004
+        fixes the substrate). The `mutualTLS` type is the closest OpenAPI security-scheme
+        token for "the transport peer's verified identity is the authority"; the v1
+        substrate is a local UDS peer-cred, not network mTLS. No body field and no bearer
+        token carries identity on this surface — a request body is hints only (NFR-SEC-43).
+
+  parameters:
+    IncludeReleasedQuery:
+      name: include_released
+      in: query
+      required: false
+      description: >-
+        When true, released (destroyed) tombstone rows are included alongside the live
+        reserved/active rows. Default false (live rows only).
+      schema:
+        type: boolean
+        default: false
+
+    SessionKeyPath:
+      name: key
+      in: path
+      required: true
+      description: >-
+        The host-derived session key to read. This is the registry binding key
+        (SessionHandle.session_key on the create surface), not a caller-supplied hint.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 256
+
+  responses:
+    Denied:
+      description: >-
+        The action was refused or could not be performed. Carries the shared BoundedReason
+        envelope (NFR-SEC-51): a stable reason_code and a length-capped message with no
+        stack trace or internal topology. A not-owned session is reported the same as a
+        missing one, so a probe cannot distinguish another principal's row from absence
+        (NFR-SEC-43).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BoundedReason'
+
+  schemas:
+    # The shared deny envelope (NFR-SEC-51), one logical shape canon-wide. Mirrors the
+    # JSON $def at contracts/control/control-rpc.schema.json#/$defs/BoundedReason and the
+    # exec-channel BoundedReason VERBATIM: reason_code is a stable code, message is a
+    # length-capped human string carrying no stack trace or internal topology. OpenAPI
+    # expresses the pattern and maxLength natively, so the wire bound is enforced here.
+    BoundedReason:
+      type: object
+      additionalProperties: false
+      required: [reason_code]
+      properties:
+        reason_code:
+          type: string
+          pattern: '^[A-Z][A-Z0-9_]{1,63}$'
+          description: >-
+            Stable machine-readable deny code. The caller branches on it; it carries no
+            internal detail.
+        message:
+          type: string
+          maxLength: 256
+          description: >-
+            Optional human-readable detail, no stack trace or internal topology.
+          x-ocu-default: >-
+            maxLength 256 is the NFR-SEC-51 default pending sign-off, not a source-pinned
+            value; retunable per workload tier. Matches the control-rpc and exec-channel
+            BoundedReason.
+
+    # CreateRequest mirrors the in-process operator CreateRequest
+    # (internal/ingress/operator: {SessionHint, Image, Mount, Egress, Resources,
+    # ControlPubKey}). Every field is a HINT/INTENT — none names a caller, tenant, or
+    # session-authority id (NFR-SEC-43). The minted Storage-JWT is absent by design
+    # (custody plane is separate).
+    CreateRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Operator create body. Fields are hints/intents carried onto the lifecycle create
+        input; the authority is the host-attested caller, never a field here (NFR-SEC-43).
+      properties:
+        session_hint:
+          type: string
+          maxLength: 256
+          description: >-
+            Human-readable handle hint. It seeds the host-minted handle for correlation;
+            it NEVER becomes the host-derived session key (NFR-SEC-43).
+        # x-ocu-reserved: image — held PIN-PENDING, not a live field. ADR-0020
+        # (sandbox image provisioning) is status `proposed — stub`; its Open
+        # Question #4 — does an image_ref/image_tier ride this create surface, or
+        # is it deployment-pinned off the workload class and off the wire entirely
+        # — is unresolved. The frozen gateway proto CreateRequest holds the same
+        # field as `reserved 6; reserved "image"`. OpenAPI has no `reserved`
+        # primitive, so the field is withheld here and re-added as an additive
+        # change once ADR-0020 closes. Do not add it back before then.
+        mount:
+          $ref: '#/components/schemas/MountIntent'
+        egress:
+          $ref: '#/components/schemas/EgressPolicy'
+        resources:
+          $ref: '#/components/schemas/ResourceCaps'
+        control_pub_key:
+          type: string
+          format: byte
+          description: >-
+            Raw 32-byte Ed25519 PUBLIC key (base64-encoded on the wire) the host stages for
+            the guest to verify host-signed control-RPC frames. A PUBLIC key, never a
+            secret; a non-32-byte value fails the create closed host-side.
+
+    # MountIntent mirrors runtime.MountIntent, MINUS the server-minted AuthToken. The weak
+    # Storage-JWT is minted by Control and pushed on the mount-config plane; the create
+    # caller does NOT supply it, so auth_token is absent from this wire shape (custody:
+    # NFR-SEC-25). Exactly one of filesystem_id / memory_store_id is the scope.
+    MountIntent:
+      type: object
+      additionalProperties: false
+      description: >-
+        Per-session storage mount INTENT. Names the scope, RW/RO posture, and freshness
+        window the session needs; the host materializes it. The weak Storage-JWT is
+        SERVER-MINTED and pushed separately — it is deliberately absent here so a create
+        body never carries a credential (NFR-SEC-25).
+      required: [destination, read_only]
+      oneOf:
+        - required: [filesystem_id]
+          not:
+            required: [memory_store_id]
+        - required: [memory_store_id]
+          not:
+            required: [filesystem_id]
+      properties:
+        destination:
+          type: string
+          pattern: '^/.+'
+          description: Absolute guest mountpoint (e.g. /workspace/out).
+        filesystem_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Per-session logical scope (the isolation unit). Egress binds to this id.
+        memory_store_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            Parallel scope for a memory-backed mount; present only when the backing scope
+            is a memory store rather than a filesystem.
+        read_only:
+          type: boolean
+          description: >-
+            Host-enforced posture: true => RO input, false => RW sink. The agent cannot
+            flip it.
+        cache_duration_s:
+          type: integer
+          minimum: 0
+          description: >-
+            Per-mount local-VFS freshness window in whole seconds (the VFS dir-cache
+            time; short for RO inputs, long for the RW sink). Named to match the canon
+            mount-config CacheDurationSeconds shape, so MountIntent is byte-consistent
+            across this REST surface and the session-setup gRPC surface.
+      x-ocu-design: >-
+        auth_token is INTENTIONALLY ABSENT: in the create request the caller does not
+        supply the weak Storage-JWT — Control mints it and pushes it on the separate
+        mount-config plane (contracts/storage/mount-config.schema.json). A create body that
+        carried it would be a custody leak (NFR-SEC-25).
+
+    # EgressPolicy mirrors runtime.EgressPolicy: the deny-default posture, the single
+    # allow-listed upstream, and the scope id the trust-edge keys the credential exchange
+    # on. default_deny is true on every production path; there is no permissive default.
+    EgressPolicy:
+      type: object
+      additionalProperties: false
+      description: >-
+        Per-session egress trust-edge policy. States the deny-default posture and the
+        single allow-listed upstream the session may reach through the trust-edge.
+      required: [default_deny]
+      properties:
+        default_deny:
+          type: boolean
+          description: >-
+            Deny-default posture; true on every production path (the control-plane bridge
+            is Internal, deny-all). A permissive value is rejected host-side on a
+            production path — there is no permissive default.
+        allowed_upstream:
+          type: string
+          description: >-
+            The single allow-listed object-store service the mount client may dial guest-out
+            over the egress hop. Empty means no egress.
+        filesystem_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            Binds the egress connection to the same scope as the mount, so the trust-edge
+            keys the credential exchange on it.
+
+    # ResourceCaps mirrors runtime.ResourceCaps: HARD caps, not shares. CPU is a hard
+    # ceiling, never a relative weight. pids_limit is optional (production always sets it).
+    ResourceCaps:
+      type: object
+      additionalProperties: false
+      description: >-
+        Hard resource caps the provider stamps onto the runtime. Caps, not shares: CPU is
+        a hard ceiling, never a relative weight.
+      required: [cpu_cores, memory_bytes]
+      properties:
+        cpu_cores:
+          type: number
+          exclusiveMinimum: 0
+          description: Hard CPU ceiling in fractional cores.
+        memory_bytes:
+          type: integer
+          exclusiveMinimum: 0
+          description: Hard memory ceiling in bytes. The /tmp tmpfs counts against it.
+        pids_limit:
+          type: integer
+          exclusiveMinimum: 0
+          description: >-
+            Optional process-count cap (the cgroup pids controller). Absent only on a
+            non-production path; production always sets it.
+
+    # SessionHandle is the create response. It carries the host-minted handle only —
+    # no credential, no authority token. The host-derived session key is the binding;
+    # the container_name is recorded data, never authority, and is absent here.
+    SessionHandle:
+      type: object
+      additionalProperties: false
+      description: >-
+        The host-assigned session handle returned on a successful create. Carries the
+        host-minted key and the lifecycle state — no credential and no authority token. The
+        minted Storage-JWT is NEVER in this body (custody plane is separate, NFR-SEC-25).
+      required: [session_key, state]
+      properties:
+        session_key:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            The host-derived reservation key the host minted for this session. It is the
+            session identity for subsequent operator addressing; it is host-derived, never
+            the caller's session_hint (NFR-SEC-43).
+        state:
+          type: string
+          enum: [reserved, active, released]
+          description: >-
+            Lifecycle position of the row at the time of the response (a create returns a
+            reserved row before any caller side effect runs).
+
+    # RevokeOneRequest mirrors the in-process RevokeOne(key, reason). key is the
+    # host-derived session key the operator names; reason is operator-supplied text. No
+    # caller/actor id — the actor is the host-attested operator (NFR-SEC-43).
+    RevokeOneRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Revoke-one body. Names the session to denylist and force-kill; the actor is the
+        host-attested operator, never a field here (NFR-SEC-43, NFR-SEC-45).
+      required: [key]
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: The host-derived session key to denylist and force-kill.
+        reason:
+          type: string
+          maxLength: 256
+          description: >-
+            Operator-supplied justification recorded on the audit event. The bound mirrors
+            BoundedReason.message.
+          x-ocu-default: >-
+            maxLength 256 mirrors the NFR-SEC-51 BoundedReason.message default; retunable,
+            not source-pinned.
+
+    # RevokeAllRequest mirrors the in-process RevokeAll(reason): a reason only, since the
+    # target is the whole deployment. No caller/actor id (NFR-SEC-43).
+    RevokeAllRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Revoke-all (DENY-ALL) body. The target is the whole deployment, so the only field
+        is the operator's justification. The actor is the host-attested operator
+        (NFR-SEC-43, NFR-SEC-45).
+      properties:
+        reason:
+          type: string
+          maxLength: 256
+          description: Operator-supplied justification recorded on the audit event.
+          x-ocu-default: >-
+            maxLength 256 mirrors the NFR-SEC-51 BoundedReason.message default; retunable,
+            not source-pinned.
+
+    # LiftDenyRequest mirrors the in-process LiftDeny(key, reason). key is the denylisted
+    # session to lift; reason is operator-supplied text. No caller/actor id (NFR-SEC-43).
+    # DestroyRequest mirrors the in-process destroy hint body ({session_hint}). The hint
+    # ADDRESSES the operator's own handle; the host re-derives the key from it and the
+    # attested caller, so it is request data, never authority (NFR-SEC-43). An empty body
+    # is accepted (zero hint).
+    DestroyRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Operator destroy body. The session_hint addresses the operator's own handle; the
+        host re-derives the key from it under the attested caller. A foreign or unknown hint
+        resolves to a not-found-shaped DENY (NFR-SEC-43).
+      properties:
+        session_hint:
+          type: string
+          maxLength: 256
+          description: >-
+            The operator's own session handle to address. A HINT, not authority: the
+            host-attested caller gates the row.
+
+    # ResumeAllRequest mirrors the in-process ResumeAll(reason). The target is the whole
+    # deployment (lift DENY-ALL), so the only field is the operator's justification. An
+    # empty body is accepted (the reason defaults to empty).
+    ResumeAllRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Resume-all body (lift the deployment-wide DENY-ALL). The only field is the
+        operator's justification; the actor is the host-attested operator
+        (NFR-SEC-43, NFR-SEC-45).
+      properties:
+        reason:
+          type: string
+          maxLength: 256
+          description: Operator-supplied justification recorded on the audit event.
+          x-ocu-default: >-
+            maxLength 256 mirrors the NFR-SEC-51 BoundedReason.message default; retunable,
+            not source-pinned.
+
+    # --- Admin read-surface schemas (ADR-0022). Read-only projections of the enriched
+    # reservation registry (state.EnrichedSessionRow); every field is OBSERVED data, never
+    # an input, and no credential appears. state is lowercase; reserved_at is always
+    # present; active_at, caps, and container_name are absent until the row activates.
+    SessionView:
+      type: object
+      additionalProperties: false
+      description: >-
+        Enriched, read-only view of one session row for the operator console. Projects the
+        registry (key, owner, state) plus the durable activation enrichment (caps,
+        reserved_at, active_at) and the bound container_name; adds no control-plane state
+        and carries no credential.
+      required: [key, owner, state, reserved_at]
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            The host-derived session key — the registry binding key, the read identity for
+            GET /v1alpha/sessions/{key}.
+        owner:
+          $ref: '#/components/schemas/SessionOwner'
+        state:
+          type: string
+          enum: [reserved, active, released]
+          description: >-
+            Lifecycle position of the row. reserved = creating, active = live, released =
+            destroyed (a tombstone, returned only with include_released=true). Same casing
+            as SessionHandle.state on the create surface.
+        container_name:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: >-
+            The runtime container binding recorded for the row, bound once after activation
+            (write-once). ABSENT until then. RECORDED DATA, never authority (NFR-SEC-43);
+            surfaced here for the operator view only.
+        caps:
+          $ref: '#/components/schemas/SessionCaps'
+        reserved_at:
+          type: string
+          format: date-time
+          description: >-
+            When the row was reserved (state.EnrichedSessionRow.ReservedAt; the reserved_at
+            column, NOT NULL). Always present. The console derives row age from it.
+        active_at:
+          type: string
+          format: date-time
+          description: >-
+            When the row transitioned reserved -> active (ActiveAt; the active_at column,
+            nullable). ABSENT until the row activates. The average start DURATION is not
+            computed from a single row but read from the /metrics reserved->active histogram
+            (active_at - reserved_at).
+
+    SessionOwner:
+      type: object
+      additionalProperties: false
+      description: The tenant/caller facet the registry recorded for the row. Observed, never an input.
+      required: [tenant, caller]
+      properties:
+        tenant:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: The tenant the session bills to (host-derived, registry-recorded).
+        caller:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: The caller identity the session was created under (host-derived, registry-recorded).
+
+    SessionCaps:
+      type: object
+      additionalProperties: false
+      description: >-
+        The hard resource caps recorded on the row at activation (mirrors ResourceCaps on
+        the create surface). Read-only projection — caps, not shares. Absent until the row
+        activates.
+      required: [cpu_cores, memory_bytes]
+      properties:
+        cpu_cores:
+          type: number
+          exclusiveMinimum: 0
+          description: Hard CPU ceiling in fractional cores.
+        memory_bytes:
+          type: integer
+          exclusiveMinimum: 0
+          description: Hard memory ceiling in bytes.
+        pids_limit:
+          type: integer
+          exclusiveMinimum: 0
+          description: >-
+            Process-count cap (cgroup pids controller). Optional — absent when no pids cap
+            was recorded (nil PidsLimit / NULL column); production always sets it.
+
+    DeploymentView:
+      type: object
+      additionalProperties: false
+      description: >-
+        Deployment-wide runtime singletons the console renders once, not per-session. Both
+        fields are deployment-wide, set at deploy time (--runtime-tier / --runtime-provider).
+      required: [runtime_tier, runtime_provider]
+      properties:
+        runtime_tier:
+          type: string
+          enum: [runc, gvisor, firecracker]
+          description: >-
+            The deployment-wide sandbox runtime tier (ADR-0003). One value for the whole
+            deployment, never per-session. firecracker is the microVM tier (deferred post-v1
+            per ADR-0003) but the value the --runtime-tier flag accepts.
+        runtime_provider:
+          type: string
+          enum: [docker, k8s]
+          description: >-
+            The deployment-wide runtime provider behind the RuntimeProvider seam (ADR-0012).
+
+# Gatekeeper resolutions recorded at freeze time.
+x-ocu-notes:
+  - >-
+    `image` is withheld (x-ocu-reserved on CreateRequest), not a live field, pending
+    ADR-0020 Open Question #4. The frozen gateway proto holds the same field as
+    `reserved 6`. It re-enters as an additive change once ADR-0020 closes — not before.
+  - >-
+    The operator transport's security scheme is modelled as `mutualTLS` because OpenAPI has
+    no native "verified UDS peer-cred" scheme; the v1 substrate is a host-owned 0700
+    operator socket with SO_PEERCRED, not network mTLS (ADR-0004). The `mutualTLS` keyword
+    is the nearest OpenAPI primitive for a mutually-authenticated local transport; the
+    carrier is the host-owned UDS, which is also why no `servers` block is declared.

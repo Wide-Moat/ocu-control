@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# lychee — broken link checker for the tracked Markdown.
+# Reference: https://lychee.cli.rs/usage/config/
+#
+# The guard is forward-reference integrity: a relative link to a missing file is
+# broken and must fail CI. External URLs are NOT the guard (rate-limit and
+# transient-upstream noise would make the gate flaky), so they are skipped.
+# Inputs (which files/dirs to scan) are passed as positional CLI args by the
+# workflow, not as a config-file key; this file carries flags and exclusions only.
+
+# Skip these paths when expanding globs — vendored/transient trees and the
+# local-only planning tree (which is gitignored and never in CI scope anyway).
+exclude_path = [
+  "node_modules",
+  ".venv",
+  ".planning",
+]
+
+# Allow these schemes without HTTP checking (no network reference to verify).
+exclude = [
+  '^mailto:',
+  '^tel:',
+]
+
+# External URLs are not what we guard against (forward-reference rule); skipping
+# them keeps the gate deterministic and offline-capable.
+exclude_all_private = false
+
+no_progress = true
+verbose = "info"

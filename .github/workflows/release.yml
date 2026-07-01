@@ -1,0 +1,428 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+# Top-level permissions: least-privilege default. Jobs that push packages,
+# sign artifacts, or write attestations elevate only what they need.
+permissions:
+  contents: read
+
+jobs:
+  # tag-format gates the whole pipeline: only well-formed SemVer release
+  # tags proceed. The v* trigger glob is permissive; an arbitrary or
+  # malformed tag must fail loud here, never fall through to a stable
+  # "Latest" release.
+  tag-format:
+    runs-on: ubuntu-latest
+    outputs:
+      is_prerelease: ${{ steps.classify.outputs.is_prerelease }}
+    steps:
+      - name: validate the tag and classify pre-release
+        id: classify
+        run: |
+          set -euo pipefail
+          v="${GITHUB_REF_NAME#v}"
+          # SemVer: MAJOR.MINOR.PATCH with an optional pre-release suffix
+          # whose identifiers may contain hyphens (rc-1, alpha.2, dev-x.3).
+          if ! echo "$v" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::tag ${GITHUB_REF_NAME} is not a SemVer release tag (vMAJOR.MINOR.PATCH[-prerelease])"
+            exit 1
+          fi
+          if echo "$v" | grep -qE '-'; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  # security-gates blocks the release until this tag's own security run
+  # (security.yml also triggers on v* tags) completes green. A release
+  # never ships from a ref the secrets/SAST/SCA/lexicon gates never
+  # scanned, and never on cached green from an earlier branch run.
+  security-gates:
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: wait for the security workflow on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          required="lexicon secrets-gitleaks secrets-trufflehog sast-semgrep sca-trivy-fs"
+          deadline=$(( $(date +%s) + 1800 ))
+          while :; do
+            runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+              --jq '[.check_runs[] | {name, status, conclusion}]')
+            ok=true
+            for job in $required; do
+              status=$(echo "$runs" | jq -r --arg n "$job" '[.[] | select(.name==$n)] | last | .status // "absent"')
+              concl=$(echo "$runs" | jq -r --arg n "$job" '[.[] | select(.name==$n)] | last | .conclusion // ""')
+              if [ "$status" != "completed" ]; then
+                ok=false
+              elif [ "$concl" != "success" ] && [ "$concl" != "skipped" ]; then
+                echo "::error::security gate '$job' concluded '$concl' on ${GITHUB_SHA}"
+                exit 1
+              fi
+            done
+            if [ "$ok" = true ]; then
+              echo "all security gates green on ${GITHUB_SHA}"
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out waiting for the security gates on ${GITHUB_SHA}"
+              exit 1
+            fi
+            sleep 20
+          done
+
+  # verify re-runs the full test suite and the real-binary e2e smoke IN THIS
+  # RUN — a release never ships on cached green from an earlier commit.
+  verify:
+    runs-on: ubuntu-latest
+    needs: [tag-format]
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: full test suite
+        run: go test ./... -timeout 600s
+      - name: full test suite under the race detector (T1-14)
+        run: go test -race ./... -timeout 600s
+      - name: collect the release coverage profile (internal packages)
+        run: go test -coverpkg=./internal/... -coverprofile=cover.out ./internal/...
+      - name: build and smoke the real binary
+        # Build the binary the release-gating slice runs against, then run the
+        # SAME committed pre-bind smoke the e2e workflow uses (missing flag,
+        # unknown runtime-tier, unknown runtime-provider, create-before-bind
+        # naming NFR-SEC-01). Release no longer carries a weaker exit-code-only
+        # copy; one script, asserted once.
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=0 go build -trimpath -o ocu-controld ./cmd/ocu-controld
+          bash scripts/e2e-smoke.sh ./ocu-controld
+      - name: run the Integration + E2E slice
+        # The e2e helper finds the real daemon via OCU_CONTROL_BIN; without it
+        # every live case t.Skip's (a skip counts as a pass) and this
+        # release-gating slice goes vacuous. The build step above writes the
+        # binary to the workspace root, so point at that absolute path — mirror
+        # the e2e.yml working pattern.
+        env:
+          OCU_CONTROL_BIN: ${{ github.workspace }}/ocu-controld
+        run: go test -run 'Integration|E2E' ./... -v -timeout 600s
+      - name: upload the release coverage profile
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-coverage-profile
+          path: cover.out
+
+  # ghcr-image builds and pushes the multi-arch container image (T1-11).
+  # The Dockerfile's builder stage uses the SAME go build invocation as the
+  # release job below (CGO_ENABLED=0, -trimpath, -s -w, main.version stamped
+  # from the tag) against the same tagged checkout, so the container binary
+  # and the released binary are build-identical. Third-party actions here
+  # are pinned to full commit SHAs, never floating tags.
+  ghcr-image:
+    runs-on: ubuntu-latest
+    needs: [tag-format, security-gates, verify]
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: derive the image tags and OCI labels
+        id: meta
+        uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+      - name: build and push linux/amd64 + linux/arm64
+        id: push
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # image-scan runs trivy over the JUST-pushed image by digest — CRITICAL
+  # blocks, same severity floor as the filesystem scan in security.yml. The
+  # release job below needs this gate: binaries never ship from a run whose
+  # container image carries an unscanned or CRITICAL-vulnerable base.
+  image-scan:
+    runs-on: ubuntu-latest
+    needs: [ghcr-image]
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: resolve the pushed image reference (registry paths are lowercase)
+        run: echo "IMAGE_REF=ghcr.io/${GITHUB_REPOSITORY,,}@${{ needs.ghcr-image.outputs.digest }}" >> "$GITHUB_ENV"
+      - name: trivy image — CRITICAL blocks
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ env.IMAGE_REF }}
+          severity: CRITICAL
+          exit-code: "1"
+          ignore-unfixed: "false"
+
+  # sbom-and-sign generates a CycloneDX SBOM, signs all release artifacts
+  # with cosign keyless (OIDC, no stored key), and attests build provenance
+  # via the GitHub Sigstore integration (T2-9, SUPPLY-02, NFR-SEC-07).
+  # Runs after image-scan so the image digest is available from ghcr-image.
+  sbom-and-sign:
+    runs-on: ubuntu-latest
+    needs: [tag-format, security-gates, verify, ghcr-image, image-scan]
+    permissions:
+      contents: read
+      packages: write
+      # Required for cosign keyless (OIDC token exchange) and
+      # attest-build-provenance (Sigstore attestation write).
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      # Install cosign for keyless signing (OIDC, no stored key).
+      - name: install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # Rebuild the release binaries exactly as the release job does so the
+      # SBOM and signatures cover the same build outputs.
+      - name: build the release binaries
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tag="${GITHUB_REF_NAME}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${tag}" \
+              -o "dist/ocu-controld_linux_${arch}" ./cmd/ocu-controld
+          done
+          (cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt)
+
+      # Generate a CycloneDX SBOM over the Go module (captures all
+      # transitive dependencies at the versions pinned in go.sum).
+      - name: generate CycloneDX SBOM (Go module)
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/sbom.cyclonedx.json
+          artifact-name: sbom.cyclonedx.json
+
+      # cosign keyless: sign the release binaries and the sha256sums file.
+      # OIDC identity is the GitHub Actions workflow — no long-lived key is
+      # stored or managed. Signatures are recorded in the public Rekor
+      # transparency log.
+      - name: cosign keyless sign — binaries and sha256sums
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          for f in dist/ocu-controld_linux_amd64 dist/ocu-controld_linux_arm64 dist/sha256sums.txt; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${f}.cosign.bundle" \
+              "$f"
+          done
+
+      # cosign keyless sign the GHCR image by digest (not by tag, which is
+      # mutable). The image digest comes from the ghcr-image job output.
+      # OCI registry references must be fully lowercase; github.repository
+      # may contain mixed case (e.g. "Wide-Moat/ocu-control"). Derive the
+      # lowercased name once and reuse it for every image-ref construction in
+      # this job so all consumers stay in sync.
+      - name: derive lowercase image name
+        run: echo "IMAGE_NAME_LC=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: docker login for cosign image signing
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: cosign keyless sign — GHCR image by digest
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+        run: |
+          set -euo pipefail
+          # Sign by digest so the signature is immutable.
+          # IMAGE_NAME_LC was written to GITHUB_ENV by the preceding step;
+          # the registry reference must be lowercase or cosign cannot parse it.
+          cosign sign --yes "${IMAGE_NAME_LC}@${{ needs.ghcr-image.outputs.digest }}"
+
+      # SLSA build provenance attestation over the release binaries.
+      # actions/attest-build-provenance records the provenance in the
+      # GitHub attestation store (gh attestation verify).
+      - name: attest build provenance — linux/amd64 binary
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/ocu-controld_linux_amd64
+
+      - name: attest build provenance — linux/arm64 binary
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: dist/ocu-controld_linux_arm64
+
+      - name: attest build provenance — GHCR image
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-name: ${{ env.IMAGE_NAME_LC }}
+          subject-digest: ${{ needs.ghcr-image.outputs.digest }}
+          push-to-registry: true
+
+      # Upload signing bundles and SBOM for attachment to the GitHub Release.
+      - name: upload signing bundles and SBOM as artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-signing-artifacts
+          path: |
+            dist/sbom.cyclonedx.json
+            dist/*.cosign.bundle
+          retention-days: 7
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [tag-format, security-gates, verify, image-scan, sbom-and-sign]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+
+      - name: build the release binaries (static, linux amd64 + arm64)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tag="${GITHUB_REF_NAME}"
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" \
+              go build -trimpath -ldflags "-s -w -X main.version=${tag}" \
+              -o "dist/ocu-controld_linux_${arch}" ./cmd/ocu-controld
+          done
+          (cd dist && sha256sum * > sha256sums.txt && cat sha256sums.txt)
+
+      - name: smoke the stamped version (-version must report the tag)
+        # The ldflags stamp is only real if `main.version` exists and the
+        # binary reports it: run the just-built amd64 binary (the runner's
+        # own arch) and require the tag in its -version output.
+        run: |
+          set -euo pipefail
+          chmod +x dist/ocu-controld_linux_amd64
+          out=$(dist/ocu-controld_linux_amd64 -version)
+          echo "$out"
+          echo "$out" | grep -F "${GITHUB_REF_NAME}" >/dev/null \
+            || { echo "::error::-version output does not carry the tag ${GITHUB_REF_NAME}"; exit 1; }
+
+      - name: generate the changelog since the previous tag
+        id: changelog
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            CHANGES=$(git log --oneline --no-merges)
+          else
+            CHANGES=$(git log --oneline --no-merges ${PREV_TAG}..HEAD)
+          fi
+          echo "changes<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: download signing artifacts (SBOM + cosign bundles)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-signing-artifacts
+          path: dist/
+
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          generate_release_notes: true
+          prerelease: ${{ needs.tag-format.outputs.is_prerelease == 'true' }}
+          files: |
+            dist/ocu-controld_linux_amd64
+            dist/ocu-controld_linux_arm64
+            dist/sha256sums.txt
+            dist/sbom.cyclonedx.json
+            dist/*.cosign.bundle
+          body: |
+            ## Binaries
+
+            Static `ocu-controld` builds for linux/amd64 and linux/arm64,
+            with `sha256sums.txt`. Verify before running:
+
+            ```bash
+            sha256sum -c sha256sums.txt --ignore-missing
+            ```
+
+            ## Supply-chain verification
+
+            Every release artifact is signed with cosign keyless (GitHub OIDC,
+            no stored key) and the provenance is recorded in the public Rekor
+            transparency log. SLSA build provenance is attested via GitHub's
+            Sigstore integration.
+
+            **Verify a binary:**
+            ```bash
+            # Download the binary and its cosign bundle from the release assets.
+            cosign verify-blob \
+              --bundle ocu-controld_linux_amd64.cosign.bundle \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              ocu-controld_linux_amd64
+            ```
+
+            **Verify the container image:**
+            ```bash
+            cosign verify \
+              --certificate-identity-regexp 'https://github.com/${{ github.repository }}' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+            ```
+
+            **Verify SLSA build provenance (GitHub attestation):**
+            ```bash
+            gh attestation verify \
+              --owner ${{ github.repository_owner }} \
+              ocu-controld_linux_amd64
+            ```
+
+            **Inspect the SBOM:**
+            ```bash
+            # sbom.cyclonedx.json is attached to this release.
+            cat sbom.cyclonedx.json | jq '.components | length'
+            ```
+
+            ## Changes
+            ${{ steps.changelog.outputs.changes }}

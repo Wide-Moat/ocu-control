@@ -1,0 +1,187 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+name: e2e
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # build-controld builds the static control daemon and publishes it as a
+  # same-run artifact. The e2e job consumes it via needs: +
+  # download-artifact@v4 IN THE SAME RUN — no run-id/token cross-workflow
+  # mode (that is the race-prone anti-pattern and is NOT used).
+  build-controld:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: static build of ocu-controld
+        run: CGO_ENABLED=0 go build -trimpath -o ocu-controld ./cmd/ocu-controld
+      - name: upload the control daemon binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ocu-controld
+          path: ocu-controld
+          if-no-files-found: error
+          retention-days: 1
+
+  # e2e is the RELEASE-GATING job: it exercises the REAL daemon binary —
+  # no mocks. It is a REQUIRED check — no continue-on-error. The smoke below
+  # asserts the pre-bind refusals against the real binary; the Integration|E2E
+  # slice that follows drives the full create→destroy lifecycle against a real
+  # state.Store and the real Docker daemon under this same job.
+  e2e:
+    runs-on: ubuntu-latest
+    needs: build-controld
+    # Pin the Docker client API version to the daemon's maximum so the real-daemon
+    # IT/E2E legs actually execute instead of failing at the version handshake. The
+    # production provider builds its client with client.NewClientWithOpts(
+    # client.FromEnv) and NO WithAPIVersionNegotiation (docker.go), so it speaks the
+    # SDK's compiled-in default (currently API 1.51). The ubuntu-latest runner's
+    # daemon caps at 1.48, which rejects 1.51 on the first `docker network create`
+    # in Materialize — before any assertion runs. client.FromEnv honours
+    # DOCKER_API_VERSION, so pinning it here makes the production client negotiate
+    # down to a version the daemon accepts, and the three IT legs
+    # (materialize / graceful-stop / force-kill) plus the create→destroy capstone
+    # run their real assertions. Without this the only way past the handshake is an
+    # override, which is a vacuous pass — the IT leg never runs (ocu-control#7).
+    env:
+      DOCKER_API_VERSION: "1.48"
+    # A Postgres service so the full lifecycle create→destroy e2e drives a REAL
+    # state.Store and the REAL Docker daemon the runner ships TOGETHER — the
+    # milestone capability (create + manage a container's lifecycle with state in
+    # the database). The Docker daemon is local to the runner.
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: ocu_control_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U test -d ocu_control_test"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.mod
+      - name: download the control daemon binary (same run)
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: ocu-controld
+      - name: make the control daemon binary executable
+        run: chmod +x ocu-controld
+      # Build the REAL process_api guest image from the ocu-sandbox source via its
+      # single-source-of-truth composite action, pinned to an immutable main SHA
+      # (NOT a moving branch ref). The action cross-builds the static-musl
+      # process_api, `docker build`s host/guestimage/Dockerfile, loads it locally
+      # as process_api:prod, and asserts the UDS-only posture (verify-posture
+      # defaults true). Its `image` output feeds OCU_RUNTIME_IT_IMAGE on the
+      # lifecycle legs below, so they materialize a container whose ENTRYPOINT IS
+      # process_api — the provider Cmd (flags-as-args) runs as real arguments, the
+      # container binds its sockets against the handoff mounts itSpec stages, and
+      # the three IT legs run their assertions instead of honest-skipping. Pinned
+      # to ocu-sandbox main @6111b8d (#47 guest-image + #50 host/exec landed).
+      - name: build the production guest image (ocu-sandbox composite, pinned)
+        id: guest
+        uses: Wide-Moat/ocu-sandbox/.github/actions/build-guest-image@6111b8db705f87896bac458234103628b79959a4 # ocu-sandbox main (#47 + #50)
+        with:
+          tag: prod
+      - name: smoke — the real daemon refuses bad invocations pre-bind
+        # All four pre-bind refusals (missing required flag, unknown
+        # runtime-tier, unknown runtime-provider, create-before-bind naming
+        # NFR-SEC-01) live in ONE committed script so e2e and release assert
+        # the SAME invariants against the SAME binary, never drifting YAML
+        # copies.
+        run: bash scripts/e2e-smoke.sh ./ocu-controld
+      - name: run the Integration + E2E slice
+        env:
+          OCU_CONTROL_BIN: ${{ github.workspace }}/ocu-controld
+        run: go test -run 'Integration|E2E' ./... -v -timeout 600s
+      # The RuntimeProvider Docker integration leg drives the REAL Docker daemon
+      # the ubuntu-latest runner ships (no mock): it materializes a hardened
+      # container and asserts the HOST-01 posture via inspect, exercises the
+      # GracefulStop drain window and the ForceKill backstop, and proves the
+      # embedded seccomp profile actually lets a container start (a placeholder
+      # profile that blocks the netns syscalls passes the fake-SDK unit tests but
+      # fails here — which is the whole point of running the real daemon). The
+      # daemon is local to the runner, so the HOST-01 bind sources resolve from
+      # t.TempDir without OCU_RUNTIME_IT_STAGE_DIR.
+      - name: run the RuntimeProvider Docker integration leg (real daemon)
+        env:
+          OCU_RUNTIME_IT: "1"
+          # The process_api-ENTRYPOINT guest image built above. With it set,
+          # requireGuestImage no longer honest-skips: the 3 lifecycle legs
+          # (Materialize / GracefulStop / ForceKill) materialize a real container
+          # and run their assertions.
+          OCU_RUNTIME_IT_IMAGE: ${{ steps.guest.outputs.image }}
+        # This same OCU_RUNTIME_IT=1 invocation also covers the gVisor leg
+        # (TestIT_GvisorRuntimeInspect): a TierGvisor create whose docker-inspect
+        # asserts HostConfig.Runtime == "runsc", proving the gVisor admission
+        # decision is enforced at the OCI layer. That leg gates a SECOND time on a
+        # `docker info` probe for a registered "runsc" runtime and
+        # skips-with-notice when it is absent. The stock ubuntu-latest runner does
+        # NOT ship runsc, so the gVisor assertion SKIPS here until the runner (or
+        # the Lima VM on darwin) is provisioned with gVisor and registers the
+        # runtime under the name "runsc" — a green run without runsc is a skip, not
+        # an executed gVisor assertion. The unit + fake-SDK + admission↔OCI
+        # consistency tests make the policy-vs-OCI gap red→green on every runner
+        # unconditionally; this leg is the real-runsc confirmation where it exists.
+        run: go test -run 'TestIT' ./internal/runtime/docker/ -v -timeout 600s
+      # The milestone capstone: the WHOLE lifecycle pipeline driven against a REAL
+      # Postgres state.Store AND the REAL Docker daemon together — admission →
+      # quota → reserve → stage-handoff → materialize a real container → commit →
+      # bind, then a host-driven destroy that removes the container and tombstones
+      # the row. The same test additionally drives the Phase-4 mount-config push
+      # (asserting the rendered config landed on the handoff bind before materialize,
+      # carrying the weak Bearer and no backend cred) and the Phase-5 chain-linked
+      # OCSF audit (a validatable create→destroy spine with the no-minted-token-in-
+      # event grep). The daemon is local to the runner, so the HOST-01 bind sources
+      # resolve from t.TempDir (no OCU_RUNTIME_IT_STAGE_DIR needed). Release-gating:
+      # no continue-on-error.
+      - name: run the lifecycle create→destroy e2e (real Postgres + real Docker)
+        env:
+          OCU_TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/ocu_control_test?sslmode=disable
+          OCU_RUNTIME_IT: "1"
+          # The process_api-ENTRYPOINT guest image, so the create→destroy capstone
+          # materializes a real container instead of honest-skipping.
+          OCU_RUNTIME_IT_IMAGE: ${{ steps.guest.outputs.image }}
+        run: go test -run 'TestE2E_CreateDestroy_RealBackends' ./internal/lifecycle/ -v -timeout 600s
+
+  # docker-build catches go.mod / Dockerfile toolchain drift on every PR and
+  # push to main — the class of bug where go.mod advances past the builder
+  # image's Go version, causing `go mod download` to fail inside the container.
+  # A single-arch linux/amd64 build is sufficient to catch the mismatch fast;
+  # the full multi-platform push happens in release.yml. This job must never
+  # push (no registry credentials are supplied or needed).
+  docker-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: build the control image (no push — toolchain mismatch gate)
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false

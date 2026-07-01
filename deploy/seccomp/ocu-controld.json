@@ -1,0 +1,348 @@
+{
+  "_comment": "Default-deny seccomp profile for ocu-controld (NFR-SEC-02).",
+  "_rationale": [
+    "Base: tightened subset of the OCI / Moby container default allowlist.",
+    "The daemon is a static CGO_ENABLED=0 Go binary compiled with -trimpath.",
+    "It needs only: bind/accept on the two ingress listeners (operator UDS +",
+    "gateway loopback TCP), outbound connect to the RuntimeProvider endpoint",
+    "and the host-dialled guest channels, filesystem verbs under the audit-sink",
+    "and runtime mounts plus a read-only signing-key mount, Go runtime",
+    "primitives, graceful shutdown signal handling, and the NOTIFY_SOCKET",
+    "sendmsg for sd_notify.",
+    "Every syscall not listed below results in ENOSYS (SCMP_ACT_ERRNO 38).",
+    "",
+    "Capability group annotations show WHICH daemon need each syscall serves.",
+    "",
+    "Explicitly NOT allowed (not needed — reduce attack surface):",
+    "  ptrace, perf_event_open, bpf — no debugging or kernel tracing",
+    "  keyctl, add_key, request_key — no kernel keyring access",
+    "  mount, umount2, pivot_root — no filesystem mounting",
+    "  setuid, setgid, setgroups — daemon does not change credentials at runtime",
+    "  inotify_* — no filesystem watch needed",
+    "  shmget, shmat, shmctl — no SysV shared memory",
+    "  msgsnd, msgrcv — no SysV message queues",
+    "  semget, semop — no SysV semaphores (futex is sufficient)",
+    "  io_uring_* — not used by the Go stdlib net/file stack",
+    "  nfsservctl, quotactl — no NFS or quota operations",
+    "  kexec_load — no kernel replacement",
+    "  name_to_handle_at, open_by_handle_at — no NFS handle ops"
+  ],
+  "defaultAction": "SCMP_ACT_ERRNO",
+  "defaultErrnoRet": 38,
+  "archMap": [
+    {
+      "architecture": "SCMP_ARCH_X86_64",
+      "subArchitectures": ["SCMP_ARCH_X86", "SCMP_ARCH_X32"]
+    },
+    {
+      "architecture": "SCMP_ARCH_AARCH64",
+      "subArchitectures": ["SCMP_ARCH_ARM"]
+    }
+  ],
+  "syscalls": [
+
+    {
+      "_group": "Process startup and exit",
+      "_daemon_need": "Go runtime init; clean process exit",
+      "names": [
+        "execve",
+        "exit",
+        "exit_group"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Memory management",
+      "_daemon_need": "Go runtime heap, stack growth, goroutine stacks, mmap-backed IO buffers",
+      "names": [
+        "brk",
+        "mmap",
+        "munmap",
+        "mprotect",
+        "madvise",
+        "mincore",
+        "mlock",
+        "munlock"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Threading and synchronisation",
+      "_daemon_need": "Go M:N scheduler — goroutines, OS threads, futex-based mutexes/channels",
+      "names": [
+        "clone",
+        "clone3",
+        "futex",
+        "futex_waitv",
+        "get_thread_area",
+        "set_thread_area",
+        "gettid",
+        "getpid",
+        "getppid",
+        "sched_yield",
+        "sched_getaffinity",
+        "nanosleep",
+        "clock_nanosleep"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Thread-local storage",
+      "_daemon_need": "Go runtime TLS pointer setup on each OS thread",
+      "names": [
+        "arch_prctl",
+        "set_tid_address",
+        "prctl"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "I/O multiplexing",
+      "_daemon_need": "Go netpoller (epoll) for all socket and file I/O; eventfd for goroutine wakeup",
+      "names": [
+        "epoll_create",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_wait",
+        "epoll_pwait",
+        "epoll_pwait2",
+        "eventfd",
+        "eventfd2",
+        "pipe",
+        "pipe2",
+        "poll",
+        "ppoll",
+        "select",
+        "pselect6"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "File descriptors",
+      "_daemon_need": "fd lifecycle, CLOEXEC setup, fcntl, ioctl",
+      "names": [
+        "close",
+        "close_range",
+        "dup",
+        "dup2",
+        "dup3",
+        "fcntl",
+        "ioctl"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Sockets: ingress listeners + outbound dials + sd_notify",
+      "_daemon_need": [
+        "socket(AF_UNIX, SOCK_STREAM) — operator/lifecycle ingress UDS",
+        "socket(AF_INET, SOCK_STREAM) — gateway ingress + ops listener loopback TCP",
+        "bind, listen — bind the two ingress endpoints",
+        "accept / accept4 — accept operator and gateway connections",
+        "connect — dial the RuntimeProvider endpoint and the per-session guest channels; sd_notify connect",
+        "getsockopt(SO_PEERCRED) — kernel-attested peer uid/pid on the operator UDS gate",
+        "setsockopt — configure socket options (REUSEADDR etc.)",
+        "getsockname / getpeername — local/remote address queries",
+        "recvmsg / sendmsg — framed messages AND sd_notify datagram",
+        "recvfrom / sendto — used by Go net package internally",
+        "shutdown — half-close on connection teardown",
+        "socketpair — Go internal; used for self-pipe trick"
+      ],
+      "names": [
+        "socket",
+        "bind",
+        "listen",
+        "accept",
+        "accept4",
+        "connect",
+        "getsockopt",
+        "setsockopt",
+        "getsockname",
+        "getpeername",
+        "recvmsg",
+        "sendmsg",
+        "recvfrom",
+        "sendto",
+        "shutdown",
+        "socketpair"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Filesystem: open / read / write",
+      "_daemon_need": [
+        "open/openat/openat2 — open the audit sink, the runtime socket dir, the read-only signing-key mount",
+        "read/readv/pread64 — read the signing key, audit chain scan at startup",
+        "write/writev/pwrite64 — append audit records",
+        "lseek — seek within files during the hash-chain scan"
+      ],
+      "names": [
+        "open",
+        "openat",
+        "openat2",
+        "read",
+        "readv",
+        "pread64",
+        "preadv",
+        "preadv2",
+        "write",
+        "writev",
+        "pwrite64",
+        "pwritev",
+        "pwritev2",
+        "lseek",
+        "readahead"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Filesystem: metadata and directory ops",
+      "_daemon_need": [
+        "stat/lstat/fstat/statx — check file existence, size, mode, ownership",
+        "getdents64 — directory listing",
+        "mkdir/mkdirat — create the runtime socket directory",
+        "rename/renameat/renameat2 — atomic audit-record promotion",
+        "unlink/unlinkat — remove the stale operator socket on restart",
+        "rmdir — remove empty directories",
+        "chmod/fchmod/fchmodat — 0700 on the operator socket dir",
+        "utimensat — preserve mtime"
+      ],
+      "names": [
+        "stat",
+        "lstat",
+        "fstat",
+        "newfstatat",
+        "statx",
+        "getdents64",
+        "mkdir",
+        "mkdirat",
+        "rename",
+        "renameat",
+        "renameat2",
+        "unlink",
+        "unlinkat",
+        "rmdir",
+        "chmod",
+        "fchmod",
+        "fchmodat",
+        "utimensat",
+        "truncate",
+        "ftruncate"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Filesystem: durability",
+      "_daemon_need": [
+        "fsync — flush audit records to disk before acknowledging a privileged action (fail-closed)",
+        "fdatasync — flush file data without metadata",
+        "sync_file_range — optional IO hint used by Go on Linux"
+      ],
+      "names": [
+        "fsync",
+        "fdatasync",
+        "sync_file_range"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Time and random",
+      "_daemon_need": "Timestamps for audit records and log lines; crypto/rand for session ids and JWT signing nonces",
+      "names": [
+        "clock_gettime",
+        "clock_getres",
+        "gettimeofday",
+        "time",
+        "getrandom"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Signal handling",
+      "_daemon_need": [
+        "signal.NotifyContext(SIGTERM, SIGINT) for graceful shutdown;",
+        "rt_sigaction/rt_sigprocmask — register/unregister signal handlers",
+        "rt_sigreturn — return from signal handler",
+        "kill(getpid(), sig) — self-signal after first signal releases intercept",
+        "signalfd / signalfd4 — Go runtime uses signalfd on Linux",
+        "tgkill — Go runtime sends signals between OS threads"
+      ],
+      "names": [
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
+        "rt_sigsuspend",
+        "rt_sigpending",
+        "rt_sigtimedwait",
+        "sigaltstack",
+        "kill",
+        "tgkill",
+        "signalfd",
+        "signalfd4"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Process info and identity",
+      "_daemon_need": "uid/gid checks; SO_PEERCRED comparison on the operator UDS; startup log lines",
+      "names": [
+        "getuid",
+        "getgid",
+        "geteuid",
+        "getegid",
+        "getgroups",
+        "getresuid",
+        "getresgid"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "System info",
+      "_daemon_need": [
+        "uname — Go runtime queries Linux version for feature detection",
+        "getrlimit/prlimit64 — ceiling checks",
+        "sysinfo — Go runtime memory stats",
+        "fstatfs/statfs — Go os.Root API on some paths"
+      ],
+      "names": [
+        "uname",
+        "getrlimit",
+        "prlimit64",
+        "sysinfo",
+        "fstatfs",
+        "statfs"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    },
+
+    {
+      "_group": "Miscellaneous Go runtime",
+      "_daemon_need": [
+        "membarrier — Go 1.19+ uses membarrier for GC write barriers on SMP",
+        "rseq — restartable sequences, used by newer glibc / Go runtime on Linux",
+        "sched_setaffinity — Go runtime may pin goroutines to CPUs",
+        "capget — Go os.exec checks capabilities before fork on some paths"
+      ],
+      "names": [
+        "membarrier",
+        "rseq",
+        "sched_setaffinity",
+        "capget"
+      ],
+      "action": "SCMP_ACT_ALLOW"
+    }
+
+  ]
+}

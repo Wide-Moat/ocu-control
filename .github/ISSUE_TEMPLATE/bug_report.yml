@@ -1,0 +1,81 @@
+name: Bug Report
+description: Report a bug or unexpected behavior in ocu-control.
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Please fill out every
+        section so maintainers can reproduce the issue quickly.
+
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: >
+        Output of `ocu-controld -version` (or the git commit / release tag
+        if building from source).
+      placeholder: "v0.3.0 / commit abc1234"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime-provider
+    attributes:
+      label: Runtime provider
+      description: >
+        The container backend the control plane drives through the
+        RuntimeProvider seam. Docker is the v1 provider.
+      options:
+        - docker
+        - other
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: OS / platform
+      description: >
+        Output of `uname -sr`. The control plane dials guests over host-owned
+        channels and supervises containers through the runtime provider.
+      placeholder: "Linux 6.8.0-59-generic"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction steps
+      description: Minimal steps to trigger the bug.
+      placeholder: |
+        1. Start the daemon with flags …
+        2. Issue a session-create request …
+        3. Observe …
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should have happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant slog output
+      description: >
+        Paste structured log lines (JSON or text-handler) from the daemon. Omit
+        credentials and signing material; redact session IDs if desired.
+      render: text

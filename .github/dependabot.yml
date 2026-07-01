@@ -1,0 +1,38 @@
+# Dependabot configuration (T2-10, SUPPLY-03)
+# Weekly automated dependency updates for Go modules and GitHub Actions.
+# Opens PRs on main; branch protection + required CI checks prevent
+# automatic merge without a passing green run.
+version: 2
+
+updates:
+  # Go module dependencies
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:00"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - go
+
+  # GitHub Actions — keeps action SHA pins current with upstream releases.
+  # Dependabot resolves the new SHA and proposes the updated pin with a
+  # version comment, matching the manual pin discipline in the workflows.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "03:30"
+      timezone: UTC
+    open-pull-requests-limit: 5
+    cooldown:
+      default-days: 7
+    labels:
+      - dependencies
+      - github-actions
