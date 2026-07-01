@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
+	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
@@ -19,9 +20,10 @@ var suspiciousFieldNameMarkers = []string{
 }
 
 // suspiciousTypeMarkers are substrings that, in a field TYPE string, mark a credential
-// type — catching e.g. a field typed cred.Token whose NAME ("Storage") would not.
+// type — catching e.g. a field typed cred.Token whose NAME ("Storage") would not, or
+// a field typed mcpkey.SecretKey whose name might be innocuous ("Key").
 var suspiciousTypeMarkers = []string{
-	"Token", "JWT",
+	"Token", "JWT", "SecretKey",
 }
 
 // TestNoRawJWTOnPersistedOrAuditRecord pins Invariant VII — no raw Storage-JWT (or any
@@ -59,6 +61,14 @@ func TestNoRawJWTOnPersistedOrAuditRecord(t *testing.T) {
 	assertCredentialFree(t, reflect.TypeOf(state.SessionRow{}), "state.SessionRow")
 	assertCredentialFree(t, reflect.TypeOf(state.EnrichedSessionRow{}), "state.EnrichedSessionRow")
 	assertCredentialFree(t, reflect.TypeOf(audit.Record{}), "audit.Record")
+
+	// NFR-SEC-87 extension: the mcp-key Record holds salted-hash credentials,
+	// never the raw sk-ocu- SecretKey. The guard walks mcpkey.Record to prove no
+	// field typed mcpkey.SecretKey (or with a credential-shaped name) is present.
+	// The audit Record's Key field (a correlation string carrying key_id) is benign;
+	// the type guard catches a hypothetical SecretKey-typed field that would be a
+	// direct no-leak violation.
+	assertCredentialFree(t, reflect.TypeOf(mcpkey.Record{}), "mcpkey.Record")
 }
 
 // assertCredentialFree fails if the top-level type is not a non-empty struct (the

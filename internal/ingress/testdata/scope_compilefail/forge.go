@@ -18,7 +18,10 @@
 package scopecompilefail
 
 import (
+	"context"
+
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
@@ -62,4 +65,17 @@ func callOperatorOnlyWithServiceScope() {
 // types; the conversion is not permitted.
 func convertServiceToOperator() ingress.OperatorScope {
 	return ingress.OperatorScope(ingress.ServiceScopeFor())
+}
+
+// gatewayCallsMCPKeyEngineCreate models a gateway-shaped caller attempting to invoke
+// mcpkey.Engine.Create with its ServiceScope. FORBIDDEN: Engine.Create requires an
+// ingress.OperatorScope, but the gateway holds only a ServiceScope and no OperatorSeam
+// — "cannot use ... (ingress.ServiceScope) as ingress.OperatorScope value". This is
+// the precise elevation a malicious gateway call would attempt (T-08-12), and it must
+// not compile (NFR-SEC-52 as a compile fact, identical to the kill-switch gate).
+func gatewayCallsMCPKeyEngineCreate(eng *mcpkey.Engine) {
+	// A gateway caller only ever holds a ServiceScope (minted by ServiceScopeFor()),
+	// never an OperatorScope. Passing the ServiceScope as the scope argument must
+	// produce a type-mismatch error — "cannot use ... as ingress.OperatorScope value".
+	_, _, _ = eng.Create(context.Background(), ingress.ServiceScopeFor(), "t", "d", nil)
 }

@@ -22,6 +22,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/ingress/operator"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	ocuruntime "github.com/Wide-Moat/ocu-control/internal/runtime"
@@ -79,12 +80,22 @@ func operatorDepsFor(t *testing.T, resolver ingress.IdentityResolver, verifier k
 		Tier:      ocuruntime.TierRunc,
 	})
 	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
+	// The mcp-key engine over an in-memory record store and a no-op rerender, so a
+	// bound transport test can drive POST /v1alpha/mcp-keys create→revoke end to end.
+	mcpEng := mcpkey.NewEngine(
+		mcpkey.NewMinter(),
+		mcpkey.NewInMemRecordStore(),
+		func(context.Context) error { return nil },
+		clk,
+		sink,
+	)
 	return operator.Deps{
-		Manager:  mgr,
-		Engine:   eng,
-		Resolver: resolver,
-		Verifier: verifier,
-		Seam:     ingress.NewOperatorSeam(),
+		Manager:      mgr,
+		Engine:       eng,
+		MCPKeyEngine: mcpEng,
+		Resolver:     resolver,
+		Verifier:     verifier,
+		Seam:         ingress.NewOperatorSeam(),
 	}
 }
 
@@ -279,6 +290,142 @@ func TestOperatorTransportRevokeOneAndAll(t *testing.T) {
 	code, _ = postJSON(t, client, "/v1alpha/revoke/all", map[string]any{"reason": "incident"})
 	if code != http.StatusOK {
 		t.Fatalf("revoke/all over the wire = %d; want 200", code)
+	}
+}
+
+// TestOperatorTransportMCPKeyCreateThenRevoke drives the mounted mcp-key routes
+// end-to-end over a real Unix socket: POST /v1alpha/mcp-keys returns 201 with a
+// shown-once sk-ocu- raw key + a key_id, and POST /v1alpha/mcp-keys/revoke of that
+// key_id returns 200. This is the wire proof that the routes landed at the A2
+// wire-freeze checkpoint — it exercises registerRoutes, the create/revoke bodies,
+// MCPKeyCreate/MCPKeyRevoke, and the OperatorScope flow from the held seam through
+// to the mcpkey Engine.
+func TestOperatorTransportMCPKeyCreateThenRevoke(t *testing.T) {
+	t.Parallel()
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+
+	// Create over the wire.
+	code, body := postJSON(t, client, "/v1alpha/mcp-keys", map[string]any{
+		"tenant":     "tenant-x",
+		"deployment": "deploy-x",
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("mcp-key create over the wire = %d; want 201", code)
+	}
+	rawKey, _ := body["raw_key"].(string)
+	if len(rawKey) < 7 || rawKey[:7] != "sk-ocu-" {
+		t.Fatalf("mcp-key create response raw_key = %q; want an sk-ocu- key", rawKey)
+	}
+	keyID, _ := body["key_id"].(string)
+	if keyID == "" {
+		t.Fatalf("mcp-key create response missing key_id: %v", body)
+	}
+	if tenant, _ := body["tenant"].(string); tenant != "tenant-x" {
+		t.Fatalf("mcp-key create response tenant = %q; want tenant-x", tenant)
+	}
+
+	// Revoke the created key by its key_id.
+	code, _ = postJSON(t, client, "/v1alpha/mcp-keys/revoke", map[string]any{
+		"key_id": keyID,
+		"reason": "rotation",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("mcp-key revoke over the wire = %d; want 200", code)
+	}
+}
+
+// TestOperatorTransportMCPKeyRevokeUnknownIsIdempotent proves the revoke route is
+// idempotent on an unknown key_id: revoking a key that was never created is a 200
+// no-op, NOT a 404. This is deliberate — a 404 would be a cross-tenant existence
+// oracle. The store's Revoke is a no-op on an absent id.
+func TestOperatorTransportMCPKeyRevokeUnknownIsIdempotent(t *testing.T) {
+	t.Parallel()
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+
+	code, _ := postJSON(t, client, "/v1alpha/mcp-keys/revoke", map[string]any{
+		"key_id": "never-minted-id",
+		"reason": "x",
+	})
+	if code != http.StatusOK {
+		t.Fatalf("mcp-key revoke of an unknown id = %d; want 200 (idempotent no-op)", code)
+	}
+}
+
+// TestOperatorTransportMCPKeyEdges drives the mcp-key routes' method-not-allowed
+// (GET → 405), unattested (refusing resolver → 401), and engine-unset (nil
+// MCPKeyEngine → 503 fail-closed, not a panic) branches over the wire.
+func TestOperatorTransportMCPKeyEdges(t *testing.T) {
+	t.Parallel()
+
+	// Method-not-allowed: GET on the POST-only mcp-key routes.
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+	for _, path := range []string{"/v1alpha/mcp-keys", "/v1alpha/mcp-keys/revoke"} {
+		resp, err := client.Get("http://unix" + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode != http.StatusMethodNotAllowed {
+			t.Fatalf("GET %s = %d; want 405", path, resp.StatusCode)
+		}
+	}
+
+	// Unattested: a refusing resolver makes both mcp-key verbs 401.
+	_, refusingClient, _ := boundOperator(t, fixedResolver{refuse: true}, nil)
+	code, _ := postJSON(t, refusingClient, "/v1alpha/mcp-keys", map[string]any{"tenant": "t"})
+	if code != http.StatusUnauthorized {
+		t.Fatalf("unattested mcp-key create = %d; want 401", code)
+	}
+	code, _ = postJSON(t, refusingClient, "/v1alpha/mcp-keys/revoke", map[string]any{"key_id": "k"})
+	if code != http.StatusUnauthorized {
+		t.Fatalf("unattested mcp-key revoke = %d; want 401", code)
+	}
+}
+
+// TestOperatorTransportMCPKeyEngineUnset503 proves the fail-closed nil-engine
+// path: a bound listener whose Deps omits the MCPKeyEngine returns 503 (a clean
+// refusal), NOT a nil-pointer panic that crashes the Serve goroutine. The route
+// is mounted unconditionally, so the nil guard is the boundary that keeps an
+// unconfigured deployment from crashing on the first mcp-key request.
+func TestOperatorTransportMCPKeyEngineUnset503(t *testing.T) {
+	t.Parallel()
+	socket := shortSocketPath(t)
+	deps := operatorDepsFor(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, nil)
+	deps.MCPKeyEngine = nil // model a deployment that did not wire the engine
+	deps.Healthz = func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}
+	l := operator.NewListener(socket, deps)
+	if err := l.Bind(); err != nil {
+		t.Fatalf("Bind: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- l.Serve(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-serveErr:
+			if err != nil {
+				t.Errorf("Serve returned %v; want nil on clean shutdown", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Error("Serve did not return after context cancel")
+		}
+	})
+	client := unixClient(socket)
+	waitOperatorReady(t, client)
+
+	code, _ := postJSON(t, client, "/v1alpha/mcp-keys", map[string]any{"tenant": "t"})
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("mcp-key create with a nil engine = %d; want 503 (fail-closed, not a panic)", code)
 	}
 }
 

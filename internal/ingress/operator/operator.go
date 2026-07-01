@@ -44,6 +44,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
@@ -89,6 +90,13 @@ type Deps struct {
 	// http.Handler so this package stays decoupled from the metrics collector. When
 	// nil the /metrics route is not mounted.
 	Metrics http.Handler
+	// MCPKeyEngine is the operator surface for minting and revoking sk-ocu- MCP API
+	// keys. Its Create/Revoke methods require an OperatorScope (obtained here from the
+	// held Seam after attestation) so a gateway caller cannot reach them. When nil the
+	// MCPKeyCreate/MCPKeyRevoke handlers refuse with an internal error — the daemon
+	// wires the real engine; tests may inject a configured one. It is SEPARATE from the
+	// killswitch Engine: MCP key operations do not touch the session denylist.
+	MCPKeyEngine *mcpkey.Engine
 }
 
 // HealthzFunc is the readiness handler the boot Sequencer's Healthz returns. The
@@ -103,11 +111,12 @@ type HealthzFunc = http.HandlerFunc
 // from the held seam (after peer attestation for admin/CLI, after a SOAR verify
 // for the webhook), so the operator-only Engine surface is reachable only here.
 type Handlers struct {
-	manager  *lifecycle.Manager
-	engine   *killswitch.Engine
-	resolver ingress.IdentityResolver
-	verifier killswitch.SOARVerifier
-	seam     ingress.OperatorSeam
+	manager      *lifecycle.Manager
+	engine       *killswitch.Engine
+	mcpKeyEngine *mcpkey.Engine
+	resolver     ingress.IdentityResolver
+	verifier     killswitch.SOARVerifier
+	seam         ingress.OperatorSeam
 }
 
 // NewHandlers builds the in-process operator handler surface from Deps. A nil
@@ -120,11 +129,12 @@ func NewHandlers(deps Deps) *Handlers {
 		resolver = NewPeerCredResolver(nil)
 	}
 	return &Handlers{
-		manager:  deps.Manager,
-		engine:   deps.Engine,
-		resolver: resolver,
-		verifier: deps.Verifier,
-		seam:     deps.Seam,
+		manager:      deps.Manager,
+		engine:       deps.Engine,
+		mcpKeyEngine: deps.MCPKeyEngine,
+		resolver:     resolver,
+		verifier:     deps.Verifier,
+		seam:         deps.Seam,
 	}
 }
 

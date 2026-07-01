@@ -117,7 +117,7 @@ func TestProperty_SEC45ExhaustiveOverPrivilegedEnum(t *testing.T) {
 // a call site that drifts to a non-enumerated action fails the test.
 func TestEmitCallSiteActionsArePinned(t *testing.T) {
 	t.Parallel()
-	// The Actions the lifecycle + kill-switch Emit call sites pass today.
+	// The Actions the lifecycle + kill-switch + mcpkey Engine Emit call sites pass today.
 	callSiteActions := []audit.Action{
 		audit.ActionCreateCommit,  // lifecycle stageCommit
 		audit.ActionDestroy,       // lifecycle Destroy
@@ -127,6 +127,8 @@ func TestEmitCallSiteActionsArePinned(t *testing.T) {
 		audit.ActionOverrideQuota, // killswitch quota override
 		audit.ActionRetentionPolicy,
 		audit.ActionCreateRejected, // lifecycle stageAdmit/stageQuotaCharge/stageReserve deny
+		audit.ActionMCPKeyCreate,   // mcpkey Engine Create
+		audit.ActionMCPKeyRevoke,   // mcpkey Engine Revoke
 	}
 	priv := actionSet(audit.PrivilegedActions())
 	for _, a := range callSiteActions {
@@ -158,12 +160,12 @@ func TestCreateRejectedIsSEC72Only(t *testing.T) {
 	}
 }
 
-// TestFixtureVersionPinned proves the fixture version constant is the expected v1, so
+// TestFixtureVersionPinned proves the fixture version constant is the expected v2, so
 // a fixture-set change without a version bump fails this pin.
 func TestFixtureVersionPinned(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v1" {
-		t.Fatalf("FixtureVersion = %q, want v1", audit.FixtureVersion)
+	if audit.FixtureVersion != "v2" {
+		t.Fatalf("FixtureVersion = %q, want v2", audit.FixtureVersion)
 	}
 }
 

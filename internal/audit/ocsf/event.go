@@ -171,7 +171,8 @@ func activityFor(a audit.Action) (uint8, string) {
 		return activityDelete, a.String()
 	case audit.ActionRevokeOne, audit.ActionRevokeAll,
 		audit.ActionEditDenylist, audit.ActionOverrideQuota, audit.ActionRetentionPolicy,
-		audit.ActionResumeGlobal:
+		audit.ActionResumeGlobal,
+		audit.ActionMCPKeyCreate, audit.ActionMCPKeyRevoke:
 		return activityUpdate, a.String()
 	case audit.ActionCreateRejected:
 		// A refused create produced no resource, so it has no CRUD slot: it maps to

@@ -23,6 +23,8 @@ func TestPrivilegedActionsIsClosedEnum(t *testing.T) {
 		audit.ActionOverrideQuota,
 		audit.ActionRetentionPolicy,
 		audit.ActionResumeGlobal,
+		audit.ActionMCPKeyCreate,
+		audit.ActionMCPKeyRevoke,
 		audit.ActionCreateRejected,
 	}
 	got := audit.PrivilegedActions()
@@ -70,6 +72,8 @@ func TestSEC45ActionsSubsetAndContents(t *testing.T) {
 		audit.ActionDestroy:         true,
 		audit.ActionRetentionPolicy: true,
 		audit.ActionResumeGlobal:    true,
+		audit.ActionMCPKeyCreate:    true,
+		audit.ActionMCPKeyRevoke:    true,
 	}
 	got := audit.SEC45Actions()
 	if len(got) != len(want) {
@@ -153,7 +157,7 @@ func TestSEC72EnumActionsDistinct(t *testing.T) {
 // TestFixtureVersion pins the versioned fixture stamp.
 func TestFixtureVersion(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v1" {
-		t.Fatalf("FixtureVersion = %q, want v1", audit.FixtureVersion)
+	if audit.FixtureVersion != "v2" {
+		t.Fatalf("FixtureVersion = %q, want v2", audit.FixtureVersion)
 	}
 }

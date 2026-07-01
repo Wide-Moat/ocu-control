@@ -268,7 +268,7 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 	if err != nil {
 		t.Fatalf("providerOf: %v", err)
 	}
-	mgr, eng, _, _ := compose(store, clk, provider, profile, tier, signer, nullCloser{}, cfg)
+	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, nullCloser{}, cfg)
 	seam := ingress.NewOperatorSeam()
 	seq := boot.New(store, clk)
 	op := operator.NewListener(sockPath, operator.Deps{
