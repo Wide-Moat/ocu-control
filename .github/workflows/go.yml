@@ -289,11 +289,12 @@ jobs:
         with:
           repository: Wide-Moat/open-computer-use
           # Kept in sync with scripts/check-contract-identity.sh's pinned revision:
-          # 5100e14 (PR #303 exec-uplift — snake_case rename + TraceEvent/zstd pin).
-          # The prior f05b1574 was the dead PRE-REWRITE rev; the vendored
-          # contracts/{control-rpc,exec-channel,mount-config} are byte-identical to
-          # canon @5100e14 (verified by cmp).
-          ref: 5100e140e2629c1b19bb7e6c905bb6e28fc4eb2e
+          # 099d3d7 (next/v1 after PR #318 — the mcp-key-set A2 freeze), which the
+          # newly vendored contracts/mcp/mcp-key-set.schema.json requires. All five
+          # vendored contracts (control-rpc, exec-channel, mount-config,
+          # audit-fanin, mcp-key-set) are byte-identical to canon @099d3d7
+          # (verified by cmp). The prior pin was 5100e14 (PR #303 exec-uplift).
+          ref: 099d3d76d6d8a8e5bec6f46b989c6b9a9246c375
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
