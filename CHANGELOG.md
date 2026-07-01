@@ -12,6 +12,28 @@ ISO-8601 (UTC).
 
 ## [Unreleased]
 
+### Changed — mcp-key wire-freeze adoption (canon #318)
+
+The canon froze the Artifact-2 hashed-key-set schema and the operator mcp-key
+verbs; this change adopts the freeze end to end.
+
+- **Vendored `contracts/mcp/mcp-key-set.schema.json`** byte-identical from the
+  canon (rev 09b00fc) and added it to the contract-identity and ajv gates.
+- **A2 golden byte-identity chain** — `TestWriteKeySetMatchesGolden` pins the
+  exact bytes `WriteKeySet` publishes for a production-shaped record set
+  (revoked and expired records proven omitted); CI ajv-validates that golden
+  against the vendored canon schema, so a wire drift fails either leg.
+- **Fail-closed mint validation** — `Engine.Create` refuses an empty tenant or
+  deployment (`ErrTenantMissing` / `ErrDeploymentMissing`, 400 on the wire)
+  before any side effect: the published record pins both fields with
+  minLength 1, so admitting either empty would render a schema-invalid
+  artifact. `occ mcp-key create` now requires `--deployment`, mirroring the
+  canon create-request.
+- **Operator-REST doc alignment** — the mounted mcp-key routes are documented
+  in `contracts/openapi/operator-rest.openapi.yaml` with the canon-frozen
+  request/response shapes (shown-once `raw_key`, idempotent 200-never-404
+  revoke).
+
 ### Added — v0.2 admin read-API (ADR-0022, Track B)
 
 The operator-console read-surface, built on top of the v0.1 spine. It is a

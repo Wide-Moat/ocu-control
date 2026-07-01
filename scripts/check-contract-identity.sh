@@ -7,17 +7,16 @@
 # byte-identical copies so any Go parity test (and any future embed) always
 # builds against the pinned wire surface.
 #
-# Pinned canon revision (next/v1): 5100e14 — "fix(contracts): uplift
-# exec-channel to snake_case + pin TraceEvent and zstd compression" (PR #303,
-# base next/v1). This rev forward-ports the snake_case field rename (env_vars→env,
-# boundPid→bound_pid, supports_trace→supports_traces) AND pins the two previously
-# open exec-channel questions: the TraceEvent field set (5-field closed $defs) and
-# the compression algorithm (zstd RFC 8878, window ≤2^17). The exec-channel schema
-# at this rev is sha256 ea1e94ef…52aaf (15712 B); control-rpc is unchanged
-# (bd0bde46…). The prior pin (f05b1574…) was a dead PRE-REWRITE rev (not an
-# ancestor of next/v1 after the public-release history consolidation). Re-vendor
-# against this SHA; bump it deliberately when re-vendoring and verify byte-identity
-# (cmp) before bumping.
+# Pinned canon revision (next/v1): 099d3d7 — next/v1 after PR #318,
+# "feat(contracts): freeze the mcp-key-set artifact and operator mcp-key verbs
+# (ADR-0027)". All five declared contracts are byte-identical to canon at this
+# rev (verified by cmp): mcp/mcp-key-set.schema.json enters at this pin (git
+# blob 25329b0f…); control-rpc, exec-channel, mount-config, and audit-fanin are
+# unchanged since the prior pin 5100e14 (PR #303 exec-uplift: snake_case rename
+# + the TraceEvent 5-field $defs + zstd RFC 8878 window ≤2^17 pins; exec-channel
+# sha256 ea1e94ef…52aaf, control-rpc bd0bde46…). Keep this pin in sync with the
+# canon checkout `ref:` in go.yml's checks job. Bump it deliberately when
+# re-vendoring and verify byte-identity (cmp) before bumping.
 #
 # The canon is a SEPARATE repository, so this check runs wherever a checkout
 # is reachable (set OCU_CANON_DIR, default ../open-computer-use) and skips
@@ -39,6 +38,7 @@ readonly -a CONTRACTS=(
   'exec/exec-channel.schema.json'
   'storage/mount-config.schema.json'
   'audit/audit-fanin.asyncapi.yaml'
+  'mcp/mcp-key-set.schema.json'
 )
 
 # Resolve the canon side once: probe the first declared contract to decide

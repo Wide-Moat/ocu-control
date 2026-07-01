@@ -214,11 +214,18 @@ spdx: ## Assert SPDX FSL-1.1-Apache-2.0 header on all in-scope source files
 contract: ## Assert vendored contracts are byte-identical to the canon (skips if canon absent)
 	bash scripts/check-contract-identity.sh
 
-schema: ## Compile every vendored JSON-Schema contract with ajv (structural validity)
+schema: ## Compile every vendored JSON-Schema contract with ajv; validate the A2 golden
 	npx ajv-cli@5.0.0 compile --spec=draft2020 --strict=false \
 	  -s contracts/control/control-rpc.schema.json \
 	  -s contracts/exec/exec-channel.schema.json \
-	  -s contracts/storage/mount-config.schema.json
+	  -s contracts/storage/mount-config.schema.json \
+	  -s contracts/mcp/mcp-key-set.schema.json
+	# The golden is pinned byte-for-byte to WriteKeySet's output by
+	# TestWriteKeySetMatchesGolden, so validating it against the vendored canon
+	# schema proves the published A2 artifact conforms to the frozen wire.
+	npx ajv-cli@5.0.0 validate --spec=draft2020 --strict=false \
+	  -s contracts/mcp/mcp-key-set.schema.json \
+	  -d internal/mcpkeyset/testdata/mcp-key-set.golden.json
 
 identity: ## Assert no retired maintainer address in tracked files
 	bash scripts/check-doc-identity.sh
