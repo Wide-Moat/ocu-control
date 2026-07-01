@@ -30,6 +30,11 @@ var forbiddenConstructs = []struct {
 	{"literal-forge of OperatorSeam (unexported field mint)", "unexported field mint"},
 	{"passing a ServiceScope where an OperatorScope is required", "as ingress.OperatorScope value"},
 	{"converting a ServiceScope to an OperatorScope", "cannot convert"},
+	// The mcpkey Engine methods also take ingress.OperatorScope; a gateway-shaped
+	// caller that holds no seam cannot mint one and therefore cannot call Create or
+	// Revoke. The forge below attempts to call the engine with a ServiceScope (the
+	// gateway's capability) and must fail with the same type mismatch.
+	{"passing ServiceScope to mcpkey.Engine.Create (gateway cannot reach mcp-key create)", "as ingress.OperatorScope value"},
 }
 
 // TestScopeCompileFailFixtureDoesNotCompile is the load-bearing compile seal: it

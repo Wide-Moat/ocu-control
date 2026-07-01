@@ -63,6 +63,17 @@ const (
 	// stays the last enum arm and the exhaustiveness boundary proof
 	// (lastAction + the "audit_action_unknown" one-past-the-end value) holds.
 	ActionResumeGlobal
+	// ActionMCPKeyCreate is an operator mint of a new sk-ocu- MCP API key. It is
+	// an operator state-mutating action (the SEC-45 family), audited fail-closed
+	// BEFORE the key is minted, persisted, or published — a key that is live but
+	// un-recorded violates NFR-SEC-45. Inserted BEFORE ActionCreateRejected so
+	// the boundary anchor stays last.
+	ActionMCPKeyCreate
+	// ActionMCPKeyRevoke is an operator revocation of an existing sk-ocu- MCP API
+	// key. It is an operator state-mutating action (the SEC-45 family), audited
+	// fail-closed BEFORE the record status is flipped and the artifact re-rendered.
+	// Inserted BEFORE ActionCreateRejected so the boundary anchor stays last.
+	ActionMCPKeyRevoke
 	// ActionCreateRejected is a session create REFUSED at a pre-side-effect deny
 	// stage (admission, quota, or the kill-switch/denylist re-check). It is the
 	// system-initiated rejection record NFR-SEC-46/72 require: the deny itself is
@@ -93,6 +104,10 @@ func (a Action) String() string {
 		return "retention_policy"
 	case ActionResumeGlobal:
 		return "resume_global"
+	case ActionMCPKeyCreate:
+		return "mcp_key_create"
+	case ActionMCPKeyRevoke:
+		return "mcp_key_revoke"
 	case ActionCreateRejected:
 		return "create_rejected"
 	default:

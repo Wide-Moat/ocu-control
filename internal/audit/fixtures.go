@@ -21,7 +21,7 @@ package audit
 // a forward-declared deferred-verb label — is a version bump. It is carried in the
 // audit metadata so a downstream fan-in can pin which fixture revision a source was
 // running.
-const FixtureVersion = "v1"
+const FixtureVersion = "v2"
 
 // lastAction is the highest valid Action enum value. It anchors the exhaustive walk
 // of the closed enum: PrivilegedActions enumerates 0..lastAction inclusive, and the
@@ -69,6 +69,8 @@ func SEC45Actions() []Action {
 		ActionDestroy,         // operator-initiated teardown (state-mutating)
 		ActionRetentionPolicy, // retention-policy change (deferred wire surface)
 		ActionResumeGlobal,    // operator global-deny LIFT (symmetric to RevokeAll)
+		ActionMCPKeyCreate,    // operator mcp-key issuance (SEC-45 state-mutating)
+		ActionMCPKeyRevoke,    // operator mcp-key revocation (SEC-45 state-mutating)
 	}
 }
 
