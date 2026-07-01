@@ -17,7 +17,7 @@ import (
 // fixedClock is a deterministic Clock for record tests.
 type fixedClock struct{ t time.Time }
 
-func (f fixedClock) Now() time.Time                  { return f.t }
+func (f fixedClock) Now() time.Time                     { return f.t }
 func (f fixedClock) Since(mark time.Time) time.Duration { return f.t.Sub(mark) }
 
 var epoch = time.Date(2025, 1, 2, 3, 4, 5, 0, time.UTC)

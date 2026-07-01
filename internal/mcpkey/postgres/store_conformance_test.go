@@ -14,8 +14,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
-	mcpkeypostgres "github.com/Wide-Moat/ocu-control/internal/mcpkey/postgres"
 	"github.com/Wide-Moat/ocu-control/internal/mcpkey/mcpkeytest"
+	mcpkeypostgres "github.com/Wide-Moat/ocu-control/internal/mcpkey/postgres"
 )
 
 // dbURLEnv is the environment variable that points the Postgres leg's tests at
@@ -157,5 +157,5 @@ func TestPostgres_CrossRestartDurability(t *testing.T) {
 // simpleClock is a trivial state.Clock for test use.
 type simpleClock struct{ t time.Time }
 
-func (c simpleClock) Now() time.Time                  { return c.t }
+func (c simpleClock) Now() time.Time                     { return c.t }
 func (c simpleClock) Since(mark time.Time) time.Duration { return c.t.Sub(mark) }

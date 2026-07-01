@@ -62,18 +62,18 @@ const (
 //
 // Fields:
 //   - KeyID:      the public handle passed to "revoke --id" and used as the
-//                 audit actor/correlation field; a short random handle distinct
-//                 from the secret (never derived from it — A5).
+//     audit actor/correlation field; a short random handle distinct
+//     from the secret (never derived from it — A5).
 //   - KeyHash:    sha256(salt ‖ secret); the UNSALTED hash is rejected at
-//                 construction (pass-the-hash floor, NFR-SEC-87).
+//     construction (pass-the-hash floor, NFR-SEC-87).
 //   - Salt:       a per-key 32-byte crypto/rand salt; stored alongside the hash
-//                 so a presented bearer can be re-hashed for comparison.
+//     so a presented bearer can be re-hashed for comparison.
 //   - Tenant:     the tenant the key is scoped to (operator-supplied at issuance).
 //   - Deployment: the deployment the key is scoped to.
 //   - ExpiresAt:  optional expiry; zero value means non-expiring (ADR-0027).
 //   - Status:     active | revoked (closed enum).
 //   - CreatedAt:  the instant the record was minted, stamped from the injected
-//                 Clock so time math is monotonic-source-safe.
+//     Clock so time math is monotonic-source-safe.
 type Record struct {
 	KeyID      string    `json:"key_id"`
 	KeyHash    []byte    `json:"key_hash"`

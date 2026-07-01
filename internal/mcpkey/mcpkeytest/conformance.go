@@ -25,7 +25,7 @@ var conformanceStart = time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
 // conformanceClock is a trivial deterministic clock for conformance tests.
 type conformanceClock struct{ t time.Time }
 
-func (c conformanceClock) Now() time.Time                  { return c.t }
+func (c conformanceClock) Now() time.Time                     { return c.t }
 func (c conformanceClock) Since(mark time.Time) time.Duration { return c.t.Sub(mark) }
 
 // minter is the default Minter used across the suite.
