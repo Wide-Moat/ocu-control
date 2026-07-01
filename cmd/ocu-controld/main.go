@@ -49,6 +49,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
 	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
+	mcpkeypostgres "github.com/Wide-Moat/ocu-control/internal/mcpkey/postgres"
 	"github.com/Wide-Moat/ocu-control/internal/mcpkeyset"
 	"github.com/Wide-Moat/ocu-control/internal/metrics"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
@@ -633,9 +634,23 @@ func renderJWKSArtifact(cfg config, signer *cred.Signer) error {
 // writer). compose() exposes the constructed chain sink for exactly this reuse.
 func buildMCPKeyEngine(ctx context.Context, cfg config, clk state.Clock, sink audit.AuditSink) (*mcpkey.Engine, error) {
 	// Backend select: mirrors -state-dsn empty ⇒ in-memory (the minimal shelf
-	// default). The file-vs-DB choice stays here in the daemon; it must NOT leak
-	// into the handler logic.
-	recordStore := mcpkey.NewInMemRecordStore()
+	// default, identical to openStore). The file-vs-DB choice stays here in the
+	// daemon; it must NOT leak into the handler logic.
+	var recordStore mcpkey.RecordStore
+	if cfg.stateDSN == "" {
+		// Minimal shelf: in-memory store. State is lost on restart; the optional
+		// -mcp-key-file re-seeds it on the next boot.
+		recordStore = mcpkey.NewInMemRecordStore()
+	} else {
+		// Full shelf: Postgres store. The DSN is the same one openStore uses for
+		// the session state; we open a separate pool so the mcpkey schema is
+		// migrated independently without touching the session store's pool.
+		var err error
+		recordStore, err = mcpkeypostgres.Open(ctx, cfg.stateDSN)
+		if err != nil {
+			return nil, fmt.Errorf("open mcp-key postgres store: %w", err)
+		}
+	}
 
 	// If -mcp-key-file is set and the file already exists on disk, load it into
 	// the in-memory store FAIL-CLOSED (before any listener binds). A file with

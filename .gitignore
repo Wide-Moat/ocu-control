@@ -11,6 +11,8 @@
 # The compiled daemon binary (the CI e2e/release jobs build it as
 # ./ocu-controld; a local build must never enter the tree).
 /ocu-controld
+# The compiled occ operator CLI binary (local build artifact).
+/occ
 *.bin
 
 # Property-test (rapid) failure corpus — regenerated on every failing run,
