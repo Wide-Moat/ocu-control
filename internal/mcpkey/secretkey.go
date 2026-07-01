@@ -25,7 +25,7 @@ type SecretKey struct {
 // secretKeyRedaction is the sentinel every redacting surface emits. A
 // never-logged grep test drives every emit path and asserts this string, never
 // the raw sk-ocu- key, appears. It is a fixed marker, not a credential.
-const secretKeyRedaction = "SecretKey(REDACTED)" //nolint:gosec // G101: redaction sentinel, not a credential
+const secretKeyRedaction = "SecretKey(REDACTED)"
 
 // String redacts: a %s, a Stringer caller, or a default fmt verb yields the
 // sentinel.

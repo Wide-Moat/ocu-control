@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -332,9 +333,9 @@ func Test_renderCreateResult(t *testing.T) {
 	}
 }
 
-// isUsageError is a helper that checks whether err is a usageError and writes it
-// to *ue. It mirrors errors.As semantics for the non-pointer usageError type.
-func isUsageError(err error, _ *usageError) bool {
-	_, ok := err.(usageError)
-	return ok
+// isUsageError is a helper that checks whether err is (or wraps) a usageError and
+// writes the matched value to *ue. It uses errors.As so a wrapped usageError still
+// matches — the errorlint-clean form of the earlier bare type assertion.
+func isUsageError(err error, ue *usageError) bool {
+	return errors.As(err, ue)
 }
