@@ -227,19 +227,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      # -c ajv-formats loads the format vocabulary so format:"date-time" (and the
+      # other RFC formats the frozen schemas pin) is ASSERTED, not silently ignored.
+      # Without it ajv drops every format keyword and the gate cannot catch a
+      # timestamp-format drift in the published artifact.
       - name: ajv compile the vendored JSON-Schema contracts
         run: |
-          npx --yes ajv-cli@5.0.0 compile --spec=draft2020 --strict=false \
+          npx --yes -p ajv-cli@5.0.0 -p ajv-formats@3.0.1 ajv compile --spec=draft2020 --strict=false -c ajv-formats \
             -s contracts/control/control-rpc.schema.json \
             -s contracts/exec/exec-channel.schema.json \
             -s contracts/storage/mount-config.schema.json \
             -s contracts/mcp/mcp-key-set.schema.json
       # The golden is pinned byte-for-byte to WriteKeySet's output by
       # TestWriteKeySetMatchesGolden, so validating it against the vendored canon
-      # schema proves the published A2 artifact conforms to the frozen wire.
+      # schema proves the published A2 artifact conforms to the frozen wire —
+      # INCLUDING the RFC3339 date-time formats, now that ajv-formats is loaded.
       - name: ajv validate the A2 hashed-key-set golden against the canon schema
         run: |
-          npx --yes ajv-cli@5.0.0 validate --spec=draft2020 --strict=false \
+          npx --yes -p ajv-cli@5.0.0 -p ajv-formats@3.0.1 ajv validate --spec=draft2020 --strict=false -c ajv-formats \
             -s contracts/mcp/mcp-key-set.schema.json \
             -d internal/mcpkeyset/testdata/mcp-key-set.golden.json
       # The draft operator-REST and SOAR-revoke surfaces (#205 define-surface).

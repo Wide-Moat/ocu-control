@@ -58,3 +58,9 @@ jobs:
         run: go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@v0.0.0-20251226130216-48d0401f00fb
       - name: mutation score floor (blocking)
         run: bash scripts/mutation-floor.sh
+      # RED-when-neutered proof: assert the below-floor decision and the no-score
+      # (anti-gremlins) guard both fire. A gate that never fires below floor guards
+      # nothing; this proof runs in CI (not just locally) so a neutered floor gate
+      # cannot ship green.
+      - name: mutation red-probe (floor and no-score guards fire)
+        run: bash scripts/mutation-redprobe.sh

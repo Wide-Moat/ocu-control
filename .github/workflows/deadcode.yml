@@ -29,3 +29,8 @@ jobs:
         run: go install golang.org/x/tools/cmd/deadcode@v0.38.0 # golang.org/x/tools/cmd/deadcode
       - name: deadcode gate (whole-program, incl. tests)
         run: bash scripts/deadcode-gate.sh
+      # RED-when-neutered proof: plant a dead export, assert the gate fires, remove
+      # it, assert the gate is green. A gate that never fires guards nothing; this
+      # proof runs in CI (not just locally) so a neutered gate cannot ship green.
+      - name: deadcode red-probe (gate fires on a planted dead export)
+        run: bash scripts/deadcode-redprobe.sh

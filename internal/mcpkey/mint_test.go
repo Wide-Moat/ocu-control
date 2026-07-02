@@ -5,6 +5,9 @@ package mcpkey_test
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -87,25 +90,61 @@ func TestMintBiasFree(t *testing.T) {
 	}
 }
 
-// TestMintNoBiasGrepGuard asserts that no production file under internal/mcpkey/
-// uses math/rand or the modulo expression b%62. This is a static guard to catch
-// a regression that would lower entropy below the NFR-SEC-87 256-bit floor.
+// biasForbiddenPatterns are the source fragments that would reintroduce sampling
+// bias or a weak entropy source into the mint path, lowering entropy below the
+// NFR-SEC-87 256-bit floor. TestMintNoBiasGrepGuard fails if any appears in a
+// production (non-test) file of this package.
+var biasForbiddenPatterns = []string{
+	`"math/rand"`,  // the biased/non-crypto RNG; the mint path must use crypto/rand
+	`math/rand/v2`, // the v2 import path of the same non-crypto RNG
+	"% 62",         // naive modulo folding of a byte into base62 — the classic bias
+	"%62",          // the same, unspaced
+}
+
+// TestMintNoBiasGrepGuard is a REAL static guard: it scans every production
+// (non-test) .go file in this package and fails if any names a forbidden
+// bias/weak-entropy fragment (math/rand, or a byte%62 modulo fold). It is not a
+// documentation anchor — planting `"math/rand"` or a `b % 62` fold in the mint
+// path turns this red. The behavioural companion is TestMintBiasFree; this guard
+// catches the regression at the source level, before it can bias a single mint.
 func TestMintNoBiasGrepGuard(t *testing.T) {
 	t.Parallel()
-	// This test is intentionally a grep guard at the Go level; it is enforced
-	// by the plan's acceptance criteria as a separate shell grep. At the Go
-	// level we assert that the Minter's behaviour matches expectation: the
-	// guard is in the plan's verify step, not here (a Go test cannot grep its
-	// own source).
-	//
-	// What we CAN test behaviorally: that a reader which feeds bytes in the
-	// range [248,255] (all of which would be accepted by a naive b%62 encoder
-	// but must be rejected by rejection sampling) yields a DIFFERENT body than
-	// the accepted bytes. If the sampler does b%62 it maps 248→248%62=0, which
-	// would still produce '0'; but it would ALSO NOT FAIL on the all-rejected
-	// reader. The real bias-free guard is TestMintBiasFree above. This test
-	// is a documentation anchor only.
-	t.Log("bias-free enforcement: see TestMintBiasFree and the plan verify grep")
+
+	// Locate this package's directory from the test file, so the scan is
+	// independent of the working directory go test runs in.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed; cannot locate the package directory")
+	}
+	pkgDir := filepath.Dir(thisFile)
+
+	entries, err := os.ReadDir(pkgDir)
+	if err != nil {
+		t.Fatalf("read package dir %s: %v", pkgDir, err)
+	}
+
+	scanned := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.Join(pkgDir, name)
+		src, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		scanned++
+		for _, pat := range biasForbiddenPatterns {
+			if strings.Contains(string(src), pat) {
+				t.Errorf("production file %s contains forbidden bias/weak-entropy fragment %q; "+
+					"the mint path must use crypto/rand with rejection sampling (NFR-SEC-87)", name, pat)
+			}
+		}
+	}
+	if scanned == 0 {
+		t.Fatal("scanned 0 production files; the grep guard is pointed at the wrong directory")
+	}
 }
 
 // TestMintFailClosed confirms that Mint returns an error and no SecretKey when
