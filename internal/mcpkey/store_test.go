@@ -13,18 +13,10 @@ import (
 // TestInMemStoreConformance wires the in-memory RecordStore leg to the shared
 // conformance suite. All behavioural contract cases run against the in-memory
 // impl; the Postgres leg (internal/mcpkey/postgres) runs the identical suite
-// against a live database.
+// against a live database. This is the SOLE in-memory runner (a former duplicate
+// runner was removed — two identical runners add no marginal coverage).
 func TestInMemStoreConformance(t *testing.T) {
 	mcpkeytest.RunConformance(t, func() mcpkey.RecordStore {
 		return mcpkey.NewInMemRecordStore()
 	})
-}
-
-// TestStateStoreInterfaceUnchanged is a compile-time assertion via import:
-// this test file imports mcpkey but NOT internal/state's Store interface, and
-// the grep gate in the verify step confirms internal/state/store.go is
-// byte-unchanged. This test serves as a documentation anchor; the real gate is
-// the verify step's diff check.
-func TestStateStoreInterfaceUnchanged(t *testing.T) {
-	t.Log("state.Store interface unchanged: verified by grep/diff in plan verify step")
 }

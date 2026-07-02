@@ -9,6 +9,7 @@
 package mcpkeytest
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"testing"
@@ -77,7 +78,7 @@ func RunConformance(t *testing.T, newStore func() mcpkey.RecordStore) {
 	t.Helper()
 	ctx := context.Background()
 
-	t.Run("Put then Get returns the stored Record", func(t *testing.T) {
+	t.Run("Put then Get round-trips EVERY field", func(t *testing.T) {
 		s := newStore()
 		rec := newFixtureRecord(t, "tenant-a", "deploy-1")
 		if err := s.Put(ctx, rec); err != nil {
@@ -87,15 +88,13 @@ func RunConformance(t *testing.T, newStore func() mcpkey.RecordStore) {
 		if err != nil {
 			t.Fatalf("Get: %v", err)
 		}
-		if got.KeyID != rec.KeyID {
-			t.Errorf("Get returned KeyID %q; want %q", got.KeyID, rec.KeyID)
-		}
-		if got.Tenant != rec.Tenant {
-			t.Errorf("Get returned Tenant %q; want %q", got.Tenant, rec.Tenant)
-		}
-		if got.Status != mcpkey.StatusActive {
-			t.Errorf("Get returned Status %q; want %q", got.Status, mcpkey.StatusActive)
-		}
+		// Round-trip fidelity of EVERY field, not just the handle. KeyHash and
+		// Salt are the security-critical bytes: a store that truncates them or
+		// swaps their two columns (a real Postgres scanRow hazard) would keep
+		// KeyID/Tenant/Status intact and pass a partial check, but the gateway
+		// would then hash-compare against corrupted material. bytes.Equal on both
+		// catches that.
+		assertRecordEqual(t, got, rec)
 	})
 
 	t.Run("Get of an absent key_id returns ErrRecordNotFound", func(t *testing.T) {
@@ -312,4 +311,59 @@ func RunConformance(t *testing.T, newStore func() mcpkey.RecordStore) {
 			t.Errorf("ActiveRecords on cancelled ctx: want ErrStoreUnavailable, got %v", err)
 		}
 	})
+
+	t.Run("Put then Get round-trips an EXPIRING record's ExpiresAt and bytes", func(t *testing.T) {
+		s := newStore()
+		expiresAt := conformanceStart.Add(720 * time.Hour)
+		rec := newFixtureRecordExpiring(t, expiresAt)
+		if err := s.Put(ctx, rec); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		got, err := s.Get(ctx, rec.KeyID)
+		if err != nil {
+			t.Fatalf("Get: %v", err)
+		}
+		// The store must preserve ExpiresAt (a store that dropped it would turn an
+		// expiring key non-expiring — a silent expiry-control bypass) along with
+		// the security-critical KeyHash/Salt bytes.
+		assertRecordEqual(t, got, rec)
+		if got.ExpiresAt.IsZero() {
+			t.Error("Get dropped ExpiresAt: an expiring record round-tripped as non-expiring")
+		}
+	})
+}
+
+// assertRecordEqual fails t if got does not match want field-for-field, INCLUDING
+// the security-critical KeyHash and Salt byte slices (bytes.Equal) and the
+// timestamps (compared by .Equal so a monotonic-clock reading or a UTC/local
+// representation difference does not cause a spurious mismatch). It is the shared
+// round-trip-fidelity assertion the conformance suite uses so every store leg is
+// held to the SAME field-preservation contract — a leg that truncates a hash or
+// swaps the key_hash/salt columns fails here rather than shipping green.
+func assertRecordEqual(t *testing.T, got, want mcpkey.Record) {
+	t.Helper()
+	if got.KeyID != want.KeyID {
+		t.Errorf("KeyID = %q, want %q", got.KeyID, want.KeyID)
+	}
+	if !bytes.Equal(got.KeyHash, want.KeyHash) {
+		t.Errorf("KeyHash = %x, want %x (security-critical: a corrupted hash breaks gateway validation)", got.KeyHash, want.KeyHash)
+	}
+	if !bytes.Equal(got.Salt, want.Salt) {
+		t.Errorf("Salt = %x, want %x (security-critical: a corrupted salt breaks gateway validation)", got.Salt, want.Salt)
+	}
+	if got.Tenant != want.Tenant {
+		t.Errorf("Tenant = %q, want %q", got.Tenant, want.Tenant)
+	}
+	if got.Deployment != want.Deployment {
+		t.Errorf("Deployment = %q, want %q", got.Deployment, want.Deployment)
+	}
+	if got.Status != want.Status {
+		t.Errorf("Status = %q, want %q", got.Status, want.Status)
+	}
+	if !got.CreatedAt.Equal(want.CreatedAt) {
+		t.Errorf("CreatedAt = %v, want %v", got.CreatedAt, want.CreatedAt)
+	}
+	if !got.ExpiresAt.Equal(want.ExpiresAt) {
+		t.Errorf("ExpiresAt = %v, want %v", got.ExpiresAt, want.ExpiresAt)
+	}
 }
