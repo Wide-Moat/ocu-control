@@ -24,7 +24,7 @@ func newTestHandlersWithMCPKey(t *testing.T, sink *audit.RecordingFake) (*operat
 	clk := state.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	store := mcpkey.NewInMemRecordStore()
 	minter := mcpkey.NewMinter()
-	noopRerender := func(_ context.Context) error { return nil }
+	noopRerender := func(_ context.Context) (mcpkey.RenderOutcome, error) { return mcpkey.RenderOutcome{}, nil }
 	eng := mcpkey.NewEngine(minter, store, noopRerender, clk, sink)
 
 	h := operator.NewHandlers(operator.Deps{
@@ -104,7 +104,7 @@ func TestMCPKeyRevoke_AttestedHappyPath(t *testing.T) {
 	})
 	_ = mcpkey.NewInMemRecordStore() // silence unused import
 
-	if err := h2.MCPKeyRevoke(context.Background(), attestedConn(1001), rec.KeyID, "test-revoke"); err != nil {
+	if _, err := h2.MCPKeyRevoke(context.Background(), attestedConn(1001), rec.KeyID, "test-revoke"); err != nil {
 		t.Fatalf("MCPKeyRevoke: %v", err)
 	}
 	_ = sink2
@@ -118,7 +118,7 @@ func TestMCPKeyRevoke_UnattestedRefused(t *testing.T) {
 	sink := audit.NewRecordingFake()
 	h, _ := newTestHandlersWithMCPKey(t, sink)
 
-	err := h.MCPKeyRevoke(context.Background(), unattestedConn(), "some-key-id", "reason")
+	_, err := h.MCPKeyRevoke(context.Background(), unattestedConn(), "some-key-id", "reason")
 	if !errors.Is(err, ingress.ErrUnattested) {
 		t.Fatalf("MCPKeyRevoke(unattested): err = %v, want ErrUnattested", err)
 	}

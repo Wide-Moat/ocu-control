@@ -31,6 +31,25 @@ var (
 	ErrDeploymentMissing = errors.New("mcpkey: deployment is required (fail-closed)")
 )
 
+// RenderOutcome reports the state the re-render left the published boot-set in.
+// It is returned by Revoke so the operator surface can distinguish an ordinary
+// revoke (the key was omitted from a still-non-empty set) from the terminal
+// last-key revoke.
+type RenderOutcome struct {
+	// DenyAllPending is true when the revoke removed the LAST active key, so the
+	// re-render found no active records to publish. The revoke itself is a full
+	// success — audit is durable and the store records the key revoked — but the
+	// frozen A2 schema (records minItems 1) forbids publishing an empty active
+	// set, so the boot-set artifact cannot express "accept nothing". A live
+	// gateway that keeps its last-good set on a config-refresh miss therefore
+	// still accepts the just-revoked key until it restarts: the config plane has
+	// no deny-all representation. Converging the LIVE gateway to deny-all within
+	// the NFR-SEC-04 window needs the canon deny-all-artifact contract, tracked as
+	// open-computer-use#332. Control surfaces this state to the operator rather
+	// than hiding it behind a false success or a torn 503.
+	DenyAllPending bool
+}
+
 // Engine is the composition core for the MCP API key operator verbs. It owns
 // Create (mint → persist → re-render) and Revoke (flip status → re-render), both
 // AUDIT-FIRST and fail-closed: the audit Record is emitted BEFORE any durable
@@ -46,7 +65,7 @@ var (
 type Engine struct {
 	minter   *Minter
 	store    RecordStore
-	rerender func(context.Context) error
+	rerender func(context.Context) (RenderOutcome, error)
 	clk      state.Clock
 	audit    audit.AuditSink
 }
@@ -55,7 +74,7 @@ type Engine struct {
 // called AFTER every successful Create/Revoke; it re-renders the artifact from the
 // current live set. The same Clock the store was built with must be passed so the
 // whole write path reads time through one seam.
-func NewEngine(minter *Minter, store RecordStore, rerender func(context.Context) error, clk state.Clock, sink audit.AuditSink) *Engine {
+func NewEngine(minter *Minter, store RecordStore, rerender func(context.Context) (RenderOutcome, error), clk state.Clock, sink audit.AuditSink) *Engine {
 	return &Engine{
 		minter:   minter,
 		store:    store,
@@ -142,9 +161,11 @@ func (e *Engine) Create(ctx context.Context, scope ingress.OperatorScope, tenant
 	}
 
 	// Step 4: Re-render the artifact from the current live set. The new key is now
-	// in ActiveRecords; the artifact includes it.
+	// in ActiveRecords; the artifact includes it. A create can never leave an empty
+	// active set (the just-minted key is active), so the RenderOutcome is discarded
+	// — DenyAllPending is only meaningful on the revoke path.
 	if e.rerender != nil {
-		if err := e.rerender(ctx); err != nil {
+		if _, err := e.rerender(ctx); err != nil {
 			return SecretKey{}, Record{}, fmt.Errorf("mcpkey: rerender: %w", err)
 		}
 	}
@@ -163,9 +184,18 @@ func (e *Engine) Create(ctx context.Context, scope ingress.OperatorScope, tenant
 // The scope parameter is the operator capability (NFR-SEC-52), mirroring
 // killswitch.Engine.RevokeOne. keyID is the public handle the operator passes to
 // "revoke --id"; reason is operator-supplied context for the trail.
-func (e *Engine) Revoke(ctx context.Context, scope ingress.OperatorScope, keyID, reason string) error {
+//
+// The returned RenderOutcome carries DenyAllPending: true when this revoke removed
+// the LAST active key. That is a full success (audit durable, store revoked), but
+// the frozen A2 schema cannot publish an empty active set, so the live gateway may
+// keep accepting the just-revoked key until it restarts (open-computer-use#332,
+// the config-plane deny-all gap). Control returns the flag rather than a false
+// success or a torn error, so the operator surface can warn. A non-nil error is a
+// genuine fault (audit, store, or a render fault other than the empty-set case);
+// the empty-set case is NOT an error.
+func (e *Engine) Revoke(ctx context.Context, scope ingress.OperatorScope, keyID, reason string) (RenderOutcome, error) {
 	if !scope.Valid() {
-		return ErrScopeInvalid
+		return RenderOutcome{}, ErrScopeInvalid
 	}
 
 	// Audit FIRST, fail-closed: the revoke's record must be durable before the
@@ -182,23 +212,26 @@ func (e *Engine) Revoke(ctx context.Context, scope ingress.OperatorScope, keyID,
 		Reason:  reason,
 	}
 	if err := e.audit.Emit(ctx, rec); err != nil {
-		return fmt.Errorf("mcpkey: revoke audit: %w", err)
+		return RenderOutcome{}, fmt.Errorf("mcpkey: revoke audit: %w", err)
 	}
 
 	// Flip the record status to revoked in the store. The store's Revoke is
 	// idempotent: revoking an already-revoked or absent key_id is a no-op.
 	if err := e.store.Revoke(ctx, keyID); err != nil {
-		return fmt.Errorf("mcpkey: store revoke: %w", err)
+		return RenderOutcome{}, fmt.Errorf("mcpkey: store revoke: %w", err)
 	}
 
 	// Re-render the artifact. The revoked key is now absent from ActiveRecords, so
 	// the re-rendered artifact omits it — Control's half of the ≤5-min revoke
 	// budget (NFR-SEC-04). The gateway refresh (component-01) handles propagation.
-	if e.rerender != nil {
-		if err := e.rerender(ctx); err != nil {
-			return fmt.Errorf("mcpkey: rerender: %w", err)
-		}
+	// The RenderOutcome carries DenyAllPending when this revoke emptied the active
+	// set; that is surfaced, not swallowed (open-computer-use#332).
+	if e.rerender == nil {
+		return RenderOutcome{}, nil
 	}
-
-	return nil
+	outcome, err := e.rerender(ctx)
+	if err != nil {
+		return RenderOutcome{}, fmt.Errorf("mcpkey: rerender: %w", err)
+	}
+	return outcome, nil
 }

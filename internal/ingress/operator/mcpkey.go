@@ -62,13 +62,16 @@ func (h *Handlers) MCPKeyCreate(ctx context.Context, conn ingress.ConnInfo, tena
 // MCPKeyCreate — see that method's doc. The store Revoke is idempotent: revoking
 // an already-revoked or absent key_id is a no-op success (no cross-tenant
 // existence oracle), so this route returns 200 rather than 404 for an unknown id.
-func (h *Handlers) MCPKeyRevoke(ctx context.Context, conn ingress.ConnInfo, keyID, reason string) error {
+// The returned RenderOutcome carries DenyAllPending when this revoke removed the
+// last active key: a full success whose boot-set cannot be published as an empty
+// active set, so the route surfaces a warning to the operator (open-computer-use#332).
+func (h *Handlers) MCPKeyRevoke(ctx context.Context, conn ingress.ConnInfo, keyID, reason string) (mcpkey.RenderOutcome, error) {
 	if h.mcpKeyEngine == nil {
-		return ErrMCPKeyEngineUnset
+		return mcpkey.RenderOutcome{}, ErrMCPKeyEngineUnset
 	}
 	caller, err := h.resolveCaller(ctx, conn)
 	if err != nil {
-		return err
+		return mcpkey.RenderOutcome{}, err
 	}
 	// The host-attested socket peer IS the operator; scope carries caller.Identity
 	// as the audit actor (NFR-SEC-43).

@@ -164,8 +164,20 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 			writeDecodeError(w, err)
 			return
 		}
-		if err := h.MCPKeyRevoke(r.Context(), conn, body.KeyID, body.Reason); err != nil {
+		outcome, err := h.MCPKeyRevoke(r.Context(), conn, body.KeyID, body.Reason)
+		if err != nil {
 			writeMCPKeyError(w, err)
+			return
+		}
+		if outcome.DenyAllPending {
+			// The revoke succeeded and removed the LAST active key. It is a 200, not
+			// an error — but the operator MUST know the live gateway does not yet
+			// converge to deny-all (the config plane has no empty-set representation;
+			// open-computer-use#332), so the just-revoked key may keep validating
+			// until the gateway restarts.
+			writeStatus(w, http.StatusOK, "revoked; WARNING: last active key revoked — "+
+				"deny-all is not yet propagated to a live gateway (config-plane deny-all-artifact contract pending, open-computer-use#332); "+
+				"the revoked key may keep validating until the gateway restarts")
 			return
 		}
 		writeStatus(w, http.StatusOK, "revoked")

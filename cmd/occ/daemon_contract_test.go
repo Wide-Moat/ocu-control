@@ -92,7 +92,7 @@ func startRealOperator(t *testing.T) string {
 		MCPKeyEngine: mcpkey.NewEngine(
 			mcpkey.NewMinter(),
 			mcpkey.NewInMemRecordStore(),
-			func(context.Context) error { return nil },
+			func(context.Context) (mcpkey.RenderOutcome, error) { return mcpkey.RenderOutcome{}, nil },
 			state.SystemClock(),
 			audit.NewRecordingFake(),
 		),
