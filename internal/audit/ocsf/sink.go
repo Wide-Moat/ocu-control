@@ -60,6 +60,24 @@ func NewChainSink(clk state.Clock, w EventWriter, source string) *ChainSink {
 	}
 }
 
+// ResumeChainSink constructs a ChainSink that CONTINUES an existing per-source spine
+// from tip, so a daemon restart keeps the sequence strictly monotonic and the
+// prior-hash link unbroken across the boot boundary — the single continuous spine
+// ADR-0009 and component-07 require (chain order derives from the per-source monotonic
+// sequence; the chain has zero breaks). tip is read from the durable file by ReadTip;
+// tip.Fresh true is the legitimate genesis start (empty/absent file), so this reduces
+// to NewChainSink's initial state. The FIRST Emit after resume assigns tip.LastSeq+1
+// and links to tip.PriorTip, exactly continuing the spine.
+func ResumeChainSink(clk state.Clock, w EventWriter, source string, tip Tip) *ChainSink {
+	return &ChainSink{
+		clk:      clk,
+		writer:   w,
+		source:   source,
+		lastSeq:  tip.LastSeq,
+		priorTip: tip.PriorTip,
+	}
+}
+
 // Emit maps rec onto an OCSF event, assigns the next sequence, computes the chain
 // hash, and writes the ChainEnvelope. It returns nil ONLY when the writer durably
 // accepted the envelope; on a writer failure it returns a wrapped
@@ -83,9 +101,44 @@ func (s *ChainSink) Emit(ctx context.Context, rec audit.Record) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.commitLocked(ctx, eventBytes, s.priorTip)
+}
 
+// EmitChainBreak writes a chain-break marker recording a resume discontinuity: a
+// daemon start whose audit file tail could not be read as a valid tip. observedTip is
+// what the boot read (a recovered hash or the "unreadable" sentinel). The marker
+// re-anchors the spine at genesisPriorHash — the ONLY event allowed to do so mid-file
+// — because there is no trustworthy prior tip to link to; its ChainBreak field is what
+// makes that re-anchor legitimate, so ValidateChain accepts a mid-file genesis record
+// only when the marker is present. After the marker commits, the sink continues from
+// the marker's own hash, so subsequent events chain forward normally.
+//
+// It is fail-closed like Emit: a write failure returns ErrAuditWriteFailed and does
+// not advance the spine, so a boot that cannot durably record the discontinuity does
+// not proceed as though it had.
+func (s *ChainSink) EmitChainBreak(ctx context.Context, observedTip string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: context: %w", audit.ErrAuditWriteFailed, err)
+	}
+	ev := buildChainBreakEvent(s.clk, observedTip)
+	eventBytes, err := canonicalize(ev)
+	if err != nil {
+		return fmt.Errorf("%w: %w", audit.ErrAuditWriteFailed, err)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A chain-break marker links to genesis, not the (untrustworthy or absent) prior
+	// tip — it is the deliberate, marked re-anchor point.
+	return s.commitLocked(ctx, eventBytes, genesisPriorHash)
+}
+
+// commitLocked assigns the next sequence, hashes the event over priorHash, writes the
+// envelope, and advances the spine ONLY on a durable write. The caller holds s.mu. It
+// is shared by Emit (priorHash = the running tip) and EmitChainBreak (priorHash =
+// genesis), so both paths compute the hash, write, and commit identically.
+func (s *ChainSink) commitLocked(ctx context.Context, eventBytes []byte, priorHash string) error {
 	sequence := s.lastSeq + 1
-	priorHash := s.priorTip
 	hash, err := computeHash(priorHash, sequence, eventBytes)
 	if err != nil {
 		return fmt.Errorf("%w: %w", audit.ErrAuditWriteFailed, err)

@@ -37,6 +37,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
 )
 
 // defaultSocket is the default operator socket path. It mirrors the minimal-shelf
@@ -86,15 +88,59 @@ func run(ctx context.Context, args []string, out io.Writer, dial dialFunc) error
 	socket := fs.String("socket", defaultSocket, "path to the operator Unix socket")
 
 	if err := fs.Parse(args); err != nil || fs.NArg() < 1 {
-		return usageError("expected a subcommand: mcp-key")
+		return usageError("expected a subcommand: mcp-key | audit")
 	}
 
 	switch fs.Arg(0) {
 	case "mcp-key":
 		return runMCPKey(ctx, fs.Args()[1:], *socket, out, dial)
+	case "audit":
+		return runAudit(fs.Args()[1:], out)
 	default:
-		return usageError(fmt.Sprintf("unknown subcommand %q: expected mcp-key", fs.Arg(0)))
+		return usageError(fmt.Sprintf("unknown subcommand %q: expected mcp-key or audit", fs.Arg(0)))
 	}
+}
+
+// runAudit dispatches the audit subcommand family.
+func runAudit(args []string, out io.Writer) error {
+	if len(args) < 1 {
+		return usageError("expected an audit verb: verify")
+	}
+	switch args[0] {
+	case "verify":
+		return runAuditVerify(args[1:], out)
+	default:
+		return usageError(fmt.Sprintf("unknown audit verb %q: expected verify", args[0]))
+	}
+}
+
+// runAuditVerify reads a local OCSF audit file and runs the tamper-evidence check
+// (ValidateChain) over the whole spine, reporting the verdict. It is the on-demand
+// counterpart to the daemon's boot-time verify: an operator runs it against the audit
+// file to confirm the hash-chain is intact — a broken chain (a mutated event, a
+// non-monotonic sequence, a silent re-anchor) is reported with a non-zero exit. It
+// reads a LOCAL file and needs no daemon socket. A chain-break marker in the file is
+// legitimate and does not fail the verify; a genesis re-anchor WITHOUT a marker does.
+func runAuditVerify(args []string, out io.Writer) error {
+	fs := flag.NewFlagSet("occ audit verify", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	file := fs.String("file", "", "path to the OCSF audit file to verify (required)")
+	if err := fs.Parse(args); err != nil {
+		return usageError("occ audit verify --file <path>")
+	}
+	if *file == "" {
+		return usageError("occ audit verify requires --file <path>")
+	}
+
+	envs, err := ocsf.ReadChainFile(*file)
+	if err != nil {
+		return fmt.Errorf("read audit file: %w", err)
+	}
+	if err := ocsf.ValidateChain(envs); err != nil {
+		return fmt.Errorf("audit chain INVALID: %w", err)
+	}
+	fmt.Fprintf(out, "audit chain OK: %d events verified in %s\n", len(envs), *file)
+	return nil
 }
 
 // runMCPKey dispatches the mcp-key subcommand family.

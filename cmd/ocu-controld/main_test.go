@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
 	"github.com/Wide-Moat/ocu-control/internal/boot"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
@@ -268,7 +269,8 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 	if err != nil {
 		t.Fatalf("providerOf: %v", err)
 	}
-	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, nullCloser{}, cfg)
+	sink := ocsf.NewChainSink(clk, nullCloser{}, "control")
+	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, sink, cfg)
 	seam := ingress.NewOperatorSeam()
 	seq := boot.New(store, clk)
 	op := operator.NewListener(sockPath, operator.Deps{

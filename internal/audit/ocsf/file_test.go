@@ -125,9 +125,17 @@ func TestFileSinkPermissionsAreOwnerOnly(t *testing.T) {
 	}
 }
 
-// TestFileSinkAppendsAcrossOpens proves reopening the same path appends rather than
-// truncates, so a daemon restart continues the prior spine instead of discarding it.
-func TestFileSinkAppendsAcrossOpens(t *testing.T) {
+// TestFileSinkReopenAppendsBytes proves ONLY that reopening the same path appends
+// bytes rather than truncating — the FileSink's O_APPEND behaviour. It does NOT prove
+// the logical hash-chain continues across the reopen: the FileSink is a dumb writer;
+// the sequence and prior-hash spine come from the ChainSink, and a fresh ChainSink
+// would re-anchor at genesis. The SPINE-continuity-across-restart claim is proven by
+// TestResumeKeepsOneContinuousSpineAcrossRestarts (which rebuilds a ResumeChainSink
+// over the reopened file and asserts ValidateChain accepts the two-boot spine). This
+// test was formerly named TestFileSinkAppendsAcrossOpens and its doc over-claimed that
+// byte-append alone meant "a daemon restart continues the prior spine" — it does not;
+// the two facts are separated here.
+func TestFileSinkReopenAppendsBytes(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "audit.ocsf.jsonl")
 
@@ -153,6 +161,8 @@ func TestFileSinkAppendsAcrossOpens(t *testing.T) {
 		t.Fatalf("Close #2: %v", err)
 	}
 
+	// The ONLY claim: the reopen appended, it did not truncate. Nothing here asserts
+	// the chain is continuous — see TestResumeKeepsOneContinuousSpineAcrossRestarts.
 	if lines := readLines(t, path); len(lines) != 2 {
 		t.Fatalf("reopen appended %d lines total, want 2 (truncated instead of appended?)", len(lines))
 	}
