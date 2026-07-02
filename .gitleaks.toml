@@ -31,25 +31,33 @@
 
 # Inert test fixtures the default ruleset flags. Each is a structurally-valid but
 # entirely fake value used to exercise a code path (render, scrub); none is a live
-# credential. Every entry is scoped to BOTH the exact file (paths) AND the exact
-# value shape (regexes), so it exempts only the named fixture — a real secret
-# committed to the same file would still be caught.
+# credential. Each entry allowlists the EXACT fixture VALUE only — never a path.
+#
+# WHY NOT paths: gitleaks 8.30.1 treats an allowlist's `paths` and `regexes` as
+# INDEPENDENT (OR) conditions, not a conjunction — a `paths` entry suppresses the
+# WHOLE file, so a real secret committed to the same file would then go undetected.
+# The `matchCondition`/`condition = "AND"` keys are ignored by 8.30.1. Allowlisting
+# the exact literal value instead keeps the exemption to that one fixture: any OTHER
+# secret in the same file — or that fixture value moved to another file — is still
+# caught. The regexes below are the precise fixture literals, not shapes.
 
-# The sk-ocu- fixtures in the occ CLI render tests: fake mcp-key literals asserted
-# in the shown-once render, never a live key.
+# The two sk-ocu- fixtures in the occ CLI render tests: fake mcp-key literals asserted
+# in the shown-once render, never live keys.
 [[allowlists]]
-  description = "occ render-test fake sk-ocu- key fixtures"
-  paths = ['''^cmd/occ/main_test\.go$''']
-  regexes = ['''sk-ocu-[A-Za-z0-9]+''']
+  description = "occ render-test fake sk-ocu- key fixture (create)"
+  regexes = ['''sk-ocu-TestKey1234567890ABCDEFGHIJK''']
+[[allowlists]]
+  description = "occ render-test fake sk-ocu- key fixture (render)"
+  regexes = ['''sk-ocu-UniqueTestKeyABCD1234567890XYZ''']
 
 # The scrub test's fixture JWT: a compact three-segment token whose payload decodes
-# to {"filesystem_id":"fs-1"} with the literal "signature" — the weak Storage-JWT
-# shape the teardown scrub must remove, constructed inline so the test proves the
-# scrub leaves none behind.
+# to {"filesystem_id":"fs-1"} — the weak Storage-JWT shape the teardown scrub must
+# remove, constructed inline so the test proves the scrub leaves none behind. The
+# header+payload are the exact fixture literal; the signature segment is matched by
+# shape (it authenticates nothing).
 [[allowlists]]
-  description = "teardown-scrub fixture Storage-JWT (payload filesystem_id=fs-1, literal signature)"
-  paths = ['''^internal/runtime/docker/teardown_scrub_test\.go$''']
-  regexes = ['''eyJhbGciOiJFZERTQSJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+''']
+  description = "teardown-scrub fixture Storage-JWT (payload filesystem_id=fs-1)"
+  regexes = ['''eyJhbGciOiJFZERTQSJ9\.eyJmaWxlc3lzdGVtX2lkIjoiZnMtMSJ9\.[A-Za-z0-9_-]+''']
 
 # NOTE: scripts/gitleaks-redprobe.sh needs NO allowlist. It assembles its planted
 # GitLab PAT at runtime from parts, so the detectable literal never appears verbatim
