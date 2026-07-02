@@ -85,7 +85,7 @@ func operatorDepsFor(t *testing.T, resolver ingress.IdentityResolver, verifier k
 	mcpEng := mcpkey.NewEngine(
 		mcpkey.NewMinter(),
 		mcpkey.NewInMemRecordStore(),
-		func(context.Context) error { return nil },
+		func(context.Context) (mcpkey.RenderOutcome, error) { return mcpkey.RenderOutcome{}, nil },
 		clk,
 		sink,
 	)

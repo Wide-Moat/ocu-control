@@ -25,15 +25,15 @@ func newAttestedScope(tenant, caller string) ingress.OperatorScope {
 
 // newFakeRerender returns a re-render callback that increments a counter on each
 // call. Tests assert how many re-renders happened (0 on deny, 1 on success).
-func newFakeRerender(counter *int) func(context.Context) error {
-	return func(_ context.Context) error {
+func newFakeRerender(counter *int) func(context.Context) (mcpkey.RenderOutcome, error) {
+	return func(_ context.Context) (mcpkey.RenderOutcome, error) {
 		*counter++
-		return nil
+		return mcpkey.RenderOutcome{}, nil
 	}
 }
 
 // newEngine is a convenience constructor for tests.
-func newEngine(store mcpkey.RecordStore, sink audit.AuditSink, rerender func(context.Context) error) *mcpkey.Engine {
+func newEngine(store mcpkey.RecordStore, sink audit.AuditSink, rerender func(context.Context) (mcpkey.RenderOutcome, error)) *mcpkey.Engine {
 	minter := mcpkey.NewMinter()
 	clk := state.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	return mcpkey.NewEngine(minter, store, rerender, clk, sink)
@@ -78,7 +78,7 @@ func TestEngine_Revoke_ScopeInvalid(t *testing.T) {
 	eng := newEngine(store, sink, newFakeRerender(&rerenderCount))
 
 	var zeroScope ingress.OperatorScope
-	err := eng.Revoke(context.Background(), zeroScope, "some-key-id", "test")
+	_, err := eng.Revoke(context.Background(), zeroScope, "some-key-id", "test")
 	if !errors.Is(err, mcpkey.ErrScopeInvalid) {
 		t.Fatalf("Revoke(zero scope) err = %v, want ErrScopeInvalid", err)
 	}
@@ -146,7 +146,7 @@ func TestEngine_Revoke_AuditFaultDenies(t *testing.T) {
 	eng := newEngine(store, sink, newFakeRerender(&rerenderCount))
 
 	scope := newAttestedScope("tenant-A", "operator-1")
-	err := eng.Revoke(context.Background(), scope, seedRec.KeyID, "test-revoke")
+	_, err := eng.Revoke(context.Background(), scope, seedRec.KeyID, "test-revoke")
 	if err == nil {
 		t.Fatal("Revoke(audit-fault): expected non-nil error, got nil")
 	}
@@ -261,7 +261,7 @@ func TestEngine_Revoke_HappyPath(t *testing.T) {
 	eng := newEngine(store, sink, newFakeRerender(&rerenderCount))
 
 	scope := newAttestedScope("tenant-C", "operator-3")
-	err := eng.Revoke(context.Background(), scope, seedRec.KeyID, "manual-revoke")
+	_, err := eng.Revoke(context.Background(), scope, seedRec.KeyID, "manual-revoke")
 	if err != nil {
 		t.Fatalf("Revoke: unexpected error: %v", err)
 	}
@@ -336,7 +336,7 @@ func TestEngine_Rotation_IsIssueNewPlusRevokeOld(t *testing.T) {
 		t.Error("Create produced identical key_id on rotation — key_ids must be distinct")
 	}
 
-	if err := eng.Revoke(context.Background(), scope, rec1.KeyID, "rotation"); err != nil {
+	if _, err := eng.Revoke(context.Background(), scope, rec1.KeyID, "rotation"); err != nil {
 		t.Fatalf("Revoke old key: %v", err)
 	}
 

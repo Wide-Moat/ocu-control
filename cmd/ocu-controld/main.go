@@ -678,44 +678,71 @@ func buildMCPKeyEngine(ctx context.Context, cfg config, clk state.Clock, sink au
 	}
 
 	// The artifact re-render closure is called by the Engine on every successful
-	// Create/Revoke. It reads the live active records from the store and (a)
-	// writes the hashed-key-set artifact when -mcp-keyset-path is set, and (b)
-	// writes the full hashed-entries file when -mcp-key-file is set.
-	rerender := func(rerenderCtx context.Context) error {
-		now := clk.Now()
+	// Create/Revoke. It delegates to renderMCPKeyArtifacts (extracted so the
+	// last-key-revoke deny-all path is unit-testable — a closure hidden in this
+	// factory could not be driven directly).
+	minter := mcpkey.NewMinter()
+	rerender := func(rerenderCtx context.Context) (mcpkey.RenderOutcome, error) {
+		return renderMCPKeyArtifacts(rerenderCtx, cfg, recordStore, clk.Now())
+	}
+	return mcpkey.NewEngine(minter, recordStore, rerender, clk, sink), nil
+}
 
-		if cfg.mcpKeysetPath != "" {
-			// Active subset only (revoked/expired omitted — fail-closed): the
-			// artifact is never written when there are no active records.
-			active, err := recordStore.ActiveRecords(rerenderCtx, now)
-			if err != nil {
-				return fmt.Errorf("mcp-keyset rerender: enumerate active: %w", err)
-			}
-			if err := mcpkeyset.WriteKeySet(cfg.mcpKeysetPath, active, now); err != nil {
-				// ErrEmptyKeySet is a fail-closed refusal; surface it so the
-				// caller (Engine.Create/Revoke) propagates the abort.
-				return fmt.Errorf("mcp-keyset rerender: write keyset: %w", err)
-			}
+// renderMCPKeyArtifacts writes the minimal-shelf hashed-entries file and the
+// Control→gateway hashed-key-set artifact from the store's live record set. It is
+// the daemon's re-render step, run by the Engine after every successful
+// Create/Revoke, and is a named function (not an inline closure) so its two failure
+// and boundary paths are directly testable.
+//
+// ORDER — entries FIRST, keyset second. The entries file is the durable at-rest
+// record set that re-seeds the store on a restart; writing it first means a restart
+// always reflects the latest mutation (a revoked key stays revoked), even if the
+// keyset write below is skipped or fails. The prior order (keyset first, return on
+// its error) left the entries file stale when a last-key revoke made WriteKeySet
+// refuse, silently resurrecting the revoked key on the next boot.
+//
+// EMPTY ACTIVE SET is NOT an error. When a revoke removes the last active key,
+// WriteKeySet returns ErrEmptyKeySet (the frozen A2 schema forbids an empty active
+// set). That is the expected terminal state, so this function does not propagate it
+// as a fault: it logs the deny-all-pending warning and returns
+// RenderOutcome{DenyAllPending: true}, nil. The stale boot-set artifact is left in
+// place (removing it would not converge a live gateway, which keeps its last-good
+// set on a config-refresh miss); closing the live fail-open needs the canon
+// deny-all-artifact contract, tracked as open-computer-use#332.
+func renderMCPKeyArtifacts(ctx context.Context, cfg config, store mcpkey.RecordStore, now time.Time) (mcpkey.RenderOutcome, error) {
+	// Entries file FIRST: the durable at-rest set (active + revoked) that re-seeds
+	// the store on a restart, so a restart never resurrects a just-revoked key.
+	if cfg.mcpKeyFile != "" {
+		all, err := store.List(ctx)
+		if err != nil {
+			return mcpkey.RenderOutcome{}, fmt.Errorf("mcp-key entries rerender: enumerate: %w", err)
 		}
-
-		if cfg.mcpKeyFile != "" {
-			// Full record set (active + revoked) for the minimal-shelf entries
-			// file. The entries file holds ALL records so a daemon restart can
-			// re-seed the in-memory store (revoked records must persist so they
-			// are not accidentally re-issued on the next boot).
-			all, err := recordStore.List(rerenderCtx)
-			if err != nil {
-				return fmt.Errorf("mcp-key entries rerender: enumerate: %w", err)
-			}
-			if err := mcpkeyset.WriteEntriesFile(cfg.mcpKeyFile, all); err != nil {
-				return fmt.Errorf("mcp-key entries rerender: write: %w", err)
-			}
+		if err := mcpkeyset.WriteEntriesFile(cfg.mcpKeyFile, all); err != nil {
+			return mcpkey.RenderOutcome{}, fmt.Errorf("mcp-key entries rerender: write: %w", err)
 		}
-		return nil
 	}
 
-	minter := mcpkey.NewMinter()
-	return mcpkey.NewEngine(minter, recordStore, rerender, clk, sink), nil
+	if cfg.mcpKeysetPath != "" {
+		// Active subset only (revoked/expired omitted — fail-closed).
+		active, err := store.ActiveRecords(ctx, now)
+		if err != nil {
+			return mcpkey.RenderOutcome{}, fmt.Errorf("mcp-keyset rerender: enumerate active: %w", err)
+		}
+		if err := mcpkeyset.WriteKeySet(cfg.mcpKeysetPath, active, now); err != nil {
+			if errors.Is(err, mcpkeyset.ErrEmptyKeySet) {
+				// Terminal, expected state after revoking the last active key: the
+				// schema cannot publish an empty set. NOT a fault — the revoke
+				// succeeded. Warn (the live gateway does not yet converge to
+				// deny-all; open-computer-use#332) and report DenyAllPending.
+				fmt.Fprintln(os.Stderr, "ocu-controld: WARNING: last active mcp-key revoked; the boot-set has no active keys to publish. "+
+					"The revoke is durable (audit + store), but a live gateway keeps its last-good key set on a config-refresh miss, so it may keep accepting the revoked key until it restarts. "+
+					"Converging the live gateway to deny-all needs the config-plane deny-all-artifact contract (open-computer-use#332).")
+				return mcpkey.RenderOutcome{DenyAllPending: true}, nil
+			}
+			return mcpkey.RenderOutcome{}, fmt.Errorf("mcp-keyset rerender: write keyset: %w", err)
+		}
+	}
+	return mcpkey.RenderOutcome{}, nil
 }
 
 // algOf maps the validated -jwt-alg string to the cred.Alg. The string was already
