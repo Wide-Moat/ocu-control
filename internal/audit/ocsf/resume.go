@@ -47,6 +47,44 @@ func genesisTip() Tip {
 	return Tip{LastSeq: 0, PriorTip: genesisPriorHash, Fresh: true}
 }
 
+// ReadChainFile reads every ChainEnvelope from the audit file at path, in order, for a
+// full-spine ValidateChain (the boot-time and on-demand tamper-evidence check). An
+// absent file is a valid empty chain (nil, nil). A line that is not a ChainEnvelope is
+// a hard error — a malformed audit file is a tamper/corruption signal, not something to
+// skip. It reads the whole file; the cost note on the boot caller documents why that is
+// acceptable in v1 (the hot spine stays small until the cold-tier rotation seam lands).
+func ReadChainFile(path string) ([]ChainEnvelope, error) {
+	f, err := os.Open(path) //nolint:gosec // path is the operator-configured audit sink, not user input
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("ocsf: open audit file %q: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+
+	var envs []ChainEnvelope
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), maxEnvelopeLine)
+	line := 0
+	for sc.Scan() {
+		line++
+		b := sc.Bytes()
+		if len(b) == 0 {
+			continue
+		}
+		var env ChainEnvelope
+		if err := json.Unmarshal(b, &env); err != nil {
+			return nil, fmt.Errorf("ocsf: audit file %q line %d is not a ChainEnvelope: %w", path, line, err)
+		}
+		envs = append(envs, env)
+	}
+	if err := sc.Err(); err != nil {
+		return nil, fmt.Errorf("ocsf: read audit file %q: %w", path, err)
+	}
+	return envs, nil
+}
+
 // ReadTip reads the resume anchor from an existing audit file at path. It returns:
 //   - genesisTip() (Fresh=true) when the file is absent or empty — a legitimate first
 //     boot;

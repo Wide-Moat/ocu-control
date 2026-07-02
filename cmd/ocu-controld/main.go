@@ -259,7 +259,18 @@ func serve(ctx context.Context, cfg config) error {
 	// loops have drained. A NullSink Close is a no-op.
 	defer func() { _ = auditWriter.Close() }()
 
-	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, auditWriter, cfg)
+	// Build the chain sink RESUMED from the existing spine: a restart continues the
+	// per-source monotonic sequence and prior-hash link rather than re-anchoring at
+	// genesis (which would break the tamper-evidence spine). A decoupled tail records
+	// an explicit chain-break marker before the spine continues; a boot-time verify
+	// aborts if the existing file already fails the chain. All fail-closed at boot,
+	// before any listener binds.
+	sink, err := buildResumedChainSink(ctx, clk, auditWriter, cfg.auditSink)
+	if err != nil {
+		return fmt.Errorf("boot: resume audit chain: %w", err)
+	}
+
+	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, sink, cfg)
 
 	// MCP API key surface, FAIL-CLOSED at boot: construct the Engine from a
 	// Minter (crypto/rand), the selected RecordStore (Postgres when -state-dsn is
@@ -403,7 +414,7 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 // (chain computed in-process, nothing durably persisted by default), and a
 // deployment Limits — are bound here. profile and tier are deployment-fixed and
 // flow onto the Manager as fixed fields; CreateInput carries neither.
-func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, auditWriter ocsf.EventWriter, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, sink *ocsf.ChainSink, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
 	// The metrics collector reads live state through the same custodian the admin
@@ -413,16 +424,11 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 	// /metrics scrape handler). It is purely observational — non-fatal everywhere.
 	collector := metrics.NewCollector(custodian)
 	stager := handoff.NewStager(handoffBase)
-	// The real OCSF chain sink: it serializes each privileged audit.Record to a
-	// faithful OCSF event, assigns a per-source monotonic sequence, and hash-chains
-	// the spine — all on the success path, BEFORE the privileged action is
-	// acknowledged (fail-closed). The durable writer is the one buildAuditWriter
-	// resolved from -audit-sink: a real path is backed by the append-only fsync-on-
-	// write FileSink, so a write failure denies the action (the fail-closed branch in
-	// the lifecycle/kill-switch callers now actually fires); the explicit =none/=null
-	// opt-out is the NullSink (compute-and-validate, persist-nothing). The writer slots
-	// in behind the EventWriter contract with no change to any Emit call site.
-	sink := ocsf.NewChainSink(clk, auditWriter, "control")
+	// The OCSF chain sink is built and RESUMED in main() (buildResumedChainSink), where
+	// the boot-edge I/O — reading the prior spine's tip, recording a chain-break on a
+	// decoupled tail, and the boot-time chain verification — lives next to the boot's
+	// context and error handling. compose stays a pure composition and receives the
+	// ready sink, so a test injects a fake sink without touching this wiring.
 
 	// The advisory control-RPC dialer mints its per-dial exec JWT through the same
 	// Storage-JWT custodian Signer (the narrow MintExecJWT seam, never the signing
@@ -799,6 +805,78 @@ func buildAuditWriter(sink string) (auditWriter, error) {
 		return nil, err
 	}
 	return fs, nil
+}
+
+// auditChainSource is the per-source spine name Control emits under (ADR-0009: Control
+// is one source on the host audit fan-in).
+const auditChainSource = "control"
+
+// buildResumedChainSink constructs the OCSF chain sink over writer, RESUMED from the
+// existing spine at path so a daemon restart continues the same per-source sequence
+// and prior-hash link instead of re-anchoring at genesis (which would break the
+// tamper-evidence chain across boots). It is fail-closed at boot:
+//
+//   - The non-durable opt-out (=none/=null, so path is not a real file) has no prior
+//     spine to read, so it starts fresh at genesis — nothing to resume.
+//   - A real file is read for its tip. A valid tail resumes the spine. A decoupled tail
+//     (torn last write, truncation, tamper) records an EXPLICIT chain-break marker and
+//     then continues — but if that marker cannot be durably written, the boot ABORTS:
+//     continuing without recording the discontinuity would be the silent break the
+//     whole design forbids.
+//   - Before returning, the existing file is verified end-to-end (ValidateChain). A
+//     file that already fails the chain aborts the boot rather than appending onto a
+//     spine known to be broken.
+func buildResumedChainSink(ctx context.Context, clk state.Clock, writer ocsf.EventWriter, path string) (*ocsf.ChainSink, error) {
+	// The non-durable opt-out has no on-disk spine: start fresh at genesis.
+	if auditSinkNone[strings.ToLower(path)] {
+		return ocsf.NewChainSink(clk, writer, auditChainSource), nil
+	}
+
+	// Verify the existing spine end-to-end before appending to it: a file that already
+	// fails the chain must not have new events appended onto a broken tail.
+	if err := verifyAuditChainFile(path); err != nil {
+		return nil, err
+	}
+
+	tip, err := ocsf.ReadTip(path)
+	if errors.Is(err, ocsf.ErrTipDecoupled) {
+		// The tail could not be read as a valid tip. Record the discontinuity as an
+		// explicit chain-break marker, then continue on the new spine. The marker is
+		// written through a fresh genesis-anchored sink; if the write FAILS, the boot
+		// aborts — a boot that cannot durably record the break would leave a silent one.
+		genesisSink := ocsf.NewChainSink(clk, writer, auditChainSource)
+		if berr := genesisSink.EmitChainBreak(ctx, ocsf.ChainBreakUnreadable); berr != nil {
+			return nil, fmt.Errorf("record audit chain-break at %q: %w", path, berr)
+		}
+		fmt.Fprintln(os.Stderr, "ocu-controld: WARNING: the audit file tail at "+path+" was not a valid chain tip (a torn last write, truncation, or tamper). A chain-break marker was recorded; the spine continues from it. Investigate the discontinuity.")
+		return genesisSink, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read audit tip at %q: %w", path, err)
+	}
+	return ocsf.ResumeChainSink(clk, writer, auditChainSource, tip), nil
+}
+
+// verifyAuditChainFile reads every envelope in the audit file at path and runs
+// ValidateChain over the whole spine, so a boot never appends onto a file whose
+// existing chain is already broken (a tamper or a corruption detected post-hoc). An
+// absent or empty file is a valid (empty) chain. This is the shipped, non-test caller
+// of ValidateChain — the tamper-evidence checker actually runs at boot.
+//
+// Cost note: it reads the WHOLE file at boot. That is acceptable in v1 because the
+// files are young (the daily Merkle-head submission and cold-tier rotation that bound
+// the hot file are downstream seams not yet wired), so the hot spine stays small. A
+// checkpoint-and-verify-suffix optimization is a later concern tracked with the
+// external-anchor follow-up.
+func verifyAuditChainFile(path string) error {
+	envs, err := ocsf.ReadChainFile(path)
+	if err != nil {
+		return fmt.Errorf("read audit chain at %q: %w", path, err)
+	}
+	if err := ocsf.ValidateChain(envs); err != nil {
+		return fmt.Errorf("audit chain at %q is invalid (tamper evidence): %w", path, err)
+	}
+	return nil
 }
 
 // readCACertPEM reads the CA certificate PEM from the -ca-cert path for rendering

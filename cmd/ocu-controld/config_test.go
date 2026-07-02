@@ -129,7 +129,11 @@ func Test_buildMCPKeyEngine_NoFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, aw, cfg)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	if err != nil {
+		t.Fatalf("buildResumedChainSink: %v", err)
+	}
+	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, sink, cfg)
 
 	eng, err := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if err != nil {
@@ -166,7 +170,11 @@ func Test_buildMCPKeyEngine_LoosePermAbortsBoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, aw, cfg)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	if err != nil {
+		t.Fatalf("buildResumedChainSink: %v", err)
+	}
+	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, sink, cfg)
 
 	_, bootErr := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if bootErr == nil {
@@ -196,7 +204,11 @@ func Test_buildMCPKeyEngine_AbsentFileIsCleanStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, aw, cfg)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	if err != nil {
+		t.Fatalf("buildResumedChainSink: %v", err)
+	}
+	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, sink, cfg)
 
 	eng, bootErr := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if bootErr != nil {
@@ -239,7 +251,11 @@ func Test_buildMCPKeyEngine_LoadsExistingEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, aw, cfg)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	if err != nil {
+		t.Fatalf("buildResumedChainSink: %v", err)
+	}
+	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, sink, cfg)
 
 	eng, bootErr := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if bootErr != nil {

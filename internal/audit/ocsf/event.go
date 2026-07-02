@@ -178,11 +178,11 @@ type ChainBreakInfo struct {
 	ObservedPriorTip string `json:"observed_prior_tip"`
 }
 
-// chainBreakUnreadable is the ObservedPriorTip sentinel when the file tail could not be
+// ChainBreakUnreadable is the ObservedPriorTip sentinel when the file tail could not be
 // parsed into any hash at all (a torn write, a truncated line). It keeps the field
 // non-empty so the chain_break⇒observed_prior_tip-non-empty invariant holds even when
 // nothing recoverable was read.
-const chainBreakUnreadable = "unreadable"
+const ChainBreakUnreadable = "unreadable"
 
 // activityFor maps a privileged audit.Action onto its OCSF activity_id and a
 // human-readable activity_name. Create-commit is Create(1); destroy is Delete(4);
@@ -298,7 +298,7 @@ const chainBreakActionLabel = "chain_break"
 
 // buildChainBreakEvent maps a resume discontinuity onto an OCSFEvent carrying the
 // ChainBreak marker. observedTip is what the boot read at the tail (a recovered hash
-// or chainBreakUnreadable); it is stored verbatim so the discontinuity is documented
+// or ChainBreakUnreadable); it is stored verbatim so the discontinuity is documented
 // in-band. The event is a system daemon-start marker: activity Other, High severity
 // (a chain break is a security-relevant integrity event), no actor identity (there is
 // no privileged caller — the daemon itself emitted it). It is the ONLY event that
@@ -309,9 +309,9 @@ func buildChainBreakEvent(clk state.Clock, observedTip string) OCSFEvent {
 	typeUID := uint64(classUIDAPIActivity)*100 + uint64(activityOther)
 	if observedTip == "" {
 		// Defence in depth: the field must never be empty on a marker. The caller
-		// passes a recovered hash or chainBreakUnreadable; an empty value is coerced to
+		// passes a recovered hash or ChainBreakUnreadable; an empty value is coerced to
 		// the sentinel so the chain_break⇒observed_prior_tip-non-empty invariant holds.
-		observedTip = chainBreakUnreadable
+		observedTip = ChainBreakUnreadable
 	}
 	return OCSFEvent{
 		ClassUID:     classUIDAPIActivity,
