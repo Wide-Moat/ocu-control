@@ -98,11 +98,15 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SessionHandle'
+        '400':
+          # A client-side invalid argument — a malformed request body. Deny -> 400 for an
+          # invalid argument (canon #330 aligns every deny class to its status; an invalid
+          # argument is 400, never 422). This replaces a stale '422': the shipped create
+          # route returns 400 on a bad body (writeDecodeError) and never 422.
+          $ref: '#/components/responses/Denied'
         '403':
           $ref: '#/components/responses/Denied'
         '409':
-          $ref: '#/components/responses/Denied'
-        '422':
           $ref: '#/components/responses/Denied'
         '503':
           $ref: '#/components/responses/Denied'
