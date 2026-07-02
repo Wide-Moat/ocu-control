@@ -152,7 +152,37 @@ type OCSFEvent struct {
 	SeverityID   uint8    `json:"severity_id"`
 	Actor        Actor    `json:"actor"`
 	Metadata     Metadata `json:"metadata"`
+	// ChainBreak is present ONLY on a system-emitted chain-break marker (a daemon
+	// start whose resume tip was unreadable). It is a pointer with omitempty so a
+	// normal privileged-action event omits it ENTIRELY — the field adds no bytes to
+	// the canonical payload of a normal event, so its hash is byte-identical to
+	// before this field existed (proven by TestNormalEventByteIdenticalWithChainBreakField).
+	// A chain-break marker is the ONLY event that legitimately re-anchors the spine
+	// at genesis mid-file; ValidateChain accepts a mid-file genesis record only when
+	// this marker is present, so a silent re-anchor (tamper) is rejected.
+	ChainBreak *ChainBreakInfo `json:"chain_break,omitempty"`
 }
+
+// ChainBreakInfo is the payload of a chain-break marker: the resume discontinuity a
+// daemon start observed. ObservedPriorTip records what the boot actually read at the
+// file tail — the last valid hash it could recover, or the literal "unreadable" when
+// the tail could not be parsed at all — so the discontinuity is documented in-band and
+// detectable post-hoc. A marker's own envelope re-anchors at genesisPriorHash (there
+// is no trustworthy prior tip to link to), which is legitimate ONLY because this field
+// marks it; ValidateChain enforces that pairing.
+type ChainBreakInfo struct {
+	// ObservedPriorTip is the tail state the boot observed. It is NEVER empty on a
+	// chain-break marker: a recovered-but-decoupled hash, or the literal "unreadable"
+	// when the tail did not parse. The non-empty invariant is enforced at construction
+	// and re-checked in ValidateChain.
+	ObservedPriorTip string `json:"observed_prior_tip"`
+}
+
+// chainBreakUnreadable is the ObservedPriorTip sentinel when the file tail could not be
+// parsed into any hash at all (a torn write, a truncated line). It keeps the field
+// non-empty so the chain_break⇒observed_prior_tip-non-empty invariant holds even when
+// nothing recoverable was read.
+const chainBreakUnreadable = "unreadable"
 
 // activityFor maps a privileged audit.Action onto its OCSF activity_id and a
 // human-readable activity_name. Create-commit is Create(1); destroy is Delete(4);
@@ -257,5 +287,58 @@ func buildEvent(clk state.Clock, rec audit.Record) OCSFEvent {
 				Reason: rec.Reason,
 			},
 		},
+	}
+}
+
+// chainBreakActionLabel is the self-describing action label of a chain-break marker.
+// It is not an audit.Action (a chain break is a system event, not a privileged
+// operator action, so it never enters the SEC-45 Action set), so its label is a
+// standalone constant rather than an Action.String value.
+const chainBreakActionLabel = "chain_break"
+
+// buildChainBreakEvent maps a resume discontinuity onto an OCSFEvent carrying the
+// ChainBreak marker. observedTip is what the boot read at the tail (a recovered hash
+// or chainBreakUnreadable); it is stored verbatim so the discontinuity is documented
+// in-band. The event is a system daemon-start marker: activity Other, High severity
+// (a chain break is a security-relevant integrity event), no actor identity (there is
+// no privileged caller — the daemon itself emitted it). It is the ONLY event that
+// legitimately carries a genesis prior-hash mid-file; ValidateChain enforces the
+// pairing with the marker.
+func buildChainBreakEvent(clk state.Clock, observedTip string) OCSFEvent {
+	now := clk.Now()
+	typeUID := uint64(classUIDAPIActivity)*100 + uint64(activityOther)
+	if observedTip == "" {
+		// Defence in depth: the field must never be empty on a marker. The caller
+		// passes a recovered hash or chainBreakUnreadable; an empty value is coerced to
+		// the sentinel so the chain_break⇒observed_prior_tip-non-empty invariant holds.
+		observedTip = chainBreakUnreadable
+	}
+	return OCSFEvent{
+		ClassUID:     classUIDAPIActivity,
+		CategoryUID:  categoryUIDApplicationActivity,
+		TypeUID:      typeUID,
+		ActivityID:   activityOther,
+		ActivityName: chainBreakActionLabel,
+		Time:         now.UnixMilli(),
+		TimeDT:       now.UTC().Format(time.RFC3339Nano),
+		StatusID:     statusSuccess,
+		Status:       statusName(statusSuccess),
+		SeverityID:   severityHigh,
+		Actor: Actor{
+			User:      User{},
+			Session:   Session{},
+			InvokedBy: "system",
+		},
+		Metadata: Metadata{
+			Product:        Product{Name: productName},
+			Version:        schemaVersion,
+			LogProvider:    productName,
+			CorrelationUID: "",
+			Unmapped: Unmapped{
+				Action: chainBreakActionLabel,
+				Reason: "audit chain resume discontinuity: prior tip " + observedTip,
+			},
+		},
+		ChainBreak: &ChainBreakInfo{ObservedPriorTip: observedTip},
 	}
 }

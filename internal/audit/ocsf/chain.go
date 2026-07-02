@@ -110,9 +110,32 @@ func ValidateChain(envs []ChainEnvelope) error {
 				ErrChainInvalid, i, env.Sequence, prevSeq+1)
 		}
 
-		if env.PriorHash != prevHash {
-			return fmt.Errorf("%w: index %d prior_hash = %q, want %q (broken link)",
-				ErrChainInvalid, i, env.PriorHash, prevHash)
+		// The prior-hash link check, with the marked-re-anchor exception. Normally each
+		// record's PriorHash must equal the previous record's Hash (genesis for index 0).
+		// A record MID-FILE whose PriorHash is genesis is a spine re-anchor: it is a
+		// tamper indicator (a daemon that silently restarted the chain, or an attacker who
+		// spliced a fresh segment) UNLESS the record is a legitimate chain-break marker.
+		// So a mid-file genesis anchor is accepted ONLY when the event carries the
+		// ChainBreak marker; a genesis anchor without it is rejected.
+		reAnchored := i > 0 && env.PriorHash == genesisPriorHash
+		if !reAnchored {
+			if env.PriorHash != prevHash {
+				return fmt.Errorf("%w: index %d prior_hash = %q, want %q (broken link)",
+					ErrChainInvalid, i, env.PriorHash, prevHash)
+			}
+		} else {
+			marker, err := chainBreakOf(env.Event)
+			if err != nil {
+				return fmt.Errorf("%w: index %d: %v", ErrChainInvalid, i, err)
+			}
+			if marker == nil {
+				return fmt.Errorf("%w: index %d re-anchors the spine at genesis WITHOUT a chain-break marker "+
+					"(a silent re-anchor — the spine restarted or a segment was spliced)", ErrChainInvalid, i)
+			}
+			if marker.ObservedPriorTip == "" {
+				return fmt.Errorf("%w: index %d is a chain-break marker with an empty observed_prior_tip "+
+					"(the discontinuity must record the observed tail state)", ErrChainInvalid, i)
+			}
 		}
 
 		want, err := computeHash(env.PriorHash, env.Sequence, env.Event)
@@ -128,4 +151,18 @@ func ValidateChain(envs []ChainEnvelope) error {
 		prevSeq = env.Sequence
 	}
 	return nil
+}
+
+// chainBreakOf extracts the ChainBreak marker from an envelope's canonical event
+// bytes, or nil when the event carries none. It unmarshals only the chain_break field
+// (a partial decode over the fixed JSON shape), so a normal event — whose omitempty
+// pointer serialized to nothing — yields nil without error.
+func chainBreakOf(eventBytes json.RawMessage) (*ChainBreakInfo, error) {
+	var probe struct {
+		ChainBreak *ChainBreakInfo `json:"chain_break"`
+	}
+	if err := json.Unmarshal(eventBytes, &probe); err != nil {
+		return nil, fmt.Errorf("decode event for chain_break: %w", err)
+	}
+	return probe.ChainBreak, nil
 }
