@@ -17,9 +17,12 @@ import (
 )
 
 // newTestHandlersWithMCPKey extends newTestHandlers with an mcpkey.Engine
-// collaborator wired into the Deps. The rerender callback is a no-op for these
-// handler-layer tests (the Engine's own tests cover rerender behaviour).
-func newTestHandlersWithMCPKey(t *testing.T, sink *audit.RecordingFake) (*operator.Handlers, *mcpkey.Engine) {
+// collaborator wired into the Deps. It returns the backing RecordStore too so a
+// test can re-read a record after a handler call and assert the durable state (a
+// revoke actually flipped the status), not merely that the call returned nil. The
+// rerender callback is a no-op for these handler-layer tests (the Engine's own
+// tests cover rerender behaviour).
+func newTestHandlersWithMCPKey(t *testing.T, sink *audit.RecordingFake) (*operator.Handlers, *mcpkey.Engine, mcpkey.RecordStore) {
 	t.Helper()
 	clk := state.NewFakeClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	store := mcpkey.NewInMemRecordStore()
@@ -32,7 +35,7 @@ func newTestHandlersWithMCPKey(t *testing.T, sink *audit.RecordingFake) (*operat
 		Seam:         ingress.NewOperatorSeam(),
 		Resolver:     operator.NewPeerCredResolver(nil),
 	})
-	return h, eng
+	return h, eng, store
 }
 
 // TestMCPKeyCreate_AttestedHappyPath confirms that MCPKeyCreate with an attested
@@ -41,7 +44,7 @@ func newTestHandlersWithMCPKey(t *testing.T, sink *audit.RecordingFake) (*operat
 func TestMCPKeyCreate_AttestedHappyPath(t *testing.T) {
 	t.Parallel()
 	sink := audit.NewRecordingFake()
-	h, _ := newTestHandlersWithMCPKey(t, sink)
+	h, _, _ := newTestHandlersWithMCPKey(t, sink)
 
 	sk, rec, err := h.MCPKeyCreate(context.Background(), attestedConn(1001), "tenant-1", "deploy-1", nil)
 	if err != nil {
@@ -67,7 +70,7 @@ func TestMCPKeyCreate_AttestedHappyPath(t *testing.T) {
 func TestMCPKeyCreate_UnattestedRefused(t *testing.T) {
 	t.Parallel()
 	sink := audit.NewRecordingFake()
-	h, _ := newTestHandlersWithMCPKey(t, sink)
+	h, _, _ := newTestHandlersWithMCPKey(t, sink)
 
 	sk, rec, err := h.MCPKeyCreate(context.Background(), unattestedConn(), "tenant-1", "deploy-1", nil)
 	if !errors.Is(err, ingress.ErrUnattested) {
@@ -83,32 +86,46 @@ func TestMCPKeyCreate_UnattestedRefused(t *testing.T) {
 }
 
 // TestMCPKeyRevoke_AttestedHappyPath confirms that MCPKeyRevoke with an attested
-// connection drives Engine.Revoke and returns nil on success.
+// connection drives Engine.Revoke and DURABLY revokes the addressed key. It asserts
+// the post-state in the store, not merely that the call returned nil: MCPKeyRevoke is
+// idempotent (revoking an absent or wrong id also returns nil), so a nil return alone
+// proves nothing — a handler that dropped the key id would still pass. Re-reading the
+// record and asserting its status is StatusRevoked pins that the RIGHT key was flipped.
 func TestMCPKeyRevoke_AttestedHappyPath(t *testing.T) {
 	t.Parallel()
 	sink := audit.NewRecordingFake()
-	h, eng := newTestHandlersWithMCPKey(t, sink)
+	h, eng, store := newTestHandlersWithMCPKey(t, sink)
 
-	// First create a key to revoke.
+	// First create a key to revoke, through the same engine the handler drives.
 	scope := ingress.NewOperatorSeam().Mint(state.Identity{Tenant: "tenant-2", Caller: "operator"})
 	_, rec, err := eng.Create(context.Background(), scope, "tenant-2", "deploy-2", nil)
 	if err != nil {
 		t.Fatalf("Engine.Create: %v", err)
 	}
+	// Precondition: the freshly-created record is active in the store.
+	before, err := store.Get(context.Background(), rec.KeyID)
+	if err != nil {
+		t.Fatalf("store.Get before revoke: %v", err)
+	}
+	if before.Status != mcpkey.StatusActive {
+		t.Fatalf("precondition: created record status = %q, want active", before.Status)
+	}
 
-	sink2 := audit.NewRecordingFake() // fresh sink for the handler call
-	h2 := operator.NewHandlers(operator.Deps{
-		MCPKeyEngine: eng,
-		Seam:         ingress.NewOperatorSeam(),
-		Resolver:     operator.NewPeerCredResolver(nil),
-	})
-	_ = mcpkey.NewInMemRecordStore() // silence unused import
-
-	if _, err := h2.MCPKeyRevoke(context.Background(), attestedConn(1001), rec.KeyID, "test-revoke"); err != nil {
+	if _, err := h.MCPKeyRevoke(context.Background(), attestedConn(1001), rec.KeyID, "test-revoke"); err != nil {
 		t.Fatalf("MCPKeyRevoke: %v", err)
 	}
-	_ = sink2
-	_ = h
+
+	// The durable effect: the addressed record is now revoked in the store.
+	after, err := store.Get(context.Background(), rec.KeyID)
+	if err != nil {
+		t.Fatalf("store.Get after revoke: %v", err)
+	}
+	if after.Status != mcpkey.StatusRevoked {
+		t.Errorf("after MCPKeyRevoke, record %q status = %q, want revoked; the handler returned nil but did not durably revoke the addressed key", rec.KeyID, after.Status)
+	}
+	if sink.Len() == 0 {
+		t.Error("MCPKeyRevoke: no audit record emitted for the successful revoke")
+	}
 }
 
 // TestMCPKeyRevoke_UnattestedRefused confirms MCPKeyRevoke refuses an unattested
@@ -116,7 +133,7 @@ func TestMCPKeyRevoke_AttestedHappyPath(t *testing.T) {
 func TestMCPKeyRevoke_UnattestedRefused(t *testing.T) {
 	t.Parallel()
 	sink := audit.NewRecordingFake()
-	h, _ := newTestHandlersWithMCPKey(t, sink)
+	h, _, _ := newTestHandlersWithMCPKey(t, sink)
 
 	_, err := h.MCPKeyRevoke(context.Background(), unattestedConn(), "some-key-id", "reason")
 	if !errors.Is(err, ingress.ErrUnattested) {
