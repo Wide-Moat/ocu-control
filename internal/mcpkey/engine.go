@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
@@ -30,6 +31,28 @@ var (
 	ErrTenantMissing     = errors.New("mcpkey: tenant is required (fail-closed)")
 	ErrDeploymentMissing = errors.New("mcpkey: deployment is required (fail-closed)")
 )
+
+// ErrTenantTooLong and ErrDeploymentTooLong refuse a mint whose tenant or
+// deployment exceeds the frozen A2 length cap, before any side effect. The
+// published record pins both fields with maxLength 256
+// (contracts/mcp/mcp-key-set.schema.json $defs Tenant/Deployment), so admitting
+// an over-long value would mint a record the hashed-key-set artifact cannot
+// legally render — and a strict gateway boot-loader would then reject the WHOLE
+// artifact, taking down every key in the deployment off one bad mint. This is the
+// maxLength half of the same fail-closed guard as the minLength-1 refusals above;
+// enforcing only the empty half left the over-long half to a post-publish schema
+// failure.
+var (
+	ErrTenantTooLong     = errors.New("mcpkey: tenant exceeds the maximum length (fail-closed)")
+	ErrDeploymentTooLong = errors.New("mcpkey: deployment exceeds the maximum length (fail-closed)")
+)
+
+// maxScopeLen is the maximum length of a tenant or deployment scope, matching the
+// frozen A2 schema's maxLength 256 on $defs Tenant and Deployment. It is counted
+// in Unicode code points (utf8.RuneCountInString), the same unit JSON Schema
+// maxLength measures, so the Go refusal and the schema constraint agree on a
+// multi-byte value rather than diverging on byte length.
+const maxScopeLen = 256
 
 // RenderOutcome reports the state the re-render left the published boot-set in.
 // It is returned by Revoke so the operator surface can distinguish an ordinary
@@ -116,6 +139,16 @@ func (e *Engine) Create(ctx context.Context, scope ingress.OperatorScope, tenant
 	}
 	if deployment == "" {
 		return SecretKey{}, Record{}, ErrDeploymentMissing
+	}
+	// Cap tenant/deployment at the frozen A2 maxLength BEFORE any side effect. An
+	// over-long value mints a record the artifact cannot legally render; a strict
+	// gateway boot-loader would then reject the whole boot-set, so this refusal is
+	// the maxLength half of the same fail-closed guard as the empty checks above.
+	if utf8.RuneCountInString(tenant) > maxScopeLen {
+		return SecretKey{}, Record{}, ErrTenantTooLong
+	}
+	if utf8.RuneCountInString(deployment) > maxScopeLen {
+		return SecretKey{}, Record{}, ErrDeploymentTooLong
 	}
 
 	// Step 1: Mint the sk and build the full Record, which produces the key_id we
