@@ -120,9 +120,12 @@ func Test_MCPKey_Create_BadExpires(t *testing.T) {
 
 // Test_MCPKey_Create_HappyPath drives the full mcp-key create flag-parse and
 // shown-once render path with a fake HTTP server. It asserts:
-//  1. The request body carries the correct tenant/deployment/expires_at fields.
-//  2. The rendered output contains the raw key, the key_id, and the store-now note.
-//  3. The raw key appears EXACTLY ONCE in the output.
+//  1. The request hits the frozen route (POST /v1alpha/mcp-keys) with a JSON
+//     content type — the daemon mounts method+path patterns, so a path drift
+//     would be a production 404 this handler makes red.
+//  2. The request body carries the correct tenant/deployment/expires_at fields.
+//  3. The rendered output contains the raw key, the key_id, and the store-now note.
+//  4. The raw key appears EXACTLY ONCE in the output.
 func Test_MCPKey_Create_HappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -134,6 +137,14 @@ func Test_MCPKey_Create_HappyPath(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "want POST", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/v1alpha/mcp-keys" {
+			http.Error(w, "wrong route: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			http.Error(w, "wrong content type: "+ct, http.StatusUnsupportedMediaType)
 			return
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
@@ -234,7 +245,9 @@ func Test_MCPKey_Revoke_MissingID(t *testing.T) {
 }
 
 // Test_MCPKey_Revoke_HappyPath drives the full mcp-key revoke flag-parse and
-// confirmation render with a fake HTTP server.
+// confirmation render with a fake HTTP server. Like the create happy path it
+// pins the frozen route (POST /v1alpha/mcp-keys/revoke) and the JSON content
+// type, so a drift on either is red here rather than a production 404.
 func Test_MCPKey_Revoke_HappyPath(t *testing.T) {
 	t.Parallel()
 
@@ -245,6 +258,14 @@ func Test_MCPKey_Revoke_HappyPath(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "want POST", http.StatusMethodNotAllowed)
+			return
+		}
+		if r.URL.Path != "/v1alpha/mcp-keys/revoke" {
+			http.Error(w, "wrong route: "+r.URL.Path, http.StatusNotFound)
+			return
+		}
+		if ct := r.Header.Get("Content-Type"); ct != "application/json" {
+			http.Error(w, "wrong content type: "+ct, http.StatusUnsupportedMediaType)
 			return
 		}
 		if err := json.NewDecoder(r.Body).Decode(&gotBody); err != nil {
