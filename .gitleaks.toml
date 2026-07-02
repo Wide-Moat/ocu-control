@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 
-# gitleaks allowlist for the ocu-control repository.
+# gitleaks config for the ocu-control repository.
 #
 # No real credentials are committed. There are no documented false positives
 # yet: the control plane custodies the Storage-JWT signing key as a runtime
@@ -10,13 +10,48 @@
 # scoped as tightly as possible (regex on the exact value, confined to the
 # doc file that uses it).
 
+# LOAD THE DEFAULT RULESET. This is load-bearing: when gitleaks is given a config
+# file, it uses ONLY the rules that file declares — a config with an allowlist but
+# no rules and no [extend] scans with ZERO detection rules, so every committed
+# secret passes (a vacuous gate). `useDefault = true` extends the built-in ruleset
+# rather than replacing it, so the ~150 default detectors run AND the allowlist
+# below applies on top. scripts/gitleaks-redprobe.sh proves this by planting a
+# secret and asserting the gate fires; removing this block turns that probe RED.
+[extend]
+  useDefault = true
+
 # gitleaks 8.30.1 requires the array-of-tables form ([[allowlists]]), and each
 # entry must carry at least one check (commits / paths / regexes / stopwords) or
-# the config fails to load. There are no false positives to allowlist, so this
-# entry scopes a single inert path key to the local-only, gitignored dev-secrets
-# directory — a path that never enters the tree, so it allowlists nothing real
-# while satisfying the schema. Default behaviour still extends (not replaces) the
-# built-in ruleset.
+# the config fails to load. This entry scopes a single inert path key to the
+# local-only, gitignored dev-secrets directory — a path that never enters the tree,
+# so it allowlists nothing real while satisfying the schema.
 [[allowlists]]
   description = "No documented false positives; see header."
   paths = ['''^deploy/dev-secrets/''']
+
+# Inert test fixtures the default ruleset flags. Each is a structurally-valid but
+# entirely fake value used to exercise a code path (render, scrub); none is a live
+# credential. Every entry is scoped to BOTH the exact file (paths) AND the exact
+# value shape (regexes), so it exempts only the named fixture — a real secret
+# committed to the same file would still be caught.
+
+# The sk-ocu- fixtures in the occ CLI render tests: fake mcp-key literals asserted
+# in the shown-once render, never a live key.
+[[allowlists]]
+  description = "occ render-test fake sk-ocu- key fixtures"
+  paths = ['''^cmd/occ/main_test\.go$''']
+  regexes = ['''sk-ocu-[A-Za-z0-9]+''']
+
+# The scrub test's fixture JWT: a compact three-segment token whose payload decodes
+# to {"filesystem_id":"fs-1"} with the literal "signature" — the weak Storage-JWT
+# shape the teardown scrub must remove, constructed inline so the test proves the
+# scrub leaves none behind.
+[[allowlists]]
+  description = "teardown-scrub fixture Storage-JWT (payload filesystem_id=fs-1, literal signature)"
+  paths = ['''^internal/runtime/docker/teardown_scrub_test\.go$''']
+  regexes = ['''eyJhbGciOiJFZERTQSJ9\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+''']
+
+# NOTE: scripts/gitleaks-redprobe.sh needs NO allowlist. It assembles its planted
+# GitLab PAT at runtime from parts, so the detectable literal never appears verbatim
+# in any committed file — nothing for the tree-scan to flag, and no value-matching
+# allowlist that could also suppress the probe's own planted temp-file secret.
