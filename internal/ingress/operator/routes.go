@@ -459,6 +459,11 @@ func writeMCPKeyError(w http.ResponseWriter, err error) {
 		// The canon create-request marks both required; an empty value would mint
 		// a record the published A2 artifact cannot legally render (minLength 1).
 		writeStatus(w, http.StatusBadRequest, "tenant and deployment are required")
+	case errors.Is(err, mcpkey.ErrTenantTooLong), errors.Is(err, mcpkey.ErrDeploymentTooLong):
+		// The over-long half of the same constraint: the A2 artifact pins both
+		// fields at maxLength 256, so an over-long value is a client error (400),
+		// not an internal fault.
+		writeStatus(w, http.StatusBadRequest, "tenant and deployment must not exceed the maximum length")
 	default:
 		writeStatus(w, http.StatusServiceUnavailable, "mcp-key operation refused")
 	}
