@@ -12,6 +12,20 @@ import (
 	"os"
 )
 
+// PREFIX-INTEGRITY CAVEAT (a documented v1 limitation). Resume-from-tip and the whole
+// hash-chain prove PREFIX-integrity, not COMPLETENESS: a chain is tamper-evident
+// against a mutated, reordered, or spliced record, and ErrTipDecoupled catches a torn
+// (mid-record) truncation. But it does NOT detect a CLEAN truncation at a record
+// boundary — if an attacker deletes whole trailing records, the remaining prefix is
+// still a perfectly valid chain, and a resume continues from the (now-earlier) tip as
+// though nothing were missing. Detecting a clean-boundary truncation needs an anchor
+// OUTSIDE the file — a monotonically-advancing tip checkpoint (last sequence + hash)
+// persisted in the control DB and compared at boot, or the downstream Merkle-head
+// submission that seals each segment. That external anchor is tracked as a follow-up
+// (see docs/notes) and is out of scope for v1, where the hot spine is short-lived. The
+// chain still delivers the ADR-0009 minimal-shelf detective posture for every tamper
+// class EXCEPT clean-boundary trailing-truncation.
+
 // ErrTipDecoupled is the resume verdict when an existing audit file's tail cannot be
 // read as a valid chain tip: the last line does not parse as a ChainEnvelope, or its
 // stored Hash does not match a recompute over its own (prior_hash, sequence, event).
