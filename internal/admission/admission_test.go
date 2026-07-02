@@ -160,3 +160,58 @@ func TestPropertyFirecrackerColumnNeverAdmits(t *testing.T) {
 		}
 	}
 }
+
+// TestDecideOutOfRangeBoundary is the DETERMINISTIC pin on Decide's fail-closed
+// bounds check — the exact edge where a value first exceeds the 3×3 grid. It
+// covers the first out-of-range profile (3) against every in-range tier, the
+// first out-of-range tier (3) against every in-range profile, and the (3,3)
+// corner. Every one of these must reject with ReasonUnknownCell and must not
+// panic (a bare index into the 3×3 matrix at row/column 3 is out of range).
+//
+// TestPropertyTotality already asserts this property over the full uint8 space,
+// but it reaches the exact boundary (profile==3 or tier==3, the only inputs that
+// would index one past the matrix) only when its random Draw happens to land
+// there — so an off-by-one in the bounds check (>= numTiers weakened to
+// > numTiers, which lets tier==3 fall through to matrix[p][3]) survives on a run
+// where the boundary is not drawn. This table hits every boundary cell on every
+// run, so that off-by-one — and its symmetric profile twin — is killed
+// deterministically. The rapid totality property is complementary and stays.
+func TestDecideOutOfRangeBoundary(t *testing.T) {
+	t.Parallel()
+
+	// The first value one past the in-range grid for both axes. numProfiles and
+	// numTiers are both 3, so 3 is the boundary that would index matrix[.][3]
+	// (out of range) if the bounds check let it through.
+	const firstOutOfRange = 3
+
+	assertUnknownCell := func(t *testing.T, p admission.WorkloadProfile, tier runtime.RuntimeTier) {
+		t.Helper()
+		// A wrong bounds check indexes matrix at row/column 3 and panics; recover
+		// turns that into a clear test failure rather than a crashed run.
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Decide(profile=%d, tier=%d) panicked (bounds check let an out-of-range value index the matrix): %v", p, tier, r)
+			}
+		}()
+		got := admission.Decide(p, tier)
+		if got.Admitted {
+			t.Fatalf("Decide(profile=%d, tier=%d) admitted an out-of-range value; want fail-closed reject", p, tier)
+		}
+		if got.Reason != admission.ReasonUnknownCell {
+			t.Fatalf("Decide(profile=%d, tier=%d) = reason %v, want ReasonUnknownCell (fail-closed default)", p, tier, got.Reason)
+		}
+	}
+
+	// The out-of-range TIER (3) against every in-range profile — the cell that a
+	// weakened `tier >= numTiers` bounds check would let index matrix[p][3].
+	for _, p := range allProfiles {
+		assertUnknownCell(t, p, runtime.RuntimeTier(firstOutOfRange))
+	}
+	// The out-of-range PROFILE (3) against every in-range tier — the symmetric
+	// cell a weakened `profile >= numProfiles` check would let index matrix[3][t].
+	for _, tier := range allTiers {
+		assertUnknownCell(t, admission.WorkloadProfile(firstOutOfRange), tier)
+	}
+	// The corner where both axes are out of range.
+	assertUnknownCell(t, admission.WorkloadProfile(firstOutOfRange), runtime.RuntimeTier(firstOutOfRange))
+}
