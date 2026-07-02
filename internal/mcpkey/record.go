@@ -165,7 +165,13 @@ func validateSalt(salt []byte) error {
 // now (from a monotonic Clock). A zero ExpiresAt means non-expiring and always
 // returns false.
 func (r Record) IsExpired(now time.Time) bool {
-	return !r.ExpiresAt.IsZero() && now.After(r.ExpiresAt)
+	// A record is expired at OR after its expiry instant: a key whose expiry is
+	// exactly now no longer validates (a bearer presented at the expiry moment is
+	// refused). !now.Before(ExpiresAt) is true when now == ExpiresAt or later. This
+	// makes the boundary identical to the Postgres leg's `expires_at > now` filter
+	// (which excludes a row whose expires_at equals now), so the two RecordStore
+	// legs agree on the expiry instant rather than diverging by one tick.
+	return !r.ExpiresAt.IsZero() && !now.Before(r.ExpiresAt)
 }
 
 // IsActive reports whether the record is active AND not expired. The published

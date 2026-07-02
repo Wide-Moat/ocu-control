@@ -185,10 +185,13 @@ func (s *store) ActiveRecords(ctx context.Context, now time.Time) ([]mcpkey.Reco
 	if err := ctx.Err(); err != nil {
 		return nil, mcpkey.ErrStoreUnavailable
 	}
-	// The WHERE clause mirrors Record.IsActive(now): status = active AND
-	// (expires_at IS NULL OR expires_at > now). Revoked rows (status=1) are
-	// excluded. The Go layer re-checks IsActive as a safety net so the in-memory
-	// and Postgres legs stay in lock-step on the definition.
+	// The WHERE clause IS the sole filter and mirrors Record.IsActive(now) exactly:
+	// status = active AND (expires_at IS NULL OR expires_at > now). Revoked rows
+	// (status=1) are excluded, and `expires_at > now` excludes a row whose expiry
+	// is exactly now — matching Record.IsExpired's at-or-after boundary, so the
+	// in-memory and Postgres legs agree on the expiry instant. There is no Go-side
+	// re-check: the query is authoritative, and the shared conformance suite (run
+	// against BOTH legs) pins the boundary case so the two cannot drift.
 	rows, err := s.pool.Query(ctx, `
 		SELECT key_id, key_hash, salt, tenant, deployment, expires_at, status, created_at
 		FROM mcp_keys
