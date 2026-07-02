@@ -68,7 +68,7 @@ func genesisTip() Tip {
 // skip. It reads the whole file; the cost note on the boot caller documents why that is
 // acceptable in v1 (the hot spine stays small until the cold-tier rotation seam lands).
 func ReadChainFile(path string) ([]ChainEnvelope, error) {
-	f, err := os.Open(path) //nolint:gosec // path is the operator-configured audit sink, not user input
+	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
@@ -113,7 +113,7 @@ func ReadChainFile(path string) ([]ChainEnvelope, error) {
 // at boot and on demand). Reading the tail is O(1)-ish over the file size via a
 // streaming scan that keeps only the last non-empty line.
 func ReadTip(path string) (Tip, error) {
-	f, err := os.Open(path) //nolint:gosec // path is the operator-configured audit sink, not user input
+	f, err := os.Open(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return genesisTip(), nil
 	}
