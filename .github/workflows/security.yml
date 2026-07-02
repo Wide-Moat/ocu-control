@@ -68,11 +68,23 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       # The gitleaks GitHub Action requires a paid org licence; the OSS
-      # docker image does not. Run it directly with the default ruleset.
-      - name: gitleaks (docker, default ruleset)
+      # docker image does not. Run it directly. The repo .gitleaks.toml is
+      # auto-discovered and (via [extend] useDefault) extends the default ruleset.
+      - name: gitleaks (docker)
         run: |
-          docker run --rm -v "$PWD:/repo" zricethezav/gitleaks:v8.30.1 \
+          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1 \
             detect --source=/repo --redact --no-banner
+      # RED-when-neutered proof: a config without [extend]/useDefault scans with no
+      # rules (a vacuous gate). This plants a secret and asserts gitleaks fires, so a
+      # regression that drops the default ruleset cannot pass review. It runs a real
+      # gitleaks binary on PATH so the probe's `command -v gitleaks` check is honest.
+      - name: install gitleaks binary (for the red-probe)
+        run: |
+          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+      - name: gitleaks red-probe (gate-fires proof)
+        run: bash scripts/gitleaks-redprobe.sh
 
   secrets-trufflehog:
     runs-on: ubuntu-latest

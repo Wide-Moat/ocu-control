@@ -48,7 +48,7 @@ VALE_VERSION := v3.15.1
 COVERAGE_FLOOR := 91
 
 .PHONY: help build bin dev-secrets test test-race cover spdx contract identity seccomp schema vet fmt \
-        staticcheck lint deadcode vale mutation check
+        staticcheck lint deadcode vale secrets-redprobe mutation check
 
 # ── help ────────────────────────────────────────────────────────────────────
 
@@ -186,6 +186,13 @@ vale: ## vale doc-prose gate (banned vocab / AI-slop / AP-13) on tracked .md, pi
 	  exit 1; \
 	fi
 	bash scripts/vale-gate.sh
+
+secrets-redprobe: ## secrets-gate RED-when-neutered proof (needs gitleaks on PATH; CI-side, not in `make check`)
+	@if ! command -v gitleaks >/dev/null 2>&1; then \
+	  echo "gitleaks not found — install from https://github.com/gitleaks/gitleaks/releases (pin v8.30.1)"; \
+	  exit 1; \
+	fi
+	bash scripts/gitleaks-redprobe.sh
 
 # ── mutation (slower gate — NOT part of `make check`) ─────────────────────────
 #

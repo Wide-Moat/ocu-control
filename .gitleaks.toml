@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: FSL-1.1-Apache-2.0
 # Copyright (c) 2025 Open Computer Use Contributors
 
-# gitleaks allowlist for the ocu-control repository.
+# gitleaks config for the ocu-control repository.
 #
 # No real credentials are committed. There are no documented false positives
 # yet: the control plane custodies the Storage-JWT signing key as a runtime
@@ -10,13 +10,56 @@
 # scoped as tightly as possible (regex on the exact value, confined to the
 # doc file that uses it).
 
+# LOAD THE DEFAULT RULESET. This is load-bearing: when gitleaks is given a config
+# file, it uses ONLY the rules that file declares — a config with an allowlist but
+# no rules and no [extend] scans with ZERO detection rules, so every committed
+# secret passes (a vacuous gate). `useDefault = true` extends the built-in ruleset
+# rather than replacing it, so the ~150 default detectors run AND the allowlist
+# below applies on top. scripts/gitleaks-redprobe.sh proves this by planting a
+# secret and asserting the gate fires; removing this block turns that probe RED.
+[extend]
+  useDefault = true
+
 # gitleaks 8.30.1 requires the array-of-tables form ([[allowlists]]), and each
 # entry must carry at least one check (commits / paths / regexes / stopwords) or
-# the config fails to load. There are no false positives to allowlist, so this
-# entry scopes a single inert path key to the local-only, gitignored dev-secrets
-# directory — a path that never enters the tree, so it allowlists nothing real
-# while satisfying the schema. Default behaviour still extends (not replaces) the
-# built-in ruleset.
+# the config fails to load. This entry scopes a single inert path key to the
+# local-only, gitignored dev-secrets directory — a path that never enters the tree,
+# so it allowlists nothing real while satisfying the schema.
 [[allowlists]]
   description = "No documented false positives; see header."
   paths = ['''^deploy/dev-secrets/''']
+
+# Inert test fixtures the default ruleset flags. Each is a structurally-valid but
+# entirely fake value used to exercise a code path (render, scrub); none is a live
+# credential. Each entry allowlists the EXACT fixture VALUE only — never a path.
+#
+# WHY NOT paths: gitleaks 8.30.1 treats an allowlist's `paths` and `regexes` as
+# INDEPENDENT (OR) conditions, not a conjunction — a `paths` entry suppresses the
+# WHOLE file, so a real secret committed to the same file would then go undetected.
+# The `matchCondition`/`condition = "AND"` keys are ignored by 8.30.1. Allowlisting
+# the exact literal value instead keeps the exemption to that one fixture: any OTHER
+# secret in the same file — or that fixture value moved to another file — is still
+# caught. The regexes below are the precise fixture literals, not shapes.
+
+# The two sk-ocu- fixtures in the occ CLI render tests: fake mcp-key literals asserted
+# in the shown-once render, never live keys.
+[[allowlists]]
+  description = "occ render-test fake sk-ocu- key fixture (create)"
+  regexes = ['''sk-ocu-TestKey1234567890ABCDEFGHIJK''']
+[[allowlists]]
+  description = "occ render-test fake sk-ocu- key fixture (render)"
+  regexes = ['''sk-ocu-UniqueTestKeyABCD1234567890XYZ''']
+
+# The scrub test's fixture JWT: a compact three-segment token whose payload decodes
+# to {"filesystem_id":"fs-1"} — the weak Storage-JWT shape the teardown scrub must
+# remove, constructed inline so the test proves the scrub leaves none behind. The
+# header+payload are the exact fixture literal; the signature segment is matched by
+# shape (it authenticates nothing).
+[[allowlists]]
+  description = "teardown-scrub fixture Storage-JWT (payload filesystem_id=fs-1)"
+  regexes = ['''eyJhbGciOiJFZERTQSJ9\.eyJmaWxlc3lzdGVtX2lkIjoiZnMtMSJ9\.[A-Za-z0-9_-]+''']
+
+# NOTE: scripts/gitleaks-redprobe.sh needs NO allowlist. It assembles its planted
+# GitLab PAT at runtime from parts, so the detectable literal never appears verbatim
+# in any committed file — nothing for the tree-scan to flag, and no value-matching
+# allowlist that could also suppress the probe's own planted temp-file secret.
