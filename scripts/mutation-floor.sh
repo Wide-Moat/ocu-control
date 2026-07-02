@@ -35,6 +35,19 @@
 # layout on an unwired later-phase function) and are deliberately not chased — a
 # low floor is never silently accepted, but neither is a cosmetic one bought with
 # brittle over-fitting.
+#
+# mcpkey (the mint/revoke credential core) is added 2026-07-02 at a measured
+# baseline 0.831 (69/83 killed under GOMAXPROCS=1), floored at 0.8. An adversarial
+# self-audit found this core was OUTSIDE the gate despite being exactly the
+# pure-logic leaf shape the gate exists for; coverage tests added alongside
+# (conformance round-trip of the security-critical KeyHash/Salt bytes, the
+# expiresAt pass-through, the Engine store/rerender fault branches, and the key_id
+# shape) raised assertion strength on the store/engine/expiry paths. The 14
+# remaining survivors are dominated by mint.go base62/rejection-sampling
+# arithmetic (equivalent or brittle boundary mutants of the sampler, the same
+# class as the deliberately-unchased quota survivors); they are not chased with
+# over-fitted tests. The floor is floor(measured), to be ratcheted UP as the
+# sampler survivors are genuinely killed.
 set -euo pipefail
 
 # go-mutesting writes a report.json into the working dir on each run; remove it
@@ -55,6 +68,7 @@ declare -A FLOOR=(
   [killswitch]=0.8
   [quota]=0.8
   [registry]=1.0
+  [mcpkey]=0.8
 )
 
 # --exec-timeout raises go-mutesting's per-mutant test-run window from its 10s
@@ -87,7 +101,7 @@ declare -A FLOOR=(
 # infra cold-compile-timeout flake, never a true suite gap. The floors are
 # unchanged (admission stays 1.00, zero-slack).
 fail=0
-for pkg in admission killswitch quota registry; do
+for pkg in admission killswitch quota registry mcpkey; do
   out="$(go-mutesting --exec-timeout=300 "./internal/${pkg}/" 2>&1)"
   score="$(printf '%s\n' "$out" | sed -n -E 's/.*mutation score is ([0-9.]+).*/\1/p')"
   if [ -z "$score" ]; then
