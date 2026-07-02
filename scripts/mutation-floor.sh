@@ -95,10 +95,23 @@ for pkg in admission killswitch quota registry; do
     fail=1
     continue
   fi
-  awk -v s="$score" -v f="${FLOOR[$pkg]}" -v p="$pkg" 'BEGIN{
+  if awk -v s="$score" -v f="${FLOOR[$pkg]}" -v p="$pkg" 'BEGIN{
     if (s+0 < f+0) { printf "::error::%s mutation score %.4f below floor %.2f\n", p, s, f; exit 1 }
     printf "OK: %s mutation score %.4f >= floor %.2f\n", p, s, f
-  }' || fail=1
+  }'; then
+    :
+  else
+    fail=1
+    # Below-floor DIAGNOSTIC dump: name the surviving mutant(s). A CI-only mis-score
+    # (e.g. the parallelism-sensitive intermittent flake) and a genuine survivor
+    # look identical from the score alone; the full go-mutesting output names the
+    # exact FAIL "…/pkg.go.N" so the next investigation targets a mutant by name
+    # rather than guessing. This stays useful forever: a real future survivor is
+    # named here too, not just a flake.
+    echo "::group::go-mutesting full output for ${pkg} (below floor — surviving mutant dump)"
+    printf '%s\n' "$out"
+    echo "::endgroup::"
+  fi
 done
 
 if [ "$fail" -ne 0 ]; then
