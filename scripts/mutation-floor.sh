@@ -66,17 +66,29 @@ declare -A FLOOR=(
 # mutants, all killed): ~0.48s/mutant unloaded; 8.68s total under a 16-core CPU
 # burn; 14.75s total (worst single compile+test 1.576s) under GOMAXPROCS=1 + a
 # 16-core burn — the closest local model of a weak, contended runner. The 2-vCPU
-# ubuntu-latest runner under co-tenant load (the sibling coverage/race/staticcheck
-# jobs share its cores) cannot be reproduced exactly here, so the exact CI worst
-# case is unmeasured; 60s is chosen with the margin on the side of STRICTNESS
-# (~37x the measured 1.576s worst). This cannot mask a real gap: a genuine
-# survivor is a mutant that is NEVER killed — it reads as survived at 10s, 60s, or
-# 600s alike — so a wider window only removes the infra-timeout flake (a
-# finite mutant killed locally in 1.6s that the 10s CI window intermittently
-# missed), never a true suite gap. The floor is unchanged.
+# ubuntu-latest runner under co-tenant load cannot be reproduced exactly here, so
+# the exact CI worst case is unmeasured.
+#
+# 2026-07-02: the 60s window was NOT enough. A mutation run on admission read
+# 0.9444 (17/18) in CI while the admission tree was byte-identical to a passing
+# baseline — one mutant timed out, not a real survivor (admission scores a clean
+# 18/18 = 1.000 locally on both the failing branch and its base). Root cause,
+# measured firsthand under GOMAXPROCS=1 + a 16-core burn (the heaviest local model
+# of a starved single core): a WARM-cache mutant run is ~0.85s worst, but a
+# COLD-cache run — full compile + link + test, which a mutant hits when the build
+# cache is empty or invalidated — is 19.40s. A 2-vCPU CI runner compiles slower
+# per core than this box, and the mutation job starts with a cold cache, so the
+# first cold-compile mutant can approach or exceed 60s under contention. The
+# window is raised to 300s: ~15x the measured 19.40s cold worst, comfortably
+# beyond any plausible contended cold compile+test, chosen with the margin on the
+# side of STRICTNESS since the exact CI worst is un-reproducible here. This cannot
+# mask a real gap: a genuine survivor is a mutant that is NEVER killed — it reads
+# as survived at 60s, 300s, or 600s alike — so a wider window only removes the
+# infra cold-compile-timeout flake, never a true suite gap. The floors are
+# unchanged (admission stays 1.00, zero-slack).
 fail=0
 for pkg in admission killswitch quota registry; do
-  out="$(go-mutesting --exec-timeout=60 "./internal/${pkg}/" 2>&1)"
+  out="$(go-mutesting --exec-timeout=300 "./internal/${pkg}/" 2>&1)"
   score="$(printf '%s\n' "$out" | sed -n -E 's/.*mutation score is ([0-9.]+).*/\1/p')"
   if [ -z "$score" ]; then
     echo "::error::go-mutesting produced no score for ${pkg} (it built nothing — the gremlins-blindness regression class; a no-score run fails closed)"
