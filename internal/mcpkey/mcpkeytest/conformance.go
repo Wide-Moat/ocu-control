@@ -236,6 +236,34 @@ func RunConformance(t *testing.T, newStore func() mcpkey.RecordStore) {
 		}
 	})
 
+	t.Run("ActiveRecords treats a key expiring EXACTLY at now as inactive", func(t *testing.T) {
+		// The expiry-instant boundary: a record whose ExpiresAt is exactly the
+		// query's now must be OMITTED (a key at its expiry moment no longer
+		// validates). This case pins the boundary on BOTH legs so the in-memory
+		// Go path (Record.IsExpired) and the Postgres SQL path (`expires_at > now`)
+		// cannot drift by one tick — the divergence an earlier comment falsely
+		// claimed a Go-side re-check prevented.
+		s := newStore()
+		atBoundary := newFixtureRecordExpiring(t, conformanceStart)
+		live := newFixtureRecord(t, "t", "d")
+		if err := s.Put(ctx, atBoundary); err != nil {
+			t.Fatalf("Put at-boundary: %v", err)
+		}
+		if err := s.Put(ctx, live); err != nil {
+			t.Fatalf("Put live: %v", err)
+		}
+		results, err := s.ActiveRecords(ctx, conformanceStart) // now == atBoundary.ExpiresAt
+		if err != nil {
+			t.Fatalf("ActiveRecords: %v", err)
+		}
+		if len(results) != 1 {
+			t.Fatalf("ActiveRecords at the expiry instant: want 1 (the at-boundary key omitted), got %d", len(results))
+		}
+		if results[0].KeyID != live.KeyID {
+			t.Errorf("ActiveRecords: a key expiring exactly at now was NOT omitted; got key_id %q, want the live key %q", results[0].KeyID, live.KeyID)
+		}
+	})
+
 	t.Run("ActiveRecords on empty store returns empty set, not error", func(t *testing.T) {
 		s := newStore()
 		results, err := s.ActiveRecords(ctx, conformanceStart)
