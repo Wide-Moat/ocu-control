@@ -35,6 +35,19 @@
 # layout on an unwired later-phase function) and are deliberately not chased — a
 # low floor is never silently accepted, but neither is a cosmetic one bought with
 # brittle over-fitting.
+#
+# mcpkey (the mint/revoke credential core) is added 2026-07-02 at a measured
+# baseline 0.831 (69/83 killed under GOMAXPROCS=1), floored at 0.8. An adversarial
+# self-audit found this core was OUTSIDE the gate despite being exactly the
+# pure-logic leaf shape the gate exists for; coverage tests added alongside
+# (conformance round-trip of the security-critical KeyHash/Salt bytes, the
+# expiresAt pass-through, the Engine store/rerender fault branches, and the key_id
+# shape) raised assertion strength on the store/engine/expiry paths. The 14
+# remaining survivors are dominated by mint.go base62/rejection-sampling
+# arithmetic (equivalent or brittle boundary mutants of the sampler, the same
+# class as the deliberately-unchased quota survivors); they are not chased with
+# over-fitted tests. The floor is floor(measured), to be ratcheted UP as the
+# sampler survivors are genuinely killed.
 set -euo pipefail
 
 # go-mutesting writes a report.json into the working dir on each run; remove it
@@ -55,6 +68,7 @@ declare -A FLOOR=(
   [killswitch]=0.8
   [quota]=0.8
   [registry]=1.0
+  [mcpkey]=0.8
 )
 
 # --exec-timeout raises go-mutesting's per-mutant test-run window from its 10s
@@ -86,9 +100,25 @@ declare -A FLOOR=(
 # as survived at 60s, 300s, or 600s alike — so a wider window only removes the
 # infra cold-compile-timeout flake, never a true suite gap. The floors are
 # unchanged (admission stays 1.00, zero-slack).
+#
+# 2026-07-02 (later): the 300s window STILL flaked once — admission read 0.9444 in
+# CI, completing in ~5s (far under 300s, so NOT a timeout), and passed on a plain
+# re-run. Byte-identical admission, 10/10 = 1.000 locally: an intermittent
+# non-deterministic mis-score, not a real survivor. Root: each GitHub Actions job
+# runs on its OWN fresh 2-vCPU VM (NOT co-tenant with e2e/build), so the contention
+# is INSIDE this job — go-mutesting has no parallelism flag and its per-mutant
+# `go test` parallelises over GOMAXPROCS, so two mutants' compile+test contend for
+# the 2 cores and a timing/parallelism-sensitive result intermittently mis-scores.
+# go-mutesting is invoked under GOMAXPROCS=1 so each mutant's `go test` runs on a
+# single core deterministically — this removes the parallelism non-determinism (a
+# real survivor is un-killed regardless of core count, so serialising cannot mask
+# a gap) at the cost of a slower serial run the 300s window absorbs. This matters
+# more now that mcpkey (83 mutants) enlarges the run.
 fail=0
-for pkg in admission killswitch quota registry; do
-  out="$(go-mutesting --exec-timeout=300 "./internal/${pkg}/" 2>&1)"
+for pkg in admission killswitch quota registry mcpkey; do
+  # GOMAXPROCS=1: serialise the per-mutant go test so a parallelism-sensitive
+  # result cannot intermittently mis-score on the job's shared 2 vCPUs (see above).
+  out="$(GOMAXPROCS=1 go-mutesting --exec-timeout=300 "./internal/${pkg}/" 2>&1)"
   score="$(printf '%s\n' "$out" | sed -n -E 's/.*mutation score is ([0-9.]+).*/\1/p')"
   if [ -z "$score" ]; then
     echo "::error::go-mutesting produced no score for ${pkg} (it built nothing — the gremlins-blindness regression class; a no-score run fails closed)"

@@ -190,6 +190,37 @@ func TestNewRecordKeyIDDistinct(t *testing.T) {
 	}
 }
 
+// TestNewRecordKeyIDShape pins the DOCUMENTED key_id shape: the lowercase-hex
+// encoding of 12 CSPRNG bytes = exactly 24 lowercase-hex characters. The
+// existing distinctness test only asserted non-empty/distinct/not-a-substring, so
+// an entropy-reducing regression (e.g. shrinking keyIDLen, which halves the random
+// bytes) shipped green — a shorter handle is still non-empty and distinct. This
+// guards the width and the alphabet so such a regression turns red.
+func TestNewRecordKeyIDShape(t *testing.T) {
+	t.Parallel()
+	const wantHexLen = 24 // hex(12 bytes)
+	m := mcpkey.DefaultMinter()
+	clk := fixedClock{epoch}
+	for i := range 200 {
+		sk, err := m.Mint()
+		if err != nil {
+			t.Fatalf("Mint #%d: %v", i, err)
+		}
+		rec, err := mcpkey.NewRecord(sk, "t", "d", time.Time{}, clk)
+		if err != nil {
+			t.Fatalf("NewRecord #%d: %v", i, err)
+		}
+		if len(rec.KeyID) != wantHexLen {
+			t.Fatalf("record #%d: key_id %q is %d chars, want exactly %d (hex of 12 CSPRNG bytes)", i, rec.KeyID, len(rec.KeyID), wantHexLen)
+		}
+		for j, c := range rec.KeyID {
+			if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+				t.Fatalf("record #%d: key_id %q has a non-lowercase-hex char %q at %d", i, rec.KeyID, c, j)
+			}
+		}
+	}
+}
+
 // TestNewRecordNoPlaintextField proves the Record struct has no field that holds
 // the raw secret. A reflective walk over all fields confirms only KeyHash+Salt
 // are byte slices, and none carries the raw sk-ocu- string.
