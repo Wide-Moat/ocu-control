@@ -60,6 +60,24 @@ func NewChainSink(clk state.Clock, w EventWriter, source string) *ChainSink {
 	}
 }
 
+// ResumeChainSink constructs a ChainSink that CONTINUES an existing per-source spine
+// from tip, so a daemon restart keeps the sequence strictly monotonic and the
+// prior-hash link unbroken across the boot boundary — the single continuous spine
+// ADR-0009 and component-07 require (chain order derives from the per-source monotonic
+// sequence; the chain has zero breaks). tip is read from the durable file by ReadTip;
+// tip.Fresh true is the legitimate genesis start (empty/absent file), so this reduces
+// to NewChainSink's initial state. The FIRST Emit after resume assigns tip.LastSeq+1
+// and links to tip.PriorTip, exactly continuing the spine.
+func ResumeChainSink(clk state.Clock, w EventWriter, source string, tip Tip) *ChainSink {
+	return &ChainSink{
+		clk:      clk,
+		writer:   w,
+		source:   source,
+		lastSeq:  tip.LastSeq,
+		priorTip: tip.PriorTip,
+	}
+}
+
 // Emit maps rec onto an OCSF event, assigns the next sequence, computes the chain
 // hash, and writes the ChainEnvelope. It returns nil ONLY when the writer durably
 // accepted the envelope; on a writer failure it returns a wrapped
