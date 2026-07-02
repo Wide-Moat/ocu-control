@@ -100,9 +100,25 @@ declare -A FLOOR=(
 # as survived at 60s, 300s, or 600s alike — so a wider window only removes the
 # infra cold-compile-timeout flake, never a true suite gap. The floors are
 # unchanged (admission stays 1.00, zero-slack).
+#
+# 2026-07-02 (later): the 300s window STILL flaked once — admission read 0.9444 in
+# CI, completing in ~5s (far under 300s, so NOT a timeout), and passed on a plain
+# re-run. Byte-identical admission, 10/10 = 1.000 locally: an intermittent
+# non-deterministic mis-score, not a real survivor. Root: each GitHub Actions job
+# runs on its OWN fresh 2-vCPU VM (NOT co-tenant with e2e/build), so the contention
+# is INSIDE this job — go-mutesting has no parallelism flag and its per-mutant
+# `go test` parallelises over GOMAXPROCS, so two mutants' compile+test contend for
+# the 2 cores and a timing/parallelism-sensitive result intermittently mis-scores.
+# go-mutesting is invoked under GOMAXPROCS=1 so each mutant's `go test` runs on a
+# single core deterministically — this removes the parallelism non-determinism (a
+# real survivor is un-killed regardless of core count, so serialising cannot mask
+# a gap) at the cost of a slower serial run the 300s window absorbs. This matters
+# more now that mcpkey (83 mutants) enlarges the run.
 fail=0
 for pkg in admission killswitch quota registry mcpkey; do
-  out="$(go-mutesting --exec-timeout=300 "./internal/${pkg}/" 2>&1)"
+  # GOMAXPROCS=1: serialise the per-mutant go test so a parallelism-sensitive
+  # result cannot intermittently mis-score on the job's shared 2 vCPUs (see above).
+  out="$(GOMAXPROCS=1 go-mutesting --exec-timeout=300 "./internal/${pkg}/" 2>&1)"
   score="$(printf '%s\n' "$out" | sed -n -E 's/.*mutation score is ([0-9.]+).*/\1/p')"
   if [ -z "$score" ]; then
     echo "::error::go-mutesting produced no score for ${pkg} (it built nothing — the gremlins-blindness regression class; a no-score run fails closed)"
