@@ -14,12 +14,20 @@
 #
 # Both skeptics exercise the gate's decision logic hermetically (no repo source is
 # mutated, nothing is left on disk), so the proof is deterministic and leaves the
-# tree clean. It loud-skips when go-mutesting is absent (local-dev advisory parity).
+# tree clean.
 set -euo pipefail
 
+# FAIL CLOSED when go-mutesting is absent. This proof runs in CI (wired into
+# mutation.yml AFTER the install step, so the tool is always present there). A
+# missing tool must NOT skip-green: an exit-0 skip would let the whole red-probe be
+# silently neutered by removing the install step — the exact fake-green class this
+# gate exists to prevent. If the tool is genuinely unavailable, fail loudly rather
+# than pass vacuously.
 if ! command -v go-mutesting >/dev/null 2>&1; then
-  echo "::notice::go-mutesting not installed — skipping the GATE-3 red-probe (advisory parity for local dev)"
-  exit 0
+  echo "::error::go-mutesting not found on PATH — cannot run the GATE-3 red-probe (fail-closed, never skip-green)"
+  echo "  Install the pinned version:"
+  echo "    go install github.com/avito-tech/go-mutesting/cmd/go-mutesting@v0.0.0-20251226130216-48d0401f00fb"
+  exit 1
 fi
 
 # The exact floor decision scripts/mutation-floor.sh applies: RED when score < floor.

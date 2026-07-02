@@ -215,15 +215,19 @@ contract: ## Assert vendored contracts are byte-identical to the canon (skips if
 	bash scripts/check-contract-identity.sh
 
 schema: ## Compile every vendored JSON-Schema contract with ajv; validate the A2 golden
-	npx ajv-cli@5.0.0 compile --spec=draft2020 --strict=false \
+	# -c ajv-formats loads the format vocabulary so format:"date-time" is ASSERTED,
+	# not silently ignored — without it the golden validate cannot catch a timestamp
+	# format drift in the published artifact.
+	npx -p ajv-cli@5.0.0 -p ajv-formats@3.0.1 ajv compile --spec=draft2020 --strict=false -c ajv-formats \
 	  -s contracts/control/control-rpc.schema.json \
 	  -s contracts/exec/exec-channel.schema.json \
 	  -s contracts/storage/mount-config.schema.json \
 	  -s contracts/mcp/mcp-key-set.schema.json
 	# The golden is pinned byte-for-byte to WriteKeySet's output by
 	# TestWriteKeySetMatchesGolden, so validating it against the vendored canon
-	# schema proves the published A2 artifact conforms to the frozen wire.
-	npx ajv-cli@5.0.0 validate --spec=draft2020 --strict=false \
+	# schema proves the published A2 artifact conforms to the frozen wire —
+	# INCLUDING the RFC3339 date-time formats, now that ajv-formats is loaded.
+	npx -p ajv-cli@5.0.0 -p ajv-formats@3.0.1 ajv validate --spec=draft2020 --strict=false -c ajv-formats \
 	  -s contracts/mcp/mcp-key-set.schema.json \
 	  -d internal/mcpkeyset/testdata/mcp-key-set.golden.json
 
@@ -242,4 +246,4 @@ seccomp: ## Assert the embedded Docker seccomp profile matches its pinned digest
 # Those exclusions match CI's own gating model: the plain `test` job also
 # loud-skips the gated legs.
 
-check: fmt vet staticcheck lint deadcode vale spdx contract identity seccomp test ## Full local gate (pre-push)
+check: fmt vet staticcheck lint deadcode vale spdx contract schema identity seccomp test ## Full local gate (pre-push)
