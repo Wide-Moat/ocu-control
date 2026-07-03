@@ -235,10 +235,11 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 	}
 	assertHasAction(t, allEnvs, audit.ActionDestroy)
 
-	// (3) The minted weak Storage-JWT NEVER appears in any emitted audit event. We
-	// mint a token under the SAME host-derived session key the create path used and
-	// grep its raw compact JWT (Reveal) across every captured envelope's bytes.
-	assertNoMintedTokenInEvents(t, ctx, signer, row.Key, allEnvs)
+	// (3) The create-time weak Storage-JWT NEVER appears in any emitted audit event.
+	// We grep the ACTUAL rendered auth_token from the pushed mount-config (the real
+	// credential that flowed at create) across every captured envelope's bytes — not
+	// a fresh re-mint, which would be byte-different and vacuous.
+	assertNoMintedTokenInEvents(t, cfgBytes, allEnvs)
 }
 
 // capturingEventWriter records every ChainEnvelope the OCSF chain sink writes, so the
@@ -392,25 +393,20 @@ func assertHasAction(t *testing.T, envs []ocsf.ChainEnvelope, want audit.Action)
 	t.Fatalf("e2e: no emitted audit event for action %q", want.String())
 }
 
-// assertNoMintedTokenInEvents mints a real weak Storage-JWT under the same
-// host-derived session key the create path used and asserts its raw compact JWT
-// (Reveal) appears in NO captured envelope's bytes — the minted credential never
-// enters the audit path, because no audit.Record field is a cred.Token.
-func assertNoMintedTokenInEvents(t *testing.T, ctx context.Context, signer *cred.Signer, sessionKey string, envs []ocsf.ChainEnvelope) {
+// assertNoMintedTokenInEvents asserts the ACTUAL create-time weak Storage-JWT —
+// the auth_token the create path minted and rendered into the pushed
+// mount-config — appears in NO captured envelope's bytes. It greps the REAL
+// create-time credential (extracted from the pushed config bytes), NOT a fresh
+// re-mint: the signer stamps clk.Now() into iat/exp and folds it into the jti, so
+// a token minted here (seconds after create, post-destroy) is byte-different from
+// the create-time one — a re-mint grep can never match a real leak and is
+// vacuous. Grepping the config's own auth_token closes that: if the create-time
+// credential leaked into any event, this fails.
+func assertNoMintedTokenInEvents(t *testing.T, cfgBytes []byte, envs []ocsf.ChainEnvelope) {
 	t.Helper()
-	tok, err := signer.MintStorageJWT(ctx, cred.StorageMintReq{
-		SessionKey:   sessionKey,
-		FilesystemID: "e2e-fs",
-		Workspace:    "ws",
-		Org:          "org",
-		Authz:        cred.AuthorizationMetadata{Intent: cred.IntentWrite},
-	})
-	if err != nil {
-		t.Fatalf("e2e: mint token for grep: %v", err)
-	}
-	raw := tok.Reveal()
+	raw := authTokenFromMountConfig(t, cfgBytes)
 	if raw == "" {
-		t.Fatal("e2e: minted token revealed empty — grep would be vacuous")
+		t.Fatal("e2e: the pushed mount-config carried no auth_token — the grep would be vacuous")
 	}
 	// The signature segment is the highest-entropy secret slice; grep both the whole
 	// compact JWT and its signature segment across every captured envelope.
@@ -420,12 +416,33 @@ func assertNoMintedTokenInEvents(t *testing.T, ctx context.Context, signer *cred
 	}
 	for _, e := range envs {
 		if bytes.Contains(e.Event, []byte(raw)) {
-			t.Fatalf("e2e: minted JWT leaked into an audit event: %s", e.Event)
+			t.Fatalf("e2e: the create-time weak Storage-JWT leaked into an audit event: %s", e.Event)
 		}
 		if len(sigSeg) > 8 && bytes.Contains(e.Event, []byte(sigSeg)) {
-			t.Fatalf("e2e: minted JWT signature leaked into an audit event: %s", e.Event)
+			t.Fatalf("e2e: the create-time weak Storage-JWT signature leaked into an audit event: %s", e.Event)
 		}
 	}
+}
+
+// authTokenFromMountConfig extracts the rendered weak Bearer (auth_token) from
+// the pushed mount-config bytes — the ACTUAL create-time credential, so the
+// no-leak grep searches for what really flowed, not a byte-different re-mint.
+func authTokenFromMountConfig(t *testing.T, cfgBytes []byte) string {
+	t.Helper()
+	var generic map[string]any
+	if err := json.Unmarshal(cfgBytes, &generic); err != nil {
+		t.Fatalf("e2e: unmarshal pushed mount-config for the auth_token: %v", err)
+	}
+	mounts, ok := generic["mounts"].([]any)
+	if !ok || len(mounts) == 0 {
+		t.Fatalf("e2e: pushed mount-config has no mounts to read the auth_token from: %s", cfgBytes)
+	}
+	m0, ok := mounts[0].(map[string]any)
+	if !ok {
+		t.Fatalf("e2e: pushed mount[0] is not an object: %s", cfgBytes)
+	}
+	tok, _ := m0["auth_token"].(string)
+	return tok
 }
 
 // lastDot returns the index of the last '.' in s, or -1.
