@@ -236,21 +236,20 @@ func serve(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	// The docker finalizer step 3 scrubs the per-session handoff root under the SAME
-	// base the handoff Stager (compose, below) writes under, so the host-owned
-	// credential tree is reclaimed on teardown. The base is a deployment-fixed host
-	// config value, never a per-request body field.
-	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase)
-	if err != nil {
-		return err
-	}
-
 	// Durable audit custody, FAIL-CLOSED at boot: -audit-sink names the append-only
 	// OCSF spine every privileged action is hash-chained into BEFORE it is
 	// acknowledged. A real path is backed by a durable, fsync-on-write file writer; an
 	// unopenable path aborts the daemon here, before any listener binds, rather than
 	// booting with a silently-discarded trail. The single opt-out (=none/=null) is the
 	// NullSink, behind a loud WARN that the trail is non-durable.
+	//
+	// The audit sink is built BEFORE the runtime provider so the provider's teardown
+	// finalizer can record its step-1 revoke outcome against the SAME durable spine
+	// (via the revokeOutcomeAuditor below). This ordering does not touch the
+	// kill-switch-first invariant: that is the Boot sequencer's durable deny posture,
+	// loaded further down (boot.New / seq) and gated on the listener-bind hook — no
+	// listener binds before it, and neither the provider nor the audit sink admits a
+	// create.
 	auditWriter, err := buildAuditWriter(cfg.auditSink)
 	if err != nil {
 		return fmt.Errorf("boot: open audit sink: %w", err)
@@ -268,6 +267,16 @@ func serve(ctx context.Context, cfg config) error {
 	sink, err := buildResumedChainSink(ctx, clk, auditWriter, cfg.auditSink)
 	if err != nil {
 		return fmt.Errorf("boot: resume audit chain: %w", err)
+	}
+
+	// The docker finalizer step 3 scrubs the per-session handoff root under the SAME
+	// base the handoff Stager (compose, below) writes under, so the host-owned
+	// credential tree is reclaimed on teardown. The base is a deployment-fixed host
+	// config value, never a per-request body field. The revokeOutcomeAuditor wires
+	// the finalizer step-1 revoke outcome onto the durable spine as destroy evidence.
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, sink)
+	if err != nil {
+		return err
 	}
 
 	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, sink, cfg)
@@ -971,14 +980,53 @@ func workloadProfileOf(s string) (admission.WorkloadProfile, error) {
 // step 3 scrubs (base/<SessionName>); it is the SAME base the handoff.Stager is
 // constructed with, so teardown re-derives the credential-bearing handoff tree
 // purely from the host-derived SessionName.
-func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, stagerBase string) (runtime.RuntimeProvider, error) {
+// revokeOutcomeAuditor adapts the durable audit sink to the docker.RevokeAuditor
+// seam: it records the teardown finalizer step-1 revoke result as an evidence
+// detail on a destroy record. The revoke outcome is not a distinct privileged
+// action — it is the outcome of a destroy whose ActionDestroy record was already
+// emitted fail-closed on the create/destroy path — so this emits a follow-on
+// destroy record carrying the outcome in metadata.unmapped.revoke_outcome, never a
+// new Action value. The record Key is the bind's host-derived SessionName — the
+// SAME value the primary ActionDestroy record keys on (lifecycle builds both the
+// destroy key and the teardown Sandbox from row.Key), so the evidence and its
+// destroy event join on one CorrelationUID. The FilesystemID (the mount scope the
+// revoke targeted) stays in the warning text and the revoke context; it is never a
+// body hint.
+//
+// A none_bound outcome on a live destroy is an anomaly (a session whose mint was
+// never bound), and this records it AS none_bound — it never skips the emit on
+// none_bound, because the whole point of the evidence is that the anomaly is
+// visible in the tamper-evident spine. An Emit failure here does NOT fail the
+// destroy: the ActionDestroy that authorises the teardown was already recorded
+// fail-closed upstream, and step-1 is idempotent; a lost evidence detail is logged,
+// not escalated to a teardown abort (which would strand the container).
+type revokeOutcomeAuditor struct {
+	sink audit.AuditSink
+}
+
+func (a revokeOutcomeAuditor) RecordRevokeOutcome(ctx context.Context, sess runtime.EgressBinding, outcome runtime.RevokeOutcome) {
+	rec := audit.Record{
+		Action:        audit.ActionDestroy,
+		Key:           string(sess.Name),
+		RevokeOutcome: outcome.String(),
+	}
+	if err := a.sink.Emit(ctx, rec); err != nil {
+		fmt.Fprintln(os.Stderr, "ocu-controld: WARNING: could not record the teardown revoke outcome "+outcome.String()+" for session "+string(sess.Name)+" (mount scope "+sess.FilesystemID+") as destroy evidence: "+err.Error()+" (the destroy was already authorised fail-closed upstream and step-1 is idempotent; only this evidence detail is lost)")
+	}
+}
+
+func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, stagerBase string, sink audit.AuditSink) (runtime.RuntimeProvider, error) {
 	switch name {
 	case "docker":
 		// The shared Revoker is the below-seam finalizer step-1 (revoke session JWT)
 		// target; the same instance the Signer records mints against. StagerBase is the
 		// finalizer step-3 (handoff-root scrub) base — the SAME path the handoff Stager
-		// writes under, so teardown reclaims the host-owned credential tree.
-		p, err := docker.NewDockerProvider(tier, docker.Deps{Revoker: revoker, StagerBase: stagerBase})
+		// writes under, so teardown reclaims the host-owned credential tree. The
+		// RevokeAuditor records the step-1 revoke outcome as destroy evidence; it is
+		// built HERE from the durable sink (never passed pre-wrapped) so the call site
+		// cannot hand the provider a nil auditor — the sink is fail-closed at boot, so
+		// it is always live by the time this runs.
+		p, err := docker.NewDockerProvider(tier, docker.Deps{Revoker: revoker, StagerBase: stagerBase, RevokeAuditor: revokeOutcomeAuditor{sink: sink}})
 		if err != nil {
 			return nil, fmt.Errorf("boot: construct docker provider: %w", err)
 		}
