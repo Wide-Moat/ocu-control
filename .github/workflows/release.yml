@@ -83,7 +83,7 @@ jobs:
   # e2e-gate blocks the release until this tag's own e2e run (e2e.yml also
   # triggers on v* tags) completes green. The real create→destroy capstone —
   # against a real Postgres service AND the real Docker daemon with the
-  # process_api guest image — runs ONLY in e2e.yml's `e2e` job; release.yml's own
+  # guest runtime image — runs ONLY in e2e.yml's `e2e` job; release.yml's own
   # verify step cannot reproduce it (no Postgres service, no OCU_RUNTIME_IT, no
   # guest image) so its `-run 'Integration|E2E'` slice all-skips and proves
   # nothing. Without this wait a red capstone on the tag would NOT block signing

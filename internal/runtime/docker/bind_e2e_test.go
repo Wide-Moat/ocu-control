@@ -18,7 +18,7 @@ import (
 
 // requireBindImage gates the LIVE control-path bind(2) e2e: it requires
 // OCU_RUNTIME_IT_IMAGE to name a guest that actually binds its exec UDS under the
-// provider's hardcoded --listen-uds Cmd (the process_api guest). The default
+// provider's hardcoded --listen-uds Cmd (the sandbox guest exec-server). The default
 // busybox image has no UDS-bind entrypoint, so the hardcoded Cmd would not bind a
 // socket and the bind-proof would be vacuous; rather than fake-green against
 // busybox, the e2e skips cleanly there and runs only where a bind-capable guest
@@ -29,7 +29,7 @@ func requireBindImage(t *testing.T) string {
 	img := os.Getenv("OCU_RUNTIME_IT_IMAGE")
 	if img == "" || img == defaultITImage {
 		t.Skipf("bind e2e: set OCU_RUNTIME_IT_IMAGE to a guest image that binds the "+
-			"exec UDS under the provider Cmd (e.g. process_api); the default %q has no "+
+			"exec UDS under the provider Cmd (the sandbox guest exec-server); the default %q has no "+
 			"UDS-bind entrypoint so the bind-proof would be vacuous — skipping", defaultITImage)
 	}
 	return img

@@ -545,10 +545,11 @@ func itImage() string {
 }
 
 // requireGuestImage gates the create→destroy capstone on a guest image whose
-// ENTRYPOINT is process_api. Materialize builds the provider Cmd as ARGUMENTS to
-// that ENTRYPOINT ([--listen-uds … --auth-public-key …]); the default busybox has
-// no such ENTRYPOINT, so the container would exec `--listen-uds` as argv[0] and
-// die on init, making the lifecycle spine vacuous. The real guest image ships
+// ENTRYPOINT is the sandbox guest exec-server. Materialize builds the provider
+// Cmd as ARGUMENTS to that ENTRYPOINT ([--listen-uds … --auth-public-key …]);
+// the default busybox has no such ENTRYPOINT, so the container would exec
+// `--listen-uds` as argv[0] and die on init, making the lifecycle spine
+// vacuous. The real guest image ships
 // from ocu-sandbox (with the guest-image merge, #47); until OCU_RUNTIME_IT_IMAGE
 // names it, this SKIPS with an explicit reason — a declared skip, not a fake
 // green. Mirrors requireGuestImage in internal/runtime/docker.
@@ -556,7 +557,8 @@ func requireGuestImage(t *testing.T) {
 	t.Helper()
 	img := os.Getenv("OCU_RUNTIME_IT_IMAGE")
 	if img == "" || img == "busybox:latest" {
-		t.Skip("e2e: set OCU_RUNTIME_IT_IMAGE to a process_api-ENTRYPOINT guest image; " +
+		t.Skip("e2e: set OCU_RUNTIME_IT_IMAGE to a guest image whose ENTRYPOINT is " +
+			"the sandbox guest exec-server; " +
 			"the default busybox has no such ENTRYPOINT, so Materialize's flags-as-args " +
 			"Cmd would die on init and the create→destroy spine would be vacuous. The real " +
 			"guest image ships from ocu-sandbox (needs the guest-image merge, #47) — skipping")

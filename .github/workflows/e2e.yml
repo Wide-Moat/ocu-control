@@ -89,17 +89,18 @@ jobs:
           name: ocu-controld
       - name: make the control daemon binary executable
         run: chmod +x ocu-controld
-      # Build the REAL process_api guest image from the ocu-sandbox source via its
+      # Build the REAL guest runtime image from the ocu-sandbox source via its
       # single-source-of-truth composite action, pinned to an immutable main SHA
-      # (NOT a moving branch ref). The action cross-builds the static-musl
-      # process_api, `docker build`s host/guestimage/Dockerfile, loads it locally
-      # as process_api:prod, and asserts the UDS-only posture (verify-posture
+      # (NOT a moving branch ref). The action cross-builds the static-musl guest
+      # exec-server, `docker build`s host/guestimage/Dockerfile, loads it locally
+      # with a :prod tag, and asserts the UDS-only posture (verify-posture
       # defaults true). Its `image` output feeds OCU_RUNTIME_IT_IMAGE on the
-      # lifecycle legs below, so they materialize a container whose ENTRYPOINT IS
-      # process_api — the provider Cmd (flags-as-args) runs as real arguments, the
-      # container binds its sockets against the handoff mounts itSpec stages, and
-      # the three IT legs run their assertions instead of honest-skipping. Pinned
-      # to ocu-sandbox main @6111b8d (#47 guest-image + #50 host/exec landed).
+      # lifecycle legs below, so they materialize a container whose ENTRYPOINT is
+      # the guest exec-server — the provider Cmd (flags-as-args) runs as real
+      # arguments, the container binds its sockets against the handoff mounts
+      # itSpec stages, and the three IT legs run their assertions instead of
+      # honest-skipping. Pinned to ocu-sandbox main @6111b8d (#47 guest-image +
+      # #50 host/exec landed).
       - name: build the production guest image (ocu-sandbox composite, pinned)
         id: guest
         uses: Wide-Moat/ocu-sandbox/.github/actions/build-guest-image@6111b8db705f87896bac458234103628b79959a4 # ocu-sandbox main (#47 + #50)
@@ -144,7 +145,7 @@ jobs:
       - name: run the RuntimeProvider Docker integration leg (real daemon)
         env:
           OCU_RUNTIME_IT: "1"
-          # The process_api-ENTRYPOINT guest image built above. With it set,
+          # The guest-runtime-ENTRYPOINT image built above. With it set,
           # requireGuestImage no longer honest-skips: the 3 lifecycle legs
           # (Materialize / GracefulStop / ForceKill) materialize a real container
           # and run their assertions.
@@ -177,7 +178,7 @@ jobs:
         env:
           OCU_TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/ocu_control_test?sslmode=disable
           OCU_RUNTIME_IT: "1"
-          # The process_api-ENTRYPOINT guest image, so the create→destroy capstone
+          # The guest-runtime-ENTRYPOINT image, so the create→destroy capstone
           # materializes a real container instead of honest-skipping.
           OCU_RUNTIME_IT_IMAGE: ${{ steps.guest.outputs.image }}
         run: go test -run 'TestE2E_CreateDestroy_RealBackends' ./internal/lifecycle/ -v -timeout 600s
