@@ -56,14 +56,14 @@ func itImage() string {
 }
 
 // requireGuestImage gates the lifecycle legs (Materialize / GracefulStop /
-// ForceKill) on a guest image whose ENTRYPOINT is process_api. The provider Cmd
-// is [--listen-uds … --control-listen-uds … --auth-public-key …] — ARGUMENTS to
-// the image ENTRYPOINT, not a standalone executable. The default busybox has no
-// such ENTRYPOINT, so docker would exec `--listen-uds` as argv[0] and the
-// container would die on init before any lifecycle assertion ran — a vacuous
-// run, not a pass. process_api also binds(2) its sockets and loads the key
-// fail-closed at boot, which only succeeds against the real handoff mounts
-// itSpec now stages (CONSTITUTION XI perms).
+// ForceKill) on a guest image whose ENTRYPOINT is the sandbox guest exec-server.
+// The provider Cmd is [--listen-uds … --control-listen-uds … --auth-public-key …]
+// — ARGUMENTS to the image ENTRYPOINT, not a standalone executable. The default
+// busybox has no such ENTRYPOINT, so docker would exec `--listen-uds` as argv[0]
+// and the container would die on init before any lifecycle assertion ran — a
+// vacuous run, not a pass. The guest exec-server also binds(2) its sockets and
+// loads the key fail-closed at boot, which only succeeds against the real
+// handoff mounts itSpec now stages (CONSTITUTION XI perms).
 //
 // The real guest image is built and published from ocu-sandbox; until that image
 // is reachable on the runner (it lands with the sandbox guest-image merge, #47),
@@ -75,7 +75,7 @@ func requireGuestImage(t *testing.T) string {
 	img := os.Getenv("OCU_RUNTIME_IT_IMAGE")
 	if img == "" || img == defaultITImage {
 		t.Skipf("lifecycle e2e: set OCU_RUNTIME_IT_IMAGE to a guest image whose "+
-			"ENTRYPOINT is process_api; the default %q has no such ENTRYPOINT, so the "+
+			"ENTRYPOINT is the sandbox guest exec-server; the default %q has no such ENTRYPOINT, so the "+
 			"provider Cmd (flags-as-args) would exec %q as the binary and the container "+
 			"would die on init — the lifecycle assertion would be vacuous. The real "+
 			"guest image ships from ocu-sandbox (needs the guest-image merge, #47) — "+
@@ -120,12 +120,13 @@ func itSpec(t *testing.T, name runtime.SessionName) runtime.SessionSpec {
 	dir := itStageDir(t)
 
 	// Stage the handoff with the REAL production Stager, not a hand-rolled
-	// MkdirAll/WriteFile. A real-daemon container runs process_api as PID1, which
-	// binds(2) its exec/control sockets under /run/ocu and loads --auth-public-key
-	// fail-closed on boot. With the host umask masking modes (the old 0700 sock dir
-	// and 0600 :ro files), a CapDrop-ALL'd guest — whose userns-remapped uid does
-	// not own the staged files — would EACCES on the socket bind and on the key
-	// read, so the container would exit before any lifecycle assertion ran. The
+	// MkdirAll/WriteFile. A real-daemon container runs the guest exec-server as
+	// PID1, which binds(2) its exec/control sockets under /run/ocu and loads
+	// --auth-public-key fail-closed on boot. With the host umask masking modes
+	// (the old 0700 sock dir and 0600 :ro files), a CapDrop-ALL'd guest — whose
+	// userns-remapped uid does not own the staged files — would EACCES on the
+	// socket bind and on the key read, so the container would exit before any
+	// lifecycle assertion ran. The
 	// Stager sets the load-bearing modes that make the guest viable: the 0777 sock
 	// leaf inside the 0700 root and the 0644 :ro files (CONSTITUTION XI). Using the
 	// production Stager also keeps the IT binds byte-identical to what Materialize
