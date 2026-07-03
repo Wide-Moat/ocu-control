@@ -38,10 +38,17 @@ permissions:
   contents: read
 
 concurrency:
-  # Blocking job: let a superseded run complete its verdict on its own ref rather
-  # than cancelling it (matches the go.yml blocking-job posture).
+  # This is the longest-running blocking gate (six packages of serial
+  # go-mutesting; cred alone is 117 mutants under GOMAXPROCS=1). A superseded-SHA
+  # verdict has NO merge value — the pre-merge gate reads the HEAD SHA's
+  # check-runs only, so a mutation result for a force-pushed-over commit is dead
+  # weight that keeps the concurrency slot for hours and delays the fresh HEAD's
+  # required run. Cancel it. The short blocking jobs (go.yml and kin) keep
+  # cancel-in-progress:false: slot-holding is immaterial when the job is quick, so
+  # letting a superseded short run finish costs nothing and the symmetry churn of
+  # flipping them is not worth it.
   group: mutation-${{ github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   mutation:
