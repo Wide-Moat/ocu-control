@@ -271,11 +271,44 @@ type SessionSpec struct {
 // survives a process restart without any provider state.
 type EgressBinding struct {
 	// Name is the host-derived session identity the route was wired for; the
-	// provider re-derives the substrate route name from it at revoke time.
+	// provider re-derives the substrate route name from it at revoke time. It is
+	// ALSO the key the finalizer step-1 revoke is looked up under (the same
+	// host-derived identity the mint recorded the jti against), never FilesystemID.
 	Name SessionName
 	// FilesystemID is the scope the route was keyed on, dropped on teardown even
 	// if the guest is unresponsive (NFR-SEC-27).
 	FilesystemID string
+}
+
+// RevokeOutcome is the distinct result of a finalizer step-1 revoke, so the
+// teardown can record WHAT happened rather than collapsing "marked dead",
+// "already dead", and "nothing was bound" into one indistinguishable success. It
+// lives in runtime (not cred) so the below-seam docker Revoker port can surface
+// it without the provider importing the whole custody package.
+type RevokeOutcome int
+
+const (
+	// RevokeNoneBound: no jti was bound to the session's bind-key. A satisfied
+	// no-op for the teardown error, but recorded as its own outcome — the
+	// fail-open case a silent success would hide.
+	RevokeNoneBound RevokeOutcome = iota
+	// RevokeMarkedDead: a live jti was found and marked dead by this call.
+	RevokeMarkedDead
+	// RevokeAlreadyDead: the bound jti was already revoked (idempotent re-run).
+	RevokeAlreadyDead
+)
+
+// String renders the outcome as the stable audit label emitted under
+// revoke_outcome.
+func (o RevokeOutcome) String() string {
+	switch o {
+	case RevokeMarkedDead:
+		return "marked_dead"
+	case RevokeAlreadyDead:
+		return "already_dead"
+	default:
+		return "none_bound"
+	}
 }
 
 // Sandbox is the substrate-neutral HANDLE the lifecycle layer holds after a

@@ -99,10 +99,10 @@ func TestUseRevokerNilIsNoOp(t *testing.T) {
 func TestNewRevokerNilClockFallsBackToSystemClock(t *testing.T) {
 	t.Parallel()
 	r := cred.NewRevoker(nil) // nil clock must fall back, not panic
-	const fsID = "fs-nil-clock"
+	const sessionKey = "session-nil-clock"
 	const jti = "jti-nil-clock"
-	r.Record(fsID, jti)
-	if err := r.Revoke(context.Background(), runtime.EgressBinding{FilesystemID: fsID}); err != nil {
+	r.Record(sessionKey, jti)
+	if _, err := r.Revoke(context.Background(), runtime.EgressBinding{Name: runtime.SessionName(sessionKey)}); err != nil {
 		t.Fatalf("Revoke on system-clock revoker = %v, want nil", err)
 	}
 	if !r.IsRevoked(jti) {
