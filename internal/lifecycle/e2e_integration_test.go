@@ -548,20 +548,30 @@ func itImage() string {
 // ENTRYPOINT is the sandbox guest exec-server. Materialize builds the provider
 // Cmd as ARGUMENTS to that ENTRYPOINT ([--listen-uds … --auth-public-key …]);
 // the default busybox has no such ENTRYPOINT, so the container would exec
-// `--listen-uds` as argv[0] and die on init, making the lifecycle spine
-// vacuous. The real guest image ships
-// from ocu-sandbox (with the guest-image merge, #47); until OCU_RUNTIME_IT_IMAGE
-// names it, this SKIPS with an explicit reason — a declared skip, not a fake
-// green. Mirrors requireGuestImage in internal/runtime/docker.
+// `--listen-uds` as argv[0] and die on init, making the lifecycle spine vacuous.
+//
+// It is called (at :68) only AFTER the capstone's env gates skipped the dev path
+// (OCU_TEST_DATABASE_URL and OCU_RUNTIME_IT=1 both required at :61-66), so by the
+// time this runs we are provably in the release-gating context: a real Postgres
+// and a real daemon were declared and the CI job just built the guest image. An
+// empty or busybox OCU_RUNTIME_IT_IMAGE here is therefore a CI misconfiguration
+// (the composite build produced nothing, or the wiring points at the wrong tag),
+// not "no image for local dev" — the dev path already skipped upstream. So this
+// FAILS the capstone rather than skipping it: a broken guest-image build must red
+// the gating job, never pass as a green skip. This mirrors the e2e.yml shell guard
+// PR #33 added and the idx4 postgres Skip→Fatal, both keyed on the same "env
+// present ⇒ gating context" discrimination. Mirrors requireGuestImage in
+// internal/runtime/docker.
 func requireGuestImage(t *testing.T) {
 	t.Helper()
 	img := os.Getenv("OCU_RUNTIME_IT_IMAGE")
 	if img == "" || img == "busybox:latest" {
-		t.Skip("e2e: set OCU_RUNTIME_IT_IMAGE to a guest image whose ENTRYPOINT is " +
-			"the sandbox guest exec-server; " +
-			"the default busybox has no such ENTRYPOINT, so Materialize's flags-as-args " +
-			"Cmd would die on init and the create→destroy spine would be vacuous. The real " +
-			"guest image ships from ocu-sandbox (needs the guest-image merge, #47) — skipping")
+		t.Fatalf("e2e: the gating env is set (OCU_TEST_DATABASE_URL + OCU_RUNTIME_IT=1) but "+
+			"OCU_RUNTIME_IT_IMAGE is %q — a guest image whose ENTRYPOINT is the sandbox guest "+
+			"exec-server was required and the CI job should have built one. The default busybox "+
+			"has no such ENTRYPOINT, so Materialize's flags-as-args Cmd would die on init and the "+
+			"create→destroy spine would be vacuous. This is a broken build/wiring in the gating "+
+			"job, not a dev skip", img)
 	}
 }
 
