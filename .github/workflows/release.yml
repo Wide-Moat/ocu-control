@@ -80,6 +80,64 @@ jobs:
             sleep 20
           done
 
+  # e2e-gate blocks the release until this tag's own e2e run (e2e.yml also
+  # triggers on v* tags) completes green. The real create→destroy capstone —
+  # against a real Postgres service AND the real Docker daemon with the
+  # process_api guest image — runs ONLY in e2e.yml's `e2e` job; release.yml's own
+  # verify step cannot reproduce it (no Postgres service, no OCU_RUNTIME_IT, no
+  # guest image) so its `-run 'Integration|E2E'` slice all-skips and proves
+  # nothing. Without this wait a red capstone on the tag would NOT block signing
+  # or the GHCR push — the release would ship a binary whose lifecycle
+  # invariants (mount-config-before-materialize, OCSF chain linkage, real-daemon
+  # destroy) were never actually exercised. This makes the e2e capstone a
+  # RELEASE BLOCKER, mirroring security-gates. A `skipped` conclusion is NOT
+  # accepted for the e2e job (unlike the security gates, which may legitimately
+  # skip on forks): the release-gating capstone must have RUN, so a skip fails
+  # the gate.
+  e2e-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      checks: read
+      contents: read
+    steps:
+      - name: wait for the e2e workflow's capstone on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # The single release-gating check the e2e workflow publishes on the tag.
+          required="e2e"
+          deadline=$(( $(date +%s) + 2400 ))
+          while :; do
+            runs=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100" \
+              --jq '[.check_runs[] | {name, status, conclusion}]')
+            ok=true
+            for job in $required; do
+              status=$(echo "$runs" | jq -r --arg n "$job" '[.[] | select(.name==$n)] | last | .status // "absent"')
+              concl=$(echo "$runs" | jq -r --arg n "$job" '[.[] | select(.name==$n)] | last | .conclusion // ""')
+              if [ "$status" != "completed" ]; then
+                ok=false
+              elif [ "$concl" = "skipped" ]; then
+                # A skipped capstone is a vacuous pass — the whole point of the
+                # C1 fix. The release-gating e2e MUST have run, never skipped.
+                echo "::error::e2e gate '$job' was SKIPPED on ${GITHUB_SHA} — the release-gating capstone did not run (vacuous); a release must not ship on a skipped e2e"
+                exit 1
+              elif [ "$concl" != "success" ]; then
+                echo "::error::e2e gate '$job' concluded '$concl' on ${GITHUB_SHA}"
+                exit 1
+              fi
+            done
+            if [ "$ok" = true ]; then
+              echo "e2e capstone green on ${GITHUB_SHA}"
+              break
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out waiting for the e2e capstone on ${GITHUB_SHA}"
+              exit 1
+            fi
+            sleep 20
+          done
+
   # verify re-runs the full test suite and the real-binary e2e smoke IN THIS
   # RUN — a release never ships on cached green from an earlier commit.
   verify:
@@ -106,15 +164,31 @@ jobs:
           set -euo pipefail
           CGO_ENABLED=0 go build -trimpath -o ocu-controld ./cmd/ocu-controld
           bash scripts/e2e-smoke.sh ./ocu-controld
-      - name: run the Integration + E2E slice
-        # The e2e helper finds the real daemon via OCU_CONTROL_BIN; without it
-        # every live case t.Skip's (a skip counts as a pass) and this
-        # release-gating slice goes vacuous. The build step above writes the
-        # binary to the workspace root, so point at that absolute path — mirror
-        # the e2e.yml working pattern.
+      - name: run the Integration + E2E slice (real-daemon binary smoke)
+        # This slice runs the OCU_CONTROL_BIN-driven cases against the real
+        # daemon binary built above. It does NOT reproduce the full create→destroy
+        # capstone (that needs a Postgres service + OCU_RUNTIME_IT + the guest
+        # image, which only the e2e.yml `e2e` job provides — the e2e-gate job waits
+        # on it). The real release blocker for the capstone is e2e-gate; this
+        # slice's value is the binary smoke, and it must NOT be silently vacuous:
+        # historically `-run 'Integration|E2E'` matched only the capstone, which
+        # all-skipped here and exited 0 (proving nothing). The -json count below
+        # fails the step if ZERO Integration|E2E tests actually ran, so a slice
+        # that matches nothing (a rename, a regex drift) is a red gate, not a
+        # green vacuum.
         env:
           OCU_CONTROL_BIN: ${{ github.workspace }}/ocu-controld
-        run: go test -run 'Integration|E2E' ./... -v -timeout 600s
+        run: |
+          set -euo pipefail
+          go test -run 'Integration|E2E' ./... -v -timeout 600s -json | tee slice.jsonl
+          ran=$(jq -rs '[.[] | select(.Action=="run" and (.Test != null))] | length' slice.jsonl)
+          skipped=$(jq -rs '[.[] | select(.Action=="skip" and (.Test != null))] | length' slice.jsonl)
+          executed=$(( ran - skipped ))
+          echo "Integration|E2E slice: ${ran} matched, ${skipped} skipped, ${executed} executed"
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::the Integration|E2E slice matched ZERO tests — the -run regex drifted off every test name; this release smoke is vacuous. Fix the regex or the test names."
+            exit 1
+          fi
       - name: upload the release coverage profile
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
@@ -129,7 +203,7 @@ jobs:
   # are pinned to full commit SHAs, never floating tags.
   ghcr-image:
     runs-on: ubuntu-latest
-    needs: [tag-format, security-gates, verify]
+    needs: [tag-format, security-gates, e2e-gate, verify]
     permissions:
       contents: read
       packages: write
@@ -197,7 +271,7 @@ jobs:
   # Runs after image-scan so the image digest is available from ghcr-image.
   sbom-and-sign:
     runs-on: ubuntu-latest
-    needs: [tag-format, security-gates, verify, ghcr-image, image-scan]
+    needs: [tag-format, security-gates, e2e-gate, verify, ghcr-image, image-scan]
     permissions:
       contents: read
       packages: write
@@ -311,7 +385,7 @@ jobs:
 
   release:
     runs-on: ubuntu-latest
-    needs: [tag-format, security-gates, verify, image-scan, sbom-and-sign]
+    needs: [tag-format, security-gates, e2e-gate, verify, image-scan, sbom-and-sign]
     permissions:
       contents: write
     steps:
