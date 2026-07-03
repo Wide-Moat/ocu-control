@@ -85,13 +85,27 @@ func shortSocketPath(t *testing.T) string {
 // exercises the production dial path.
 func startRealOperator(t *testing.T) string {
 	t.Helper()
+	socket, _ := startRealOperatorWithStore(t)
+	return socket
+}
+
+// startRealOperatorWithStore is startRealOperator plus a handle on the SAME
+// mcp-key record store the daemon's engine writes to, so a contract test can
+// re-read a key AFTER driving the shipped revoke path and prove the record was
+// actually flipped to revoked end-to-end — not that the CLI printed the word
+// "revoked" (which the idempotent absent-key no-op also produces). The store is
+// the shipped mcpkey.RecordStore behind the real engine; reading it is reading
+// the contract's post-condition, not a heuristic on stdout.
+func startRealOperatorWithStore(t *testing.T) (string, mcpkey.RecordStore) {
+	t.Helper()
 	socket := shortSocketPath(t)
+	store := mcpkey.NewInMemRecordStore()
 	deps := operator.Deps{
 		Resolver: fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}},
 		Seam:     ingress.NewOperatorSeam(),
 		MCPKeyEngine: mcpkey.NewEngine(
 			mcpkey.NewMinter(),
-			mcpkey.NewInMemRecordStore(),
+			store,
 			func(context.Context) (mcpkey.RenderOutcome, error) { return mcpkey.RenderOutcome{}, nil },
 			state.SystemClock(),
 			audit.NewRecordingFake(),
@@ -127,13 +141,13 @@ func startRealOperator(t *testing.T) string {
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return socket
+				return socket, store
 			}
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("real operator listener did not become ready within the deadline")
-	return ""
+	return "", nil
 }
 
 // fieldFromOutput extracts the value of a "Label : value" line from the CLI's
@@ -163,7 +177,7 @@ func fieldFromOutput(output, label string) string {
 // response rather than a fake one.
 func Test_MCPKey_CreateThenRevoke_AgainstRealDaemon(t *testing.T) {
 	t.Parallel()
-	socket := startRealOperator(t)
+	socket, store := startRealOperatorWithStore(t)
 	ctx := context.Background()
 
 	var out bytes.Buffer
@@ -203,7 +217,30 @@ func Test_MCPKey_CreateThenRevoke_AgainstRealDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mcp-key revoke against the real daemon = %v; want nil", err)
 	}
-	if !strings.Contains(out.String(), "revoked") {
-		t.Errorf("revoke output does not confirm revocation\noutput:\n%s", out.String())
+	// The stdout confirmation is necessary but NOT sufficient: the shipped
+	// idempotent no-op path (revoking an absent key id) also prints "revoked", so
+	// a stdout grep proves neither a durable create nor an actual revocation. The
+	// load-bearing assertion is the REAL contract post-condition — the revoke
+	// invalidated the key in the store end to end:
+	//   (a) re-reading the record shows StatusRevoked, and
+	//   (b) the key is gone from ActiveRecords (the set the gateway boot-loads).
+	// This reads the same store the daemon's engine wrote through, so a revoke
+	// that printed "revoked" but did not flip the record (the fail-open class,
+	// #59/FID-03) is red here.
+	rec, gerr := store.Get(ctx, keyID)
+	if gerr != nil {
+		t.Fatalf("re-read the revoked key %q from the store = %v; want the record present and revoked", keyID, gerr)
+	}
+	if rec.Status != mcpkey.StatusRevoked {
+		t.Errorf("after the shipped revoke path ran, record status = %q, want %q (the revoke did not durably invalidate the key)", rec.Status, mcpkey.StatusRevoked)
+	}
+	active, aerr := store.ActiveRecords(ctx, time.Now())
+	if aerr != nil {
+		t.Fatalf("ActiveRecords after revoke = %v; want nil", aerr)
+	}
+	for _, r := range active {
+		if r.KeyID == keyID {
+			t.Errorf("revoked key %q is STILL in ActiveRecords (the gateway would keep honoring it)", keyID)
+		}
 	}
 }
