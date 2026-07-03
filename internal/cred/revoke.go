@@ -13,15 +13,35 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
-// ErrRevokeUnbound is returned when Revoke is asked for an EgressBinding whose
-// FilesystemID was never recorded at mint. The finalizer treats this as a
-// satisfied no-op (there is no live jti to revoke), so it is wrapped for
-// diagnostics but the teardown path does not fail on it.
-var ErrRevokeUnbound = errors.New("cred: no minted jti bound to that egress filesystem_id")
+// ErrRevokeUnbound is returned when Revoke is asked to revoke a session whose
+// bind-key was never recorded at mint. The finalizer treats this as a satisfied
+// no-op (there is no live jti to revoke), but it is a DISTINCT audited outcome
+// (RevokeNoneBound), never dissolved into a blanket "success" — a revoke that
+// bound nothing is evidence, not silence.
+var ErrRevokeUnbound = errors.New("cred: no minted jti bound to that session bind-key")
+
+// BindKey derives the single index key that BOTH the mint-side Record and the
+// teardown-side Revoke key the revocation index on. It is the ONE derivation both
+// call sites share, so the record-key and the lookup-key are equal BY
+// CONSTRUCTION (compile-time), never by a value collision between two
+// independently chosen keys. The input is the host-derived session identity —
+// the registry key the signer owns at mint and the finalizer re-derives from the
+// session row — NEVER a body-supplied FilesystemID (NFR-SEC-43): the mint scope's
+// FilesystemID is irrelevant to which jti a teardown revokes. Keeping it a named
+// derivation (rather than a bare map access) is what makes a key-drift regression
+// impossible: swap either side off BindKey and the two keys no longer agree, and
+// the drift test goes red.
+func BindKey(sessionKey string) string {
+	// The identity of the host-derived session key IS the bind key; the function
+	// exists so both sides provably route through the same derivation. A future
+	// change to how the index is keyed (namespacing, hashing) changes it HERE, for
+	// both sides at once, and cannot drift them apart.
+	return sessionKey
+}
 
 // Revoker is the host-side reclamation index the below-seam finalizer step-1
 // ("revoke session JWT") calls. It records the jti minted for a session against
-// the session's FilesystemID, so a revoke can mark that jti dead even though the
+// the session's BindKey, so a revoke can mark that jti dead even though the
 // frozen session row does not persist the jti. The JWKS Verifier consults
 // IsRevoked. Every liveness mark is read against the injected monotonic Clock,
 // so a wall-clock setback never un-revokes a dead jti (NFR-SEC-48). The Revoker
@@ -32,7 +52,7 @@ type Revoker struct {
 	mu   sync.Mutex
 	clk  state.Clock
 	dead map[string]time.Time // jti -> monotonic mark of revocation
-	bind map[string]string    // FilesystemID -> jti recorded at mint
+	bind map[string]string    // BindKey(sessionKey) -> jti recorded at mint
 }
 
 // NewRevoker builds an empty Revoker on the injected monotonic Clock. A nil
@@ -50,40 +70,48 @@ func NewRevoker(clk state.Clock) *Revoker {
 	}
 }
 
-// Record indexes the jti against the FilesystemID at mint time, so the finalizer
-// (which receives EgressBinding.FilesystemID) can revoke without the session row
-// carrying the jti. A later Record for the same FilesystemID supersedes the
-// binding — the freshest mint is the one a teardown revokes. Empty inputs are
-// ignored (there is nothing to bind).
-func (r *Revoker) Record(filesystemID, jti string) {
-	if filesystemID == "" || jti == "" {
+// Record indexes the jti against BindKey(sessionKey) at mint time, so the
+// finalizer (which re-derives the same session key from the session row) can
+// revoke without the session row carrying the jti. A later Record for the same
+// session key supersedes the binding — the freshest mint is the one a teardown
+// revokes. Empty inputs are ignored (there is nothing to bind). The FIRST
+// argument is the host-derived session key, NOT a FilesystemID; both call sites
+// route through BindKey so record-key ≡ lookup-key by construction.
+func (r *Revoker) Record(sessionKey, jti string) {
+	if sessionKey == "" || jti == "" {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.bind[filesystemID] = jti
+	r.bind[BindKey(sessionKey)] = jti
 }
 
 // Revoke is the finalizer step-1 effect: mark the session's jti dead, keyed off
-// the EgressBinding the step already holds. It is idempotent — a re-run of the
-// finalizer revokes an already-dead jti without error — and the dead mark is
-// monotonic, stamped from the injected Clock, so a wall-clock setback never
-// resurrects the token. An unrecorded FilesystemID returns ErrRevokeUnbound,
-// which the finalizer treats as a satisfied no-op (nothing live to revoke).
-func (r *Revoker) Revoke(ctx context.Context, bind runtime.EgressBinding) error {
+// the host-derived session identity the EgressBinding.Name already carries — the
+// SAME BindKey the mint recorded under, so the lookup cannot drift from the
+// record. It is idempotent — a re-run revokes an already-dead jti without error —
+// and the dead mark is monotonic, stamped from the injected Clock, so a
+// wall-clock setback never resurrects the token. A session whose bind-key was
+// never recorded returns (RevokeNoneBound, ErrRevokeUnbound): the finalizer
+// treats it as a satisfied no-op BUT audits the none_bound outcome, so a
+// silently-missed revoke leaves evidence. The revoke lookup is keyed on
+// bind.Name (the session identity), never on bind.FilesystemID (a mint scope
+// irrelevant to which jti to revoke).
+func (r *Revoker) Revoke(ctx context.Context, bind runtime.EgressBinding) (runtime.RevokeOutcome, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return runtime.RevokeNoneBound, err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	jti, ok := r.bind[bind.FilesystemID]
+	jti, ok := r.bind[BindKey(string(bind.Name))]
 	if !ok {
-		return ErrRevokeUnbound
+		return runtime.RevokeNoneBound, ErrRevokeUnbound
 	}
-	if _, already := r.dead[jti]; !already {
-		r.dead[jti] = r.clk.Now()
+	if _, already := r.dead[jti]; already {
+		return runtime.RevokeAlreadyDead, nil
 	}
-	return nil
+	r.dead[jti] = r.clk.Now()
+	return runtime.RevokeMarkedDead, nil
 }
 
 // IsRevoked is what the JWKS Verifier consults. A revoked jti is permanently

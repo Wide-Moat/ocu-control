@@ -144,15 +144,32 @@ func (t *teardown) revokeJWT(base context.Context, bind runtime.EgressBinding) e
 	}
 	ctx, cancel := context.WithTimeout(base, stepTimeout)
 	defer cancel()
-	if err := t.p.revoker.Revoke(ctx, bind); err != nil {
+	outcome, err := t.p.revoker.Revoke(ctx, bind)
+	if err != nil {
 		if errors.Is(err, cred.ErrRevokeUnbound) {
 			// No minted jti bound to this session (nothing live to revoke) — a
-			// satisfied no-op, not a finalizer failure.
+			// satisfied no-op for the finalizer error, but a DISTINCT audited
+			// outcome (none_bound), never dissolved into a blanket success: a
+			// revoke that bound nothing is evidence. With BindKey unifying the
+			// record and lookup keys this can only mean a genuinely never-minted
+			// or already-reaped session, not a key drift.
+			t.recordRevokeOutcome(ctx, bind, outcome)
 			return nil
 		}
 		return fmt.Errorf("docker: revoke session jwt: %w", err)
 	}
+	t.recordRevokeOutcome(ctx, bind, outcome)
 	return nil
+}
+
+// recordRevokeOutcome surfaces the step-1 revoke outcome to the audit seam, if
+// one is wired. A nil auditor records nothing (the minimal shelf), exactly as a
+// nil revoker leaves the revoke effect a no-op.
+func (t *teardown) recordRevokeOutcome(ctx context.Context, bind runtime.EgressBinding, outcome runtime.RevokeOutcome) {
+	if t.p.revokeAuditor == nil {
+		return
+	}
+	t.p.revokeAuditor.RecordRevokeOutcome(ctx, bind, outcome)
 }
 
 // dropEgress is finalizer step 2: drop the network-bound egress route host-side

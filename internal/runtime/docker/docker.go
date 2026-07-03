@@ -135,8 +135,23 @@ type ocispecPlatform = ocispec.Platform
 // *cred.Revoker; naming only Revoke keeps the provider depending on the revoke
 // effect, not the whole custody package. A nil Revoker (the Phase-3 minimal shelf)
 // makes step-1 the prior no-op; the step still runs in order.
+//
+// Revoke returns a RevokeOutcome so the finalizer can surface WHAT happened
+// (a jti marked dead, an idempotent already-dead re-run, or none_bound — a
+// revoke that found no binding). none_bound is a satisfied no-op for the teardown
+// error, but it is a distinct outcome the finalizer records via RevokeAuditor,
+// never dissolved into a blanket success.
 type Revoker interface {
-	Revoke(ctx context.Context, bind runtime.EgressBinding) error
+	Revoke(ctx context.Context, bind runtime.EgressBinding) (runtime.RevokeOutcome, error)
+}
+
+// RevokeAuditor is the narrow seam the finalizer step-1 calls to record the
+// revoke outcome as evidence. It is satisfied by the lifecycle audit path; a nil
+// RevokeAuditor (the minimal shelf) records nothing, exactly as a nil Revoker
+// leaves the revoke effect a no-op. Keeping it separate from the Revoker keeps
+// the revoke EFFECT and its AUDIT independently wired.
+type RevokeAuditor interface {
+	RecordRevokeOutcome(ctx context.Context, sess runtime.EgressBinding, outcome runtime.RevokeOutcome)
 }
 
 // Provider is the Docker RuntimeProvider. It holds the SDK behind the dockerAPI
@@ -151,6 +166,11 @@ type Provider struct {
 	// revoker is the below-seam Storage-JWT revocation index finalizer step 1
 	// targets. nil leaves step 1 a host-side no-op (the step still runs in order).
 	revoker Revoker
+	// revokeAuditor records the finalizer step-1 revoke outcome as evidence. nil
+	// records nothing (the minimal shelf), exactly as a nil revoker leaves the
+	// revoke effect a no-op. Kept separate from revoker so the revoke effect and
+	// its audit are independently wired.
+	revokeAuditor RevokeAuditor
 	// stagerBase is the deployment-fixed host directory under which the create-path
 	// handoff stager writes each per-session 0700 root (base/<SessionName>). It is a
 	// PROVIDER CONSTRUCTION value — never a per-request body field (NFR-SEC-43) — so
@@ -179,6 +199,10 @@ type Deps struct {
 	// calls. nil leaves step-1 the prior host-side no-op (the step still runs in
 	// order); the daemon wires the shared *cred.Revoker here.
 	Revoker Revoker
+	// RevokeAuditor records the step-1 revoke outcome (marked_dead / already_dead /
+	// none_bound) as evidence. nil records nothing (the minimal shelf). The daemon
+	// wires the lifecycle audit path here.
+	RevokeAuditor RevokeAuditor
 	// StagerBase is the deployment-fixed host directory under which the create-path
 	// handoff stager writes each per-session 0700 root. The daemon wires the SAME
 	// base it constructs the handoff.Stager with, so finalizer step 3 (zeroTmpfs)
@@ -203,7 +227,7 @@ func NewDockerProvider(tier runtime.RuntimeTier, deps Deps) (*Provider, error) {
 		}
 		api = cli
 	}
-	return &Provider{api: api, tier: tier, revoker: deps.Revoker, stagerBase: deps.StagerBase}, nil
+	return &Provider{api: api, tier: tier, revoker: deps.Revoker, revokeAuditor: deps.RevokeAuditor, stagerBase: deps.StagerBase}, nil
 }
 
 // networkName is the pure function from session name to per-session bridge name,

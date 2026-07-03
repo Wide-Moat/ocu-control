@@ -48,6 +48,20 @@
 # class as the deliberately-unchased quota survivors); they are not chased with
 # over-fitted tests. The floor is floor(measured), to be ratcheted UP as the
 # sampler survivors are genuinely killed.
+#
+# cred (the Storage-JWT mint + the host-side revocation index) is added 2026-07-03
+# at a measured baseline 0.717 (84/117 killed under GOMAXPROCS=1), floored at 0.7.
+# An adversarial self-audit found the mint→record→revoke COMPOSITION was never
+# tested end-to-end: a signer.go key-swap (Record under FilesystemID instead of
+# the session key) shipped GREEN and made kill-switch emergency-revoke a silent
+# no-op (weak Storage-JWT alive after destroy — NFR-SEC-04 revoke-fail-open). The
+# fix unifies the record and lookup keys through cred.BindKey (record-key ≡
+# lookup-key by construction) and adds a composition test driving the real Signer;
+# putting cred under the mutation floor is what keeps the class from returning —
+# a future drift off BindKey is a survivor the floor catches. The remaining
+# survivors are dominated by signer claim-field and base64url arithmetic mutants
+# (equivalent/brittle, the same class as the unchased quota/mcpkey survivors); the
+# floor is floor(measured), ratcheted UP as they are genuinely killed.
 set -euo pipefail
 
 # go-mutesting writes a report.json into the working dir on each run; remove it
@@ -69,6 +83,7 @@ declare -A FLOOR=(
   [quota]=0.8
   [registry]=1.0
   [mcpkey]=0.8
+  [cred]=0.7
 )
 
 # --exec-timeout raises go-mutesting's per-mutant test-run window from its 10s
@@ -115,7 +130,7 @@ declare -A FLOOR=(
 # a gap) at the cost of a slower serial run the 300s window absorbs. This matters
 # more now that mcpkey (83 mutants) enlarges the run.
 fail=0
-for pkg in admission killswitch quota registry mcpkey; do
+for pkg in admission killswitch quota registry mcpkey cred; do
   # GOMAXPROCS=1: serialise the per-mutant go test so a parallelism-sensitive
   # result cannot intermittently mis-score on the job's shared 2 vCPUs (see above).
   out="$(GOMAXPROCS=1 go-mutesting --exec-timeout=300 "./internal/${pkg}/" 2>&1)"

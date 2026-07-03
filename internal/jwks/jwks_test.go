@@ -219,8 +219,11 @@ func TestRevokedTokenFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Verify (to read jti): %v", err)
 	}
-	revoker.Record(claims.FilesystemID, claims.JTI)
-	if err := revoker.Revoke(context.Background(), egressBinding(claims.FilesystemID)); err != nil {
+	// Record under the host-derived session key (the BindKey both sides route
+	// through), the SAME identity egressBinding carries on Egress.Name — not the
+	// FilesystemID (a mount scope irrelevant to the revoke lookup).
+	revoker.Record("sess-key-host-derived", claims.JTI)
+	if _, err := revoker.Revoke(context.Background(), egressBinding(claims.FilesystemID)); err != nil {
 		t.Fatalf("Revoke: %v", err)
 	}
 

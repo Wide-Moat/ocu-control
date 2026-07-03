@@ -20,8 +20,10 @@ var revokeStart = time.Date(2025, time.April, 1, 0, 0, 0, 0, time.UTC)
 // TestTeardownStep1RevokesRecordedJTI proves the canon-fixed finalizer step-1 wires
 // the real revoke: a jti the create-path mint recorded against the host-derived
 // session key is marked dead when the finalizer runs with the Sandbox carrying that
-// key on Egress.FilesystemID. The revoke is keyed off the EgressBinding the step
-// already holds — never a body hint — and the dead mark is monotonic.
+// key on Egress.Name (the host-derived session identity, the BindKey both the mint
+// record and this revoke route through). The revoke is keyed off the EgressBinding
+// the step already holds — never a body hint, never FilesystemID — and the dead
+// mark is monotonic.
 func TestTeardownStep1RevokesRecordedJTI(t *testing.T) {
 	t.Parallel()
 	clk := state.NewFakeClock(revokeStart)
@@ -40,13 +42,14 @@ func TestTeardownStep1RevokesRecordedJTI(t *testing.T) {
 		t.Fatalf("NewDockerProvider: %v", err)
 	}
 
-	// The teardown Sandbox carries the host-derived session key on
-	// Egress.FilesystemID, exactly as lifecycle.Destroy builds it, so step-1 finds
-	// the recorded jti.
+	// The teardown Sandbox carries the host-derived session key on Egress.Name,
+	// exactly as lifecycle.Destroy builds it (Name: SessionName(row.Key)), so
+	// step-1 finds the recorded jti via BindKey. FilesystemID is a DIFFERENT value
+	// (the mount scope) to prove the revoke does not key on it.
 	sess := runtime.Sandbox{
-		Name:      runtime.SessionName("sess-revoke"),
+		Name:      runtime.SessionName(sessionKey),
 		RuntimeID: "ctr-revoke",
-		Egress:    runtime.EgressBinding{Name: runtime.SessionName("sess-revoke"), FilesystemID: sessionKey},
+		Egress:    runtime.EgressBinding{Name: runtime.SessionName(sessionKey), FilesystemID: "some-mount-fs-id"},
 		Tier:      runtime.TierRunc,
 	}
 	if err := p.Teardown().ForceKill(context.Background(), sess); err != nil {
