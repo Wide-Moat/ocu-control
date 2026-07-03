@@ -154,14 +154,23 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
-      - name: trivy filesystem — CRITICAL blocks
+      - name: trivy filesystem — CRITICAL,HIGH blocks
+        # severity CRITICAL,HIGH (not CRITICAL only): the Go ecosystem's NVD/GHSA
+        # advisories are almost entirely HIGH — a firsthand sweep of a dozen
+        # popular vulnerable Go deps (jwt-go auth-bypass, runc, containerd,
+        # consul, gin, yaml.v2) found ALL classified HIGH, ZERO CRITICAL, so a
+        # CRITICAL-only SCA gate is near-vacuous for a Go module: a real HIGH
+        # auth-bypass would ship green. HIGH is the fleet standard. Findings with
+        # no reachable path or no upstream fix are carried, with a rationale and a
+        # review-by date, in .trivyignore — never blanket-suppressed.
         uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8  # v0.36.0
         with:
           scan-type: fs
           scan-ref: .
-          severity: CRITICAL
+          severity: CRITICAL,HIGH
           exit-code: "1"
           ignore-unfixed: "false"
+          trivyignores: .trivyignore
 
   conventional-commits:
     runs-on: ubuntu-latest
