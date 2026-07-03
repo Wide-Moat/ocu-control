@@ -65,21 +65,29 @@ func itImage() string {
 // loads the key fail-closed at boot, which only succeeds against the real
 // handoff mounts itSpec now stages (CONSTITUTION XI perms).
 //
-// The real guest image is built and published from ocu-sandbox; until that image
-// is reachable on the runner (it lands with the sandbox guest-image merge, #47),
-// OCU_RUNTIME_IT_IMAGE is unset and these legs SKIP with this explicit reason —
-// a declared skip, never a fake green. CI wires OCU_RUNTIME_IT_IMAGE to the
-// sandbox-built image once it is in main; locally, the Lima VM provisions it.
+// The real guest image is built and published from ocu-sandbox. requireGuestImage
+// is ALWAYS reached after requireIT, which skips unless OCU_RUNTIME_IT=1, so by the
+// time this runs we are provably in the gating context: a real daemon was declared
+// and the CI job just built the guest image. An empty or busybox OCU_RUNTIME_IT_IMAGE
+// here is therefore NOT "no image for local dev" — the dev path already skipped in
+// requireIT — it is a CI misconfiguration (the composite build produced nothing, or
+// the wiring points at the wrong tag), which would make the lifecycle assertion
+// vacuous. So this FAILS the test rather than skipping it: a broken guest-image build
+// must red the gating job, never pass as a green skip. This mirrors the e2e.yml
+// shell guard PR #33 added (assert steps.guest.outputs.image non-empty+non-busybox)
+// and the idx4 postgres Skip→Fatal, both keyed on the same "env present ⇒ gating
+// context" discrimination. The dev loop (OCU_RUNTIME_IT unset) is untouched: it skips
+// earlier in requireIT and never reaches this line.
 func requireGuestImage(t *testing.T) string {
 	t.Helper()
 	img := os.Getenv("OCU_RUNTIME_IT_IMAGE")
 	if img == "" || img == defaultITImage {
-		t.Skipf("lifecycle e2e: set OCU_RUNTIME_IT_IMAGE to a guest image whose "+
-			"ENTRYPOINT is the sandbox guest exec-server; the default %q has no such ENTRYPOINT, so the "+
-			"provider Cmd (flags-as-args) would exec %q as the binary and the container "+
-			"would die on init — the lifecycle assertion would be vacuous. The real "+
-			"guest image ships from ocu-sandbox (needs the guest-image merge, #47) — "+
-			"skipping until it is reachable on this runner", defaultITImage, "--listen-uds")
+		t.Fatalf("lifecycle e2e: OCU_RUNTIME_IT=1 (gating context) but OCU_RUNTIME_IT_IMAGE is %q — "+
+			"a guest image whose ENTRYPOINT is the sandbox guest exec-server was required and the "+
+			"CI job should have built one. The default %q has no such ENTRYPOINT, so the provider Cmd "+
+			"(flags-as-args) would exec %q as the binary and the container would die on init, making the "+
+			"lifecycle assertion vacuous. This is a broken build/wiring in the gating job, not a dev skip",
+			img, defaultITImage, "--listen-uds")
 	}
 	return img
 }
