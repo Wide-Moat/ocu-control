@@ -1,0 +1,34 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# trivy SCA exceptions. The gate runs at severity CRITICAL,HIGH (see
+# .github/workflows/security.yml); this file carries the HIGH findings that are
+# surfaced-but-not-yet-actioned, EACH with a rationale and a review-by date. It
+# is an EXCEPTION LEDGER, never a blanket suppressor: an entry that outlives its
+# rationale is a finding, not a waiver.
+#
+# All three below are docker/docker@v28.5.2+incompatible — the Docker Engine SDK
+# is a build-time dependency of the RuntimeProvider (reached via Materialize ->
+# docker-SDK). They are the same reachable docker advisories the govulncheck
+# waiver already tracks (scripts/govulncheck-waiver.sh, issue #6); this ledger
+# keeps the trivy view aligned with that one.
+#
+# REVIEW-BY: 2026-07-17 (14 days from the 2026-07-03 triage). Past this date each
+# entry must be re-confirmed (still affected? fix landed? still the only SDK?) or
+# removed. CVE-2026-34040 has an upstream fix and is a bump candidate, NOT a
+# standing waiver — it must be cleared by bumping docker, not renewed.
+
+# CVE-2026-34040 — Moby authorization-bypass. status: FIXED in docker 29.3.1.
+# ACTION: bump github.com/docker/docker to >=29.3.1 and DELETE this line. This is
+# a bump candidate held only for the 14-day window, not a no-fix waiver.
+CVE-2026-34040
+
+# CVE-2026-41567 — Moby/Docker Engine arbitrary code execution. status: affected,
+# Fixed-in = none. No upstream fix at v28.5.2; reachable via RuntimeProvider ->
+# docker-SDK, no alternative SDK tracked at this version (mirrors the govulncheck
+# waiver rationale).
+CVE-2026-41567
+
+# CVE-2026-42306 — Moby container-framework advisory. status: affected,
+# Fixed-in = none. Same no-upstream-fix, reachable-docker-SDK rationale as above.
+CVE-2026-42306
