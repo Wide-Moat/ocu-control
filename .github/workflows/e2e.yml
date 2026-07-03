@@ -105,6 +105,22 @@ jobs:
         uses: Wide-Moat/ocu-sandbox/.github/actions/build-guest-image@6111b8db705f87896bac458234103628b79959a4 # ocu-sandbox main (#47 + #50)
         with:
           tag: prod
+      - name: assert the guest image built (non-empty) — a silent build fail must not vacuously skip the legs
+        # requireGuestImage in the capstone SKIPS on an unset/busybox
+        # OCU_RUNTIME_IT_IMAGE — legitimate for local dev where the image is
+        # absent, but INSIDE this gating job the image is BUILT above, so an empty
+        # steps.guest.outputs.image means the composite silently produced nothing.
+        # Left unchecked, the lifecycle legs below would honest-skip and the job
+        # would go green having exercised nothing (the idx8 vacuity). Fail loud
+        # here so a broken guest-image build is a red gating job, not a green skip.
+        run: |
+          set -euo pipefail
+          img="${{ steps.guest.outputs.image }}"
+          if [ -z "$img" ] || [ "$img" = "busybox:latest" ]; then
+            echo "::error::the guest-image build produced an empty/placeholder image (%q) — the lifecycle legs would vacuously skip; failing the gating job"
+            exit 1
+          fi
+          echo "guest image built: $img"
       - name: smoke — the real daemon refuses bad invocations pre-bind
         # All four pre-bind refusals (missing required flag, unknown
         # runtime-tier, unknown runtime-provider, create-before-bind naming
