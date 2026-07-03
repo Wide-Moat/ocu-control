@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -76,23 +78,38 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 	// product concern: the kill-switch-first refusal itself is proven elsewhere.
 	store, err := postgres.Open(ctx, dsn, clk)
 	if err != nil {
-		t.Skipf("e2e: Postgres not reachable (%v) — skipping", err)
+		// FATAL, not skip: control only reaches here after BOTH env gates passed
+		// (OCU_TEST_DATABASE_URL set at :59, OCU_RUNTIME_IT=1 at :63), so we are
+		// provably in the release-gating context — a real Postgres was declared
+		// present. A postgres.Open failure now means broken infra (the service did
+		// not come up, a bad DSN), NOT "no backend for local dev" — a t.Skip here
+		// would turn a broken gating job into a green skip that the release e2e-gate
+		// passes (a job-level SUCCESS, not a job-level skip), masking a capstone that
+		// never ran. The dev-loop stays intact: with the env unset the run already
+		// skipped at :61, never reaching this line.
+		t.Fatalf("e2e: Postgres unreachable in the gating context (both env set) — broken infra, not a dev skip: %v", err)
 	}
 	t.Cleanup(func() { _ = closeStore(store) })
 	if err := store.ClearDeny(ctx, state.ScopeGlobal, ""); err != nil {
 		t.Fatalf("e2e: clear stale global kill-switch: %v", err)
 	}
 
-	// REAL Docker provider at the trusted_operator×runc admit cell.
-	dockerProvider, err := docker.NewDockerProvider(runtime.TierRunc, docker.Deps{})
+	// A real cred.Signer over a freshly generated key mints the weak Storage-JWT and
+	// records the minted jti against its host-derived session key on the shared
+	// Revoker; the capturing Pusher lands the rendered config on the real host-owned
+	// bind so the Phase-4 render+push stage actually fires (a nil Signer/Push would
+	// no-op it).
+	signer, revoker := newTestSigner(t, clk)
+
+	// REAL Docker provider at the trusted_operator×runc admit cell, wired with the
+	// SAME Revoker the signer records against — so finalizer step-1 (revoke session
+	// JWT) actually runs on destroy instead of the nil-Revoker host-side no-op. This
+	// is what lets the capstone PROVE the teardown revoked the credential, not just
+	// that the row tombstoned.
+	dockerProvider, err := docker.NewDockerProvider(runtime.TierRunc, docker.Deps{Revoker: revoker})
 	if err != nil {
 		t.Fatalf("e2e: NewDockerProvider: %v", err)
 	}
-
-	// A real cred.Signer over a freshly generated key mints the weak Storage-JWT; the
-	// capturing Pusher lands the rendered config on the real host-owned bind so the
-	// Phase-4 render+push stage actually fires (a nil Signer/Push would no-op it).
-	signer, _ := newTestSigner(t, clk)
 	pusher := newCapturingPusher()
 	// orderingProvider wraps the real Docker provider to record, at the instant
 	// Materialize is first called, that the mount-config push already happened and
@@ -221,6 +238,20 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 	}
 	if after.State != state.StateReleased {
 		t.Fatalf("e2e: post-destroy row state = %v, want RELEASED (tombstone)", after.State)
+	}
+
+	// TEARDOWN RESIDUE: the row tombstone alone does not prove the finalizer's
+	// host-side effects ran. Prove the credential was REVOKED: re-running the revoke
+	// on the same host-derived binding must report already_dead — the destroy
+	// finalizer's step-1 already marked this session's minted jti dead. A none_bound
+	// (never recorded) or marked_dead (this call was the FIRST revoke — destroy did
+	// not revoke) both fail, so a destroy that skipped the revoke is red here.
+	outcome, rerr := revoker.Revoke(ctx, runtime.EgressBinding{Name: runtime.SessionName(row.Key), FilesystemID: "e2e-fs"})
+	if rerr != nil {
+		t.Fatalf("e2e: re-revoke after destroy = %v, want nil (the binding must still resolve)", rerr)
+	}
+	if outcome != runtime.RevokeAlreadyDead {
+		t.Fatalf("e2e: post-destroy revoke outcome = %v, want RevokeAlreadyDead — the destroy finalizer did not revoke the session JWT (host-side teardown residue)", outcome)
 	}
 
 	// A chain-linked OCSF audit event was emitted for destroy; the full spine still
@@ -359,6 +390,12 @@ func assertMountConfigShape(t *testing.T, cfgBytes []byte) {
 	if tok == "" {
 		t.Fatal("e2e: pushed mount-config carries no weak auth_token (Bearer)")
 	}
+	// PRESENCE is not enough: a token minted under the wrong scope (or a body-hint
+	// placeholder that surfaced) is a non-empty string that a presence-only check
+	// waves through. Decode the JWT payload and assert the credential is scoped to
+	// THIS session's filesystem_id — so a mint under the wrong FilesystemID
+	// (stages.go rendering the wrong scope) is red here.
+	assertAuthTokenScopedTo(t, tok, "e2e-fs")
 	// No backend filestore credential field may appear anywhere in the config: the
 	// mount runs in-guest and exchanges the weak JWT for the real credential there.
 	for _, forbidden := range []string{
@@ -368,6 +405,32 @@ func assertMountConfigShape(t *testing.T, cfgBytes []byte) {
 		if bytes.Contains(cfgBytes, []byte(forbidden)) {
 			t.Fatalf("e2e: pushed mount-config carries a backend credential field %q: %s", forbidden, cfgBytes)
 		}
+	}
+}
+
+// assertAuthTokenScopedTo decodes the compact JWT's payload and asserts its
+// filesystem_id claim equals wantFilesystemID — proving the rendered auth_token
+// is the real minted credential scoped to THIS session, not merely a non-empty
+// string. It reads the payload only (no signature verify): the point is to pin
+// the VALUE the mount-config carried, so a wrong-scope mint is caught.
+func assertAuthTokenScopedTo(t *testing.T, compact, wantFilesystemID string) {
+	t.Helper()
+	parts := strings.Split(compact, ".")
+	if len(parts) != 3 {
+		t.Fatalf("e2e: auth_token is not a compact JWT (got %d segments): %q", len(parts), compact)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("e2e: decode auth_token payload: %v", err)
+	}
+	var claims struct {
+		FilesystemID string `json:"filesystem_id"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatalf("e2e: unmarshal auth_token claims: %v", err)
+	}
+	if claims.FilesystemID != wantFilesystemID {
+		t.Fatalf("e2e: auth_token filesystem_id = %q, want %q (the mint rendered the wrong scope)", claims.FilesystemID, wantFilesystemID)
 	}
 }
 
