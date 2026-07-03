@@ -141,6 +141,16 @@ type Record struct {
 	// Reason is the operator-supplied reason text for a revoke or override. It is
 	// free-form context for the trail, never part of any authority decision.
 	Reason string
+	// RevokeOutcome is an OPTIONAL evidence detail on a destroy record: the result
+	// of the teardown finalizer's step-1 Storage-JWT revoke ("marked_dead",
+	// "already_dead", or "none_bound"). It is empty on every record that is not a
+	// destroy carrying a recorded revoke outcome — an EMPTY value means the revoke
+	// step was not run or not recorded, which is semantically distinct from the
+	// "none_bound" outcome (a revoke that ran and bound nothing). It is trail
+	// evidence, never an authority-decision input; the OCSF serializer carries it
+	// in metadata.unmapped.revoke_outcome behind omitempty so a record without it
+	// is byte-identical to before this field existed.
+	RevokeOutcome string
 }
 
 // ErrAuditWriteFailed is the fail-closed evidence: a privileged action MUST be

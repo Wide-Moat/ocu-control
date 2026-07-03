@@ -111,11 +111,20 @@ type Product struct {
 }
 
 // Unmapped carries the control-plane fields that have no first-class OCSF slot: the
-// action label and the operator-supplied reason text. Reason is free-form trail
-// context, never part of any authority decision. Neither field is ever a token.
+// action label, the operator-supplied reason text, and — on a destroy record only —
+// the teardown revoke outcome. Reason is free-form trail context, never part of any
+// authority decision. None of these fields is ever a token.
+//
+// RevokeOutcome is additive and OPTIONAL (omitempty): the finalizer step-1 revoke
+// result ("marked_dead" / "already_dead" / "none_bound") on a destroy record, empty
+// everywhere else. Like ChainBreak below, omitempty keeps the canonical payload of
+// every event that does not carry it byte-identical to before the field existed, so
+// the chain hash of all pre-existing event kinds is unchanged (proven by
+// TestUnmappedRevokeOutcomeOmittedIsByteIdentical).
 type Unmapped struct {
-	Action string `json:"action"`
-	Reason string `json:"reason"`
+	Action        string `json:"action"`
+	Reason        string `json:"reason"`
+	RevokeOutcome string `json:"revoke_outcome,omitempty"`
 }
 
 // Metadata is the OCSF metadata object: the product, the OCSF schema version, the
@@ -283,8 +292,9 @@ func buildEvent(clk state.Clock, rec audit.Record) OCSFEvent {
 			LogProvider:    productName,
 			CorrelationUID: rec.Key,
 			Unmapped: Unmapped{
-				Action: rec.Action.String(),
-				Reason: rec.Reason,
+				Action:        rec.Action.String(),
+				Reason:        rec.Reason,
+				RevokeOutcome: rec.RevokeOutcome,
 			},
 		},
 	}

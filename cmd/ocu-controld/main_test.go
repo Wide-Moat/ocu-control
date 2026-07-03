@@ -265,11 +265,16 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 	if err != nil {
 		t.Fatalf("buildSigner: %v", err)
 	}
-	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase)
+	// providerOf builds the docker provider's RevokeAuditor from the durable sink,
+	// exactly as serve() does — the sink is built before the provider so the same
+	// spine carries the teardown revoke evidence. This composition test does not
+	// exercise that evidence, but it passes the real sink so the wiring path is the
+	// production one.
+	sink := ocsf.NewChainSink(clk, nullCloser{}, "control")
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, sink)
 	if err != nil {
 		t.Fatalf("providerOf: %v", err)
 	}
-	sink := ocsf.NewChainSink(clk, nullCloser{}, "control")
 	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, sink, cfg)
 	seam := ingress.NewOperatorSeam()
 	seq := boot.New(store, clk)
