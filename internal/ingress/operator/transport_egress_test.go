@@ -97,3 +97,26 @@ func TestOperatorTransportCreateEgressSmuggledFieldRefused(t *testing.T) {
 		t.Fatalf("Materialize called %d times on a refused create; want 0", n)
 	}
 }
+
+// TestOperatorTransportCreateRejectsControlPubKey pins the custody keystone: the
+// wire create body has NO control_pub_key field — the guest verify key is
+// deployment-fixed (host-derived), never a request hint (NFR-SEC-43). A body
+// smuggling control_pub_key is refused 400 by the strict decoder, the provider
+// never called.
+func TestOperatorTransportCreateRejectsControlPubKey(t *testing.T) {
+	t.Parallel()
+	spy := &specRecordingProvider{}
+	client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
+
+	code, _ := postForText(t, client, "/v1alpha/sessions", map[string]any{
+		"session_hint":    "smuggle-verifykey",
+		"image":           "img",
+		"control_pub_key": make([]byte, 32),
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("create smuggling control_pub_key = %d; want 400 (verify key is not a wire field)", code)
+	}
+	if n := len(spy.captured()); n != 0 {
+		t.Fatalf("Materialize called %d times on a refused create; want 0", n)
+	}
+}

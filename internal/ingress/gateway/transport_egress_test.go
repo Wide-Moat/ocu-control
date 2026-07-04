@@ -72,3 +72,26 @@ func TestGatewayTransportCreateEgressSmuggledFieldRefused(t *testing.T) {
 		t.Fatalf("Materialize called %d times on a refused create; want 0", n)
 	}
 }
+
+// TestGatewayTransportCreateRejectsControlPubKey pins the custody keystone on the
+// gateway plane: the frozen-proto-conformant create body has NO control_pub_key
+// field. A smuggled control_pub_key is refused 400 by the strict decoder, the
+// provider never called.
+func TestGatewayTransportCreateRejectsControlPubKey(t *testing.T) {
+	t.Parallel()
+	pair := newMTLSPair(t, "acme", "worker-7")
+	spy := &specRecordingProvider{}
+	addr, client := boundGatewayWithProvider(t, pair, spy)
+
+	code, _ := gwPostText(t, client, addr, "/v1alpha/sessions", map[string]any{
+		"session_hint":    "smuggle-verifykey-mtls",
+		"image":           "img",
+		"control_pub_key": make([]byte, 32),
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("create smuggling control_pub_key = %d; want 400 (verify key is not a wire field)", code)
+	}
+	if n := len(spy.captured()); n != 0 {
+		t.Fatalf("Materialize called %d times on a refused create; want 0", n)
+	}
+}
