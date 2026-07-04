@@ -64,6 +64,14 @@ type harness struct {
 // recording fake, and a generous quota gate at the trusted_operator×runc admit cell.
 func newHarness(t *testing.T) *harness {
 	t.Helper()
+	return newHarnessWithExec(t, nil)
+}
+
+// newHarnessWithExec builds the same harness as newHarness but wires an exec
+// driver through ManagerDeps. A nil driver yields the plain harness (Exec then
+// fail-closes), so newHarness delegates here.
+func newHarnessWithExec(t *testing.T, execDriver lifecycle.ExecDriver) *harness {
+	t.Helper()
 	clk := state.NewFakeClock(lifeStart)
 	inner := state.NewInMemory(clk)
 	store := newListerStore(inner)
@@ -74,14 +82,15 @@ func newHarness(t *testing.T) *harness {
 	gate := quota.NewGate(store, clk, generousLimits())
 
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: cust,
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   stager,
-		Audit:     sink,
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
+		Custodian:  cust,
+		Provider:   provider,
+		Clock:      clk,
+		Quota:      gate,
+		Handoff:    stager,
+		Audit:      sink,
+		Profile:    admission.ProfileTrustedOperator,
+		Tier:       runtime.TierRunc,
+		ExecDriver: execDriver,
 	})
 	return &harness{
 		mgr:      mgr,

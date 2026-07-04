@@ -155,6 +155,11 @@ type ManagerDeps struct {
 	// control-RPC wire) makes the dial a clean no-op.
 	ControlDialer ControlDialer
 
+	// ExecDriver is the guest exec-channel driver (ADR-0024) the gateway exec verb
+	// routes through. A nil ExecDriver (a deployment without the exec channel, or
+	// the minimal shelf) makes Exec a fail-closed refusal.
+	ExecDriver ExecDriver
+
 	// Metrics is the OBSERVABILITY recorder the Manager increments on a successful
 	// create/destroy and observes the reserved->active start duration into for the
 	// admin /metrics surface. It is purely observational and NON-FATAL: a nil
@@ -242,6 +247,10 @@ type Manager struct {
 	// before the authoritative finalizer. nil is a clean no-op.
 	controlDialer ControlDialer
 
+	// execDriver is the guest exec-channel driver the gateway exec verb routes
+	// through. nil makes Exec a fail-closed refusal.
+	execDriver ExecDriver
+
 	// metrics is the non-fatal observability recorder. nil is a clean no-op (every
 	// call site guards on it), so the base pipeline runs without an exporter wired.
 	metrics Recorder
@@ -273,6 +282,7 @@ func NewManager(deps ManagerDeps) *Manager {
 		mountDefaults: deps.MountDefaults,
 		storageScope:  deps.StorageScope,
 		controlDialer: deps.ControlDialer,
+		execDriver:    deps.ExecDriver,
 		metrics:       deps.Metrics,
 		events:        deps.Events,
 	}
