@@ -298,11 +298,10 @@ type execResponse struct {
 // fields are HINTS; the host-attested caller is derived from the verified SAN,
 // never the body (NFR-SEC-43).
 type createBody struct {
-	SessionHint   string            `json:"session_hint"`
-	Image         string            `json:"image"`
-	ControlPubKey []byte            `json:"control_pub_key"`
-	MountIntent   *mountIntentBody  `json:"mount_intent"`
-	EgressPolicy  *egressPolicyBody `json:"egress_policy"`
+	SessionHint  string            `json:"session_hint"`
+	Image        string            `json:"image"`
+	MountIntent  *mountIntentBody  `json:"mount_intent"`
+	EgressPolicy *egressPolicyBody `json:"egress_policy"`
 }
 
 // egressPolicyBody is the wire shape of the per-session egress trust-edge policy,
@@ -369,9 +368,8 @@ func (m *mountIntentBody) validate() error {
 // from the wire (custody).
 func (b createBody) toRequest() (CreateRequest, error) {
 	req := CreateRequest{
-		SessionHint:   b.SessionHint,
-		Image:         b.Image,
-		ControlPubKey: b.ControlPubKey,
+		SessionHint: b.SessionHint,
+		Image:       b.Image,
 	}
 	if b.EgressPolicy != nil {
 		req.Egress = runtime.EgressPolicy{

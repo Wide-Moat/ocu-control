@@ -264,43 +264,13 @@ func (s *Signer) MintStorageJWT(ctx context.Context, req StorageMintReq) (Token,
 	return tok, nil
 }
 
-// execClaims is the per-dial exec JWT body: the host-attested container subject,
-// provisional iss/aud, and a clamped exp.
-type execClaims struct {
-	Issuer       string `json:"iss"`
-	Audience     string `json:"aud"`
-	Subject      string `json:"sub"`
-	IssuedAtUnix int64  `json:"iat"`
-	ExpiryUnix   int64  `json:"exp"`
-}
-
-// MintExecJWT mints the per-dial, container-bound exec JWT: sub is the
-// host-attested ContainerName, and exp is clk.Now() plus min(RequestedTTL,
-// execMaxTTL) — a longer requested TTL is CLAMPED down, never honored. A
-// non-positive RequestedTTL is treated as the ceiling so the advisory dial
-// always carries a usable token. The signing seed never enters the guest; the
-// guest receives only this compact token.
-func (s *Signer) MintExecJWT(ctx context.Context, req ExecMintReq) (Token, error) {
-	if err := ctx.Err(); err != nil {
-		return Token{}, err
-	}
-	if req.ContainerName == "" {
-		return Token{}, fmt.Errorf("%w: empty container_name", ErrMintIdentity)
-	}
-	ttl := req.RequestedTTL
-	if ttl <= 0 || ttl > execMaxTTL {
-		ttl = execMaxTTL
-	}
-	now := s.clk.Now()
-	claims := execClaims{
-		Issuer:       s.cfg.ExecIssuer,
-		Audience:     s.cfg.ExecAudience,
-		Subject:      req.ContainerName,
-		IssuedAtUnix: now.Unix(),
-		ExpiryUnix:   now.Add(ttl).Unix(),
-	}
-	return s.sign(claims)
-}
+// The per-dial, container-bound exec JWT is NO LONGER minted here. It is minted
+// by *ExecSigner (execsigner.go) under a SEPARATE deployment-wide exec key
+// (ADR-0013 key separation), in the keyless {sub,iat,exp} EdDSA shape the guest
+// verifies — the storage keyring this Signer holds is the wrong key for the exec
+// channel and its kid/aud-bearing shape trips the guest's verifier. The narrow
+// execMinter seam the guestexec driver and the control-RPC dialer depend on is
+// now satisfied by *ExecSigner, not *Signer.
 
 // sign serializes claims into a compact JWS under the active key, sets the kid
 // header, and wraps the result in a Token. It is the single signing chokepoint

@@ -133,14 +133,15 @@ func gatewayDepsFor(t *testing.T, tlsConfig *tls.Config) gateway.Deps {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 16, CreateRatePerCallerPerMin: 16})
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  nopProvider{},
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     audit.NewRecordingFake(),
-		Profile:   0, // ProfileTrustedOperator (admits on runc)
-		Tier:      runtime.TierRunc,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       0, // ProfileTrustedOperator (admits on runc)
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	return gateway.Deps{Manager: mgr, TLSConfig: tlsConfig}
 }
@@ -239,9 +240,8 @@ func TestGatewayTransportCreateStatusDestroy(t *testing.T) {
 	addr, client := boundGateway(t, pair)
 
 	code, body := gwPost(t, client, addr, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "mtls-session",
-		"image":           "registry.example/ocu-sandbox:v1",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "mtls-session",
+		"image":        "registry.example/ocu-sandbox:v1",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create over mTLS = %d; want 201", code)

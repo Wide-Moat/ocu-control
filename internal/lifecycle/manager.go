@@ -33,6 +33,7 @@ package lifecycle
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -93,10 +94,6 @@ type CreateInput struct {
 	Egress runtime.EgressPolicy
 	// Resources are the hard caps the provider stamps onto the runtime.
 	Resources runtime.ResourceCaps
-	// ControlPubKey is the raw 32-byte Ed25519 PUBLIC key the handoff stages for the
-	// guest to verify host-signed control-RPC frames. The host mints it; a non-32-byte
-	// value fails the create closed at the stageHandoff stage.
-	ControlPubKey []byte
 }
 
 // ManagerDeps are the collaborators the stages call. Profile and Tier are
@@ -159,6 +156,16 @@ type ManagerDeps struct {
 	// routes through. A nil ExecDriver (a deployment without the exec channel, or
 	// the minimal shelf) makes Exec a fail-closed refusal.
 	ExecDriver ExecDriver
+
+	// ExecVerifyKey is the DEPLOYMENT-FIXED raw 32-byte Ed25519 PUBLIC key the guest
+	// verifies host-signed exec/control frames against — the public half of the
+	// separate exec signing key (ADR-0013). It is host-derived deployment config,
+	// never a request-body hint (NFR-SEC-43: the verify key decides who counts as
+	// the host, so the caller cannot supply it). The Manager stages it as the
+	// guest's --auth-public-key file on every create. A nil key means the exec
+	// channel is disabled; a scoped create still boots for the storage leg with no
+	// verify key staged.
+	ExecVerifyKey ed25519.PublicKey
 
 	// Metrics is the OBSERVABILITY recorder the Manager increments on a successful
 	// create/destroy and observes the reserved->active start duration into for the
@@ -251,6 +258,10 @@ type Manager struct {
 	// through. nil makes Exec a fail-closed refusal.
 	execDriver ExecDriver
 
+	// execVerifyKey is the deployment-fixed guest verify key staged on every create
+	// (host-derived, never a body hint). nil disables the exec channel.
+	execVerifyKey ed25519.PublicKey
+
 	// metrics is the non-fatal observability recorder. nil is a clean no-op (every
 	// call site guards on it), so the base pipeline runs without an exporter wired.
 	metrics Recorder
@@ -283,6 +294,7 @@ func NewManager(deps ManagerDeps) *Manager {
 		storageScope:  deps.StorageScope,
 		controlDialer: deps.ControlDialer,
 		execDriver:    deps.ExecDriver,
+		execVerifyKey: deps.ExecVerifyKey,
 		metrics:       deps.Metrics,
 		events:        deps.Events,
 	}

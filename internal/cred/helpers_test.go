@@ -23,6 +23,18 @@ import (
 // runs are reproducible and a setback is expressed relative to it.
 var testStart = time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
 
+// newTestExecSigner builds an ExecSigner over a fresh exec Ed25519 key and returns
+// it with the matching public half (the value the handoff would stage as the
+// guest verify key), so a test can mint and verify an exec JWT.
+func newTestExecSigner(t *testing.T) (*cred.ExecSigner, ed25519.PublicKey) {
+	t.Helper()
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate exec key: %v", err)
+	}
+	return cred.NewExecSigner(priv), pub
+}
+
 // keyMountTB is the testing.TB subset writeKeyMount needs, so both *testing.T
 // and *rapid.T (via rapidTB) can drive it.
 type keyMountTB interface {

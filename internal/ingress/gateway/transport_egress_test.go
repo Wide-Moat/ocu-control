@@ -22,9 +22,8 @@ func TestGatewayTransportCreateCarriesEgressPolicy(t *testing.T) {
 	addr, client := boundGatewayWithProvider(t, pair, spy)
 
 	code, body := gwPostText(t, client, addr, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "egress-mtls",
-		"image":           "registry.example/ocu-sandbox:v1",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "egress-mtls",
+		"image":        "registry.example/ocu-sandbox:v1",
 		"egress_policy": map[string]any{
 			"default_deny":     true,
 			"allowed_upstream": "edge:8450",
@@ -59,9 +58,8 @@ func TestGatewayTransportCreateEgressSmuggledFieldRefused(t *testing.T) {
 	addr, client := boundGatewayWithProvider(t, pair, spy)
 
 	code, _ := gwPostText(t, client, addr, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "smuggler-mtls",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "smuggler-mtls",
+		"image":        "img",
 		"egress_policy": map[string]any{
 			"default_deny": true,
 			"auth_token":   "eyJ.fake.token",

@@ -32,6 +32,7 @@ type config struct {
 	runtimeProvider string // container backend behind the RuntimeProvider seam
 	workloadProfile string // deployment-declared trust profile feeding the admission matrix; never per-request
 	jwtSigningKey   string // path to the Storage-JWT signing key (config/secret mount)
+	execSigningKey  string // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
 	jwtAlg          string // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
 	storageIssuer   string // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
 	storageAudience string // provisional Storage-JWT aud (PIN-PENDING)
@@ -65,6 +66,7 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker|k8s (required)")
 	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
+	fs.StringVar(&cfg.execSigningKey, "exec-signing-key", "", "path to the SEPARATE exec-channel Ed25519 signing key mount (ADR-0013 key separation); unset disables the exec channel")
 	fs.StringVar(&cfg.jwtAlg, "jwt-alg", "eddsa", "Storage-JWT signing algorithm: eddsa|es256 (default eddsa, NFR-SEC-11)")
 	fs.StringVar(&cfg.storageIssuer, "storage-issuer", "", "provisional Storage-JWT issuer (PIN-PENDING; never hardcoded)")
 	fs.StringVar(&cfg.storageAudience, "storage-audience", "", "provisional Storage-JWT audience (PIN-PENDING)")

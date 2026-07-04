@@ -55,14 +55,15 @@ func newTestHandlers(t *testing.T, resolver ingress.IdentityResolver, verifier k
 	})
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  nopProvider{},
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   0, // ProfileTrustedOperator
-		Tier:      runtime.TierRunc,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       0, // ProfileTrustedOperator
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
 	h := operator.NewHandlers(operator.Deps{
@@ -99,9 +100,8 @@ func TestUnattestedConnectionRefusedBeforeHostState(t *testing.T) {
 	h, sink, store := newTestHandlers(t, operator.NewPeerCredResolver(nil), nil)
 
 	_, err := h.Create(context.Background(), unattestedConn(), operator.CreateRequest{
-		SessionHint:   "hint",
-		Image:         "img",
-		ControlPubKey: make([]byte, 32),
+		SessionHint: "hint",
+		Image:       "img",
 	})
 	if !errors.Is(err, ingress.ErrUnattested) {
 		t.Fatalf("Create on an unattested connection = %v; want ingress.ErrUnattested", err)
@@ -319,4 +319,15 @@ func (f *fakeVerifier) Verify(ctx context.Context, _, _ []byte) (state.Identity,
 // non-socket.
 func writeMarker(path string) error {
 	return os.WriteFile(path, []byte("not a socket"), 0o600)
+}
+
+// ingressTestExecVerifyKey is a 32-byte Ed25519-shaped verify key the handoff
+// stager accepts on every scoped create. It stands in for the deployment-fixed
+// exec verify key the daemon derives from -exec-signing-key.
+func ingressTestExecVerifyKey() []byte {
+	k := make([]byte, 32)
+	for i := range k {
+		k[i] = byte(i + 1)
+	}
+	return k
 }

@@ -102,13 +102,6 @@ func TestMintStorageScopeRefusals(t *testing.T) {
 	}
 }
 
-// TestMintExecIdentityRefusal asserts the exec mint refuses an empty
-// container_name: the subject is the host-attested binding, never absent.
-func TestMintExecIdentityRefusal(t *testing.T) {
-	t.Parallel()
-	signer, _ := newTestSigner(t, cred.AlgEdDSA, time.Minute)
-	_, err := signer.MintExecJWT(context.Background(), cred.ExecMintReq{ContainerName: "", RequestedTTL: time.Minute})
-	if !errors.Is(err, cred.ErrMintIdentity) {
-		t.Fatalf("empty container_name: want ErrMintIdentity, got %v", err)
-	}
-}
+// The exec mint's empty-container_name refusal now lives on *ExecSigner and is
+// covered by TestExecSignerRefusesEmptyContainerName in execsigner_test.go — the
+// storage Signer no longer mints exec JWTs (ADR-0013 key separation).

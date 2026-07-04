@@ -27,6 +27,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"os"
@@ -220,6 +221,20 @@ func serve(ctx context.Context, cfg config) error {
 		return fmt.Errorf("boot: load storage-jwt signer: %w", err)
 	}
 
+	// Exec-channel signing key, FAIL-CLOSED at boot when configured: the exec channel
+	// (ADR-0024) verifies a Session JWT signed by a SEPARATE deployment-wide Ed25519
+	// key (ADR-0013 key separation — never the Storage-JWT keyring). Its public half
+	// is the guest's staged --auth-public-key verify file. -exec-signing-key UNSET
+	// leaves execSigner nil, which disables the exec channel (the gateway exec verb
+	// fail-closes); a SET but garbage key aborts boot before any listener binds.
+	var execSigner *cred.ExecSigner
+	if cfg.execSigningKey != "" {
+		execSigner, err = cred.LoadExecSignerFromMount(cfg.execSigningKey)
+		if err != nil {
+			return fmt.Errorf("boot: load exec signing key: %w", err)
+		}
+	}
+
 	// Storage-JWT JWKS artifact, FAIL-CLOSED at boot: when -jwks-path is set, render
 	// the static JWKS document the deploy layer serves at the egress edge's
 	// remote_jwks URI (ADR-0019 §35) so the edge can validate the weak Storage-JWT
@@ -280,7 +295,7 @@ func serve(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, sink, cfg)
+	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, execSigner, sink, cfg)
 
 	// MCP API key surface, FAIL-CLOSED at boot: construct the Engine from a
 	// Minter (crypto/rand), the selected RecordStore (Postgres when -state-dsn is
@@ -424,7 +439,7 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 // (chain computed in-process, nothing durably persisted by default), and a
 // deployment Limits — are bound here. profile and tier are deployment-fixed and
 // flow onto the Manager as fixed fields; CreateInput carries neither.
-func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, sink *ocsf.ChainSink, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, execSigner *cred.ExecSigner, sink *ocsf.ChainSink, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
 	// The metrics collector reads live state through the same custodian the admin
@@ -440,24 +455,20 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 	// context and error handling. compose stays a pure composition and receives the
 	// ready sink, so a test injects a fake sink without touching this wiring.
 
-	// The advisory control-RPC dialer mints its per-dial exec JWT through the same
-	// Storage-JWT custodian Signer (the narrow MintExecJWT seam, never the signing
-	// key). When the Signer is absent (the Phase-3 minimal shelf) there is no exec-JWT
-	// minter, so the dialer stays nil and the Destroy nudge is a clean no-op.
-	var controlDialer lifecycle.ControlDialer
-	if signer != nil {
-		controlDialer = controlrpc.NewDialer(signer, 0)
-	}
-
-	// The guest exec driver (ADR-0024) mints its per-dial container-bound Session
-	// JWT through the same custodian Signer (the narrow MintExecJWT seam, never the
-	// signing key). When the Signer is absent (the minimal shelf) there is no
-	// exec-JWT minter, so the driver stays nil and the gateway exec verb
-	// fail-closes. The execDriverAdapter bridges the two decoupled request/result
-	// shapes so neither the lifecycle nor the guestexec package imports the other.
-	var execDriver lifecycle.ExecDriver
-	if signer != nil {
-		execDriver = execDriverAdapter{driver: guestexec.NewDriver(signer)}
+	// The advisory control-RPC dialer and the guest exec driver both mint their
+	// per-dial exec JWT through the SEPARATE exec signing key (ADR-0013 key
+	// separation — never the Storage-JWT keyring). When -exec-signing-key is unset
+	// execSigner is nil, so both stay nil: the Destroy nudge is a clean no-op and the
+	// gateway exec verb fail-closes. The execDriverAdapter bridges the two decoupled
+	// request/result shapes so neither the lifecycle nor the guestexec package
+	// imports the other.
+	var (
+		controlDialer lifecycle.ControlDialer
+		execDriver    lifecycle.ExecDriver
+	)
+	if execSigner != nil {
+		controlDialer = controlrpc.NewDialer(execSigner, 0)
+		execDriver = execDriverAdapter{driver: guestexec.NewDriver(execSigner)}
 	}
 
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
@@ -483,10 +494,22 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		StorageScope:  defaultStorageScope(),
 		ControlDialer: controlDialer,
 		ExecDriver:    execDriver,
+		ExecVerifyKey: execVerifyKeyOf(execSigner),
 		Metrics:       collector,
 	})
 	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
 	return mgr, eng, custodian, collector, sink
+}
+
+// execVerifyKeyOf returns the exec signer's public verify key, or nil when no exec
+// signer is configured. The Manager stages this deployment-fixed key as the guest's
+// --auth-public-key verify file; a nil key means the exec channel is disabled and a
+// scoped create stages no verify key (the create still boots for the storage leg).
+func execVerifyKeyOf(s *cred.ExecSigner) ed25519.PublicKey {
+	if s == nil {
+		return nil
+	}
+	return s.VerifyKey()
 }
 
 // execDriverAdapter bridges the guestexec.Driver to the lifecycle.ExecDriver seam.

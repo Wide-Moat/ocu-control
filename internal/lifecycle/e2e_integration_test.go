@@ -125,6 +125,12 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 	auditWriter := &capturingEventWriter{}
 	auditSink := ocsf.NewChainSink(clk, auditWriter, "control")
 
+	// The deployment-fixed exec verify key the Manager stages on every create (the
+	// public half of the separate exec signing key); a fresh key suffices for e2e.
+	execPub, _, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		t.Fatalf("e2e: generate exec key: %v", err)
+	}
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
 		Custodian: registry.NewCustodian(store),
 		Provider:  provider,
@@ -141,15 +147,12 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 		CACertPEM:     testCACert,
 		MountDefaults: testMountDefaults(t),
 		StorageScope:  lifecycle.StorageScope{Workspace: "ws", Org: "org", Intent: cred.IntentWrite},
+		ExecVerifyKey: execPub,
 	})
 
 	caller := ingress.AuthenticatedCaller{
 		Identity: state.Identity{Tenant: "e2e-tenant", Caller: "e2e-caller"},
 		Channel:  ingress.ChannelOperator,
-	}
-	pub, _, err := ed25519.GenerateKey(nil)
-	if err != nil {
-		t.Fatalf("e2e: generate key: %v", err)
 	}
 
 	pidsLimit := int64(128)
@@ -176,7 +179,6 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 			MemoryBytes: 256 << 20,
 			PidsLimit:   &pidsLimit,
 		},
-		ControlPubKey: pub,
 	}
 
 	// CREATE against the real backends.

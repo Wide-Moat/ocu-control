@@ -47,7 +47,7 @@ const controlSockName = "control.sock"
 const defaultDialTimeout = 5 * time.Second
 
 // execMinter is the NARROW seam the dialer reaches the per-dial exec JWT through.
-// It is satisfied by *cred.Signer but names only MintExecJWT, so the load-bearing
+// It is satisfied by *cred.ExecSigner but names only MintExecJWT, so the load-bearing
 // controlrpc package depends on the mint method, not the whole custody Signer (and
 // never on the signing key). The minted Token redacts on every emit surface; the
 // raw compact JWT is revealed only at the single Authorization-write call site.
@@ -57,7 +57,7 @@ type execMinter interface {
 
 // Compile-time proof *cred.Signer satisfies the narrow execMinter seam, so the
 // production wiring type-checks and a test fake matches the same shape.
-var _ execMinter = (*cred.Signer)(nil)
+var _ execMinter = (*cred.ExecSigner)(nil)
 
 // Dialer dials the host-owned control UDS in the guest's 0700 host-owned sock
 // directory (ADR-0018). It is NOT loopback TCP: a non-host peer cannot connect(2)

@@ -30,7 +30,7 @@ import (
 )
 
 // execMinter is the NARROW mint seam this package depends on. It is satisfied
-// by *cred.Signer but names only MintExecJWT, so the driver depends on the mint
+// by *cred.ExecSigner but names only MintExecJWT, so the driver depends on the mint
 // method, never the whole custody Signer (and never the signing key).
 type execMinter interface {
 	MintExecJWT(ctx context.Context, req cred.ExecMintReq) (cred.Token, error)
@@ -38,7 +38,7 @@ type execMinter interface {
 
 // Compile-time proof *cred.Signer satisfies the narrow seam, so the production
 // wiring type-checks and a test fake matches the same shape.
-var _ execMinter = (*cred.Signer)(nil)
+var _ execMinter = (*cred.ExecSigner)(nil)
 
 // Minter adapts the control-plane exec-JWT mint to the exec channel's
 // dial.Minter contract for ONE container: every Mint is bound to that

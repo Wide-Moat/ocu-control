@@ -45,14 +45,15 @@ func boundOperatorFaultable(t *testing.T, resolver ingress.IdentityResolver) (*h
 	// test can arm the fault.
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  nopProvider{},
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   0, // ProfileTrustedOperator
-		Tier:      ocuruntime.TierRunc,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       0, // ProfileTrustedOperator
+		Tier:          ocuruntime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
 	mcpEng := mcpkey.NewEngine(

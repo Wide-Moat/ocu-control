@@ -160,15 +160,22 @@ func TestExecTTLClamp(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			signer, _ := newTestSigner(t, cred.AlgEdDSA, time.Minute)
-			tok, err := signer.MintExecJWT(ctx, cred.ExecMintReq{ContainerName: "ocu-ctr", RequestedTTL: tc.requested})
+			execSigner, _ := newTestExecSigner(t)
+			before := time.Now().Unix()
+			tok, err := execSigner.MintExecJWT(ctx, cred.ExecMintReq{ContainerName: "ocu-ctr", RequestedTTL: tc.requested})
+			after := time.Now().Unix()
 			if err != nil {
 				t.Fatalf("MintExecJWT: %v", err)
 			}
 			gotExp, gotSub := execExp(t, tok.Reveal())
-			wantExp := testStart.Add(tc.wantTTL).Unix()
-			if gotExp != wantExp {
-				t.Fatalf("clamp: requested=%v wantExp=%d gotExp=%d", tc.requested, wantExp, gotExp)
+			// The ExecSigner mints against the real clock (jwtmint), so exp lands in
+			// [before+wantTTL, after+wantTTL]. A two-second span bounds the assertion
+			// without a fixed clock while still proving the clamp (a 2h request yields
+			// a 60-minute exp, not a 2-hour one).
+			lo := before + int64(tc.wantTTL.Seconds())
+			hi := after + int64(tc.wantTTL.Seconds())
+			if gotExp < lo || gotExp > hi {
+				t.Fatalf("clamp: requested=%v exp=%d not in [%d,%d] (wantTTL=%v)", tc.requested, gotExp, lo, hi, tc.wantTTL)
 			}
 			// Requirement 6: the exec JWT subject is the host-attested container_name.
 			if gotSub != "ocu-ctr" {

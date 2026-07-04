@@ -43,9 +43,8 @@ func TestCreateDestroyStatusAttestedHandlers(t *testing.T) {
 	conn := gatewayConn("acme/worker-7")
 
 	row, err := h.Create(ctx, scope, conn, gateway.CreateRequest{
-		Image:         "img",
-		ControlPubKey: make([]byte, 32),
-		SessionHint:   "sess",
+		Image:       "img",
+		SessionHint: "sess",
 	})
 	if err != nil {
 		t.Fatalf("Create: %v", err)

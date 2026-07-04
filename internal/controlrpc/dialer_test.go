@@ -16,7 +16,6 @@ import (
 
 	"github.com/Wide-Moat/ocu-control/internal/controlrpc"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
-	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
 // newTestDialer builds a Dialer over a real Signer (the narrow execMinter) on a
@@ -25,8 +24,7 @@ import (
 // end rather than stubbing the mint.
 func newTestDialer(t *testing.T, timeout time.Duration) *controlrpc.Dialer {
 	t.Helper()
-	clk := state.NewFakeClock(time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC))
-	signer := newControlSigner(t, clk)
+	signer := newControlSigner(t)
 	return controlrpc.NewDialer(signer, timeout)
 }
 

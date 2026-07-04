@@ -151,7 +151,11 @@ func emitCreateRejected(ctx context.Context, m *Manager, st *createState, cause 
 func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	name := runtime.SessionName(st.key.String())
 	mounts := []runtime.MountIntent{st.in.Mount}
-	staged, err := m.handoff.Stage(ctx, name, st.in.ControlPubKey, mounts)
+	// The guest's verify key is the DEPLOYMENT-FIXED exec verify key (host-derived,
+	// never a body hint — NFR-SEC-43), so the caller cannot supply the key that
+	// decides who counts as the host. When the exec channel is disabled the key is
+	// nil and Stage refuses fail-closed (a scoped create needs the verify key).
+	staged, err := m.handoff.Stage(ctx, name, m.execVerifyKey, mounts)
 	if err != nil {
 		// A bad key or short write fails closed; Stage removed any partial root, so
 		// nothing half-written survives and no compensator is owed.

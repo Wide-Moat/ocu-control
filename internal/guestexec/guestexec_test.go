@@ -7,8 +7,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/x509"
-	"encoding/pem"
 	"errors"
 	"os"
 	"path/filepath"
@@ -18,40 +16,19 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/Wide-Moat/ocu-control/internal/cred"
-	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
-// newTestSigner builds a REAL cred.Signer over a fresh Ed25519 key staged the way
-// the daemon loads it, so the minter tests exercise the production mint path and
-// the emitted JWT verifies against the same key.
-func newTestSigner(t *testing.T) (*cred.Signer, ed25519.PublicKey) {
+// newTestSigner builds a REAL cred.ExecSigner over a fresh exec Ed25519 key and
+// returns it with the matching public half (the value the handoff would stage as
+// the guest verify key), so the minter tests exercise the production exec-mint path
+// and the emitted JWT verifies against that key.
+func newTestSigner(t *testing.T) (*cred.ExecSigner, ed25519.PublicKey) {
 	t.Helper()
 	pub, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generate ed25519: %v", err)
 	}
-	der, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		t.Fatalf("marshal pkcs8: %v", err)
-	}
-	pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
-	path := filepath.Join(t.TempDir(), "signing.key")
-	if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
-		t.Fatalf("write key mount: %v", err)
-	}
-	signer, err := cred.LoadSignerFromMount(path, state.SystemClock(), cred.Config{
-		Alg:             cred.AlgEdDSA,
-		StorageIssuer:   "https://control.example/provisional",
-		StorageAudience: "egress.provisional",
-		ExecIssuer:      "https://control.example/exec-provisional",
-		ExecAudience:    "guest.exec.provisional",
-		StorageTTL:      15 * time.Minute,
-	})
-	if err != nil {
-		t.Fatalf("LoadSignerFromMount: %v", err)
-	}
-	signer.UseRevoker(cred.NewRevoker(state.SystemClock()))
-	return signer, pub
+	return cred.NewExecSigner(priv), pub
 }
 
 // TestMinterMintsContainerBoundJWT pins the adapter contract: Mint(ttl) mints a

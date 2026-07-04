@@ -44,15 +44,16 @@ func newManagerWithRecorder(t *testing.T, rec lifecycle.Recorder) *lifecycle.Man
 	gate := quota.NewGate(store, clk, generousLimits())
 
 	return lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: cust,
-		Provider:  newRecordingProvider(),
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   stager,
-		Audit:     sink,
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
-		Metrics:   rec,
+		Custodian:     cust,
+		Provider:      newRecordingProvider(),
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
+		Metrics:       rec,
 	})
 }
 

@@ -70,14 +70,15 @@ func operatorDepsFor(t *testing.T, resolver ingress.IdentityResolver, verifier k
 	})
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  nopProvider{},
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   0, // ProfileTrustedOperator
-		Tier:      ocuruntime.TierRunc,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       0, // ProfileTrustedOperator
+		Tier:          ocuruntime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
 	// The mcp-key engine over an in-memory record store and a no-op rerender, so a
@@ -240,9 +241,8 @@ func TestOperatorTransportCreateThenDestroy(t *testing.T) {
 
 	// Create over the wire.
 	code, body := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "wire-session",
-		"image":           "registry.example/ocu-sandbox:v1",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "wire-session",
+		"image":        "registry.example/ocu-sandbox:v1",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create over the wire = %d; want 201", code)
@@ -268,9 +268,8 @@ func TestOperatorTransportRevokeOneAndAll(t *testing.T) {
 	_, client, _ := boundOperator(t, resolver, nil)
 
 	code, body := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "to-revoke",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "to-revoke",
+		"image":        "img",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create = %d; want 201", code)
@@ -445,7 +444,7 @@ func TestOperatorTransportResumeAll(t *testing.T) {
 		t.Fatalf("revoke/all = %d; want 200", code)
 	}
 	code, _ = postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint": "blocked", "image": "img", "control_pub_key": make([]byte, 32),
+		"session_hint": "blocked", "image": "img",
 	})
 	if code != http.StatusConflict {
 		t.Fatalf("create during DENY-ALL = %d; want 409", code)
@@ -459,7 +458,7 @@ func TestOperatorTransportResumeAll(t *testing.T) {
 
 	// A create now succeeds.
 	code, body := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint": "after-resume", "image": "img", "control_pub_key": make([]byte, 32),
+		"session_hint": "after-resume", "image": "img",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create after resume/all = %d; want 201", code)
@@ -505,9 +504,8 @@ func TestOperatorTransportUnattestedRefused(t *testing.T) {
 	_, client, _ := boundOperator(t, fixedResolver{refuse: true}, nil)
 
 	code, _ := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "x",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "x",
+		"image":        "img",
 	})
 	if code != http.StatusUnauthorized {
 		t.Fatalf("create on an unattested connection over the wire = %d; want 401", code)

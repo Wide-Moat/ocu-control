@@ -85,11 +85,11 @@ func TestUseRevokerNilIsNoOp(t *testing.T) {
 	signer, _ := newTestSigner(t, cred.AlgEdDSA, time.Minute)
 	signer.UseRevoker(nil) // must not panic
 
-	if _, err := signer.MintExecJWT(t.Context(), cred.ExecMintReq{
-		ContainerName: "ctr-nil-revoker",
-		RequestedTTL:  time.Minute,
+	if _, err := signer.MintStorageJWT(t.Context(), cred.StorageMintReq{
+		FilesystemID: "fs-nil-revoker",
+		Authz:        cred.AuthorizationMetadata{Intent: cred.IntentRead},
 	}); err != nil {
-		t.Fatalf("MintExecJWT after UseRevoker(nil) = %v, want nil (mint still works)", err)
+		t.Fatalf("MintStorageJWT after UseRevoker(nil) = %v, want nil (mint still works)", err)
 	}
 }
 
@@ -110,9 +110,10 @@ func TestNewRevokerNilClockFallsBackToSystemClock(t *testing.T) {
 	}
 }
 
-// TestMintRefusesCancelledContext covers the fail-closed ctx.Err() guard on both
-// mint paths: a cancelled context refuses the mint before any signing, so a dropped
-// caller never yields a signed token.
+// TestMintRefusesCancelledContext covers the fail-closed ctx.Err() guard on the
+// storage mint path: a cancelled context refuses the mint before any signing, so a
+// dropped caller never yields a signed token. The exec mint's own cancelled-ctx
+// guard is covered in execsigner_test.go.
 func TestMintRefusesCancelledContext(t *testing.T) {
 	t.Parallel()
 	signer, _ := newTestSigner(t, cred.AlgEdDSA, time.Minute)
@@ -124,8 +125,5 @@ func TestMintRefusesCancelledContext(t *testing.T) {
 		Authz:        cred.AuthorizationMetadata{Intent: cred.IntentRead},
 	}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("MintStorageJWT cancelled = %v, want context.Canceled", err)
-	}
-	if _, err := signer.MintExecJWT(ctx, cred.ExecMintReq{ContainerName: "ctr-1"}); !errors.Is(err, context.Canceled) {
-		t.Fatalf("MintExecJWT cancelled = %v, want context.Canceled", err)
 	}
 }

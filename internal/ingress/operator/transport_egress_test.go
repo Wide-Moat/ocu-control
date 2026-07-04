@@ -22,9 +22,8 @@ func TestOperatorTransportCreateCarriesEgressPolicy(t *testing.T) {
 	client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
 
 	code, body := postForText(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "egress-session",
-		"image":           "registry.example/ocu-sandbox:v1",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "egress-session",
+		"image":        "registry.example/ocu-sandbox:v1",
 		"egress_policy": map[string]any{
 			"default_deny":     true,
 			"allowed_upstream": "edge:8450",
@@ -60,9 +59,8 @@ func TestOperatorTransportCreateBareBodyStaysZeroEgress(t *testing.T) {
 	client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
 
 	code, body := postForText(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "no-egress",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "no-egress",
+		"image":        "img",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("bare create = %d (%s); want 201", code, body)
@@ -85,9 +83,8 @@ func TestOperatorTransportCreateEgressSmuggledFieldRefused(t *testing.T) {
 	client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
 
 	code, _ := postForText(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "smuggler",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "smuggler",
+		"image":        "img",
 		"egress_policy": map[string]any{
 			"default_deny": true,
 			"auth_token":   "eyJ.fake.token",

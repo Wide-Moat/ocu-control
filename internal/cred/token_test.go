@@ -36,7 +36,8 @@ func TestTokenNeverLogged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("MintStorageJWT: %v", err)
 	}
-	execTok, err := signer.MintExecJWT(ctx, cred.ExecMintReq{ContainerName: "ocu-ctr-1", RequestedTTL: time.Minute})
+	execSigner, _ := newTestExecSigner(t)
+	execTok, err := execSigner.MintExecJWT(ctx, cred.ExecMintReq{ContainerName: "ocu-ctr-1", RequestedTTL: time.Minute})
 	if err != nil {
 		t.Fatalf("MintExecJWT: %v", err)
 	}
@@ -115,8 +116,8 @@ func TestZeroTokenIsZero(t *testing.T) {
 	if !zero.IsZero() {
 		t.Fatal("zero Token must report IsZero")
 	}
-	signer, _ := newTestSigner(t, cred.AlgEdDSA, time.Minute)
-	tok, err := signer.MintExecJWT(context.Background(), cred.ExecMintReq{ContainerName: "c", RequestedTTL: time.Minute})
+	execSigner, _ := newTestExecSigner(t)
+	tok, err := execSigner.MintExecJWT(context.Background(), cred.ExecMintReq{ContainerName: "c", RequestedTTL: time.Minute})
 	if err != nil {
 		t.Fatalf("mint: %v", err)
 	}

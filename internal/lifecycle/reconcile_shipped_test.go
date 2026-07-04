@@ -28,14 +28,15 @@ func newShippedManager(t *testing.T) (*lifecycle.Manager, state.Store, *recordin
 	cust := registry.NewCustodian(store)
 	provider := newRecordingProvider()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: cust,
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     quota.NewGate(store, clk, generousLimits()),
-		Handoff:   newFaultStager(t.TempDir()),
-		Audit:     audit.NewRecordingFake(),
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
+		Custodian:     cust,
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         quota.NewGate(store, clk, generousLimits()),
+		Handoff:       newFaultStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 	})
 	return mgr, store, provider
 }

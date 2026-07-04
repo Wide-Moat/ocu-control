@@ -88,6 +88,7 @@ func newOrphanHarness(t *testing.T) *orphanHarness {
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 		Signer:        signer,
 		Push:          pusher,
 		ServiceURL:    testServiceURL,
@@ -315,14 +316,15 @@ func TestUnwindRunsUnderCancelledContext(t *testing.T) {
 	gate := quota.NewGate(canceller, clk, generousLimits())
 
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: cust,
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   stager,
-		Audit:     sink,
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
+		Custodian:     cust,
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 	})
 
 	_, err := mgr.Create(ctx, input("cancel-probe"))

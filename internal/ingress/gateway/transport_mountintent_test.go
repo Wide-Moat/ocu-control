@@ -61,14 +61,15 @@ func boundGatewayWithProvider(t *testing.T, pair mtlsPair, provider ocuruntime.R
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 16, CreateRatePerCallerPerMin: 16})
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     audit.NewRecordingFake(),
-		Profile:   0, // ProfileTrustedOperator (admits on runc)
-		Tier:      ocuruntime.TierRunc,
+		Custodian:     custodian,
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       0, // ProfileTrustedOperator (admits on runc)
+		Tier:          ocuruntime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	deps := gateway.Deps{Manager: mgr, TLSConfig: pair.serverTLS}
 
@@ -134,9 +135,8 @@ func TestGatewayTransportCreateCarriesMountIntent(t *testing.T) {
 	addr, client := boundGatewayWithProvider(t, pair, spy)
 
 	code, body := gwPostText(t, client, addr, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "scoped-mtls",
-		"image":           "registry.example/ocu-sandbox:v1",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "scoped-mtls",
+		"image":        "registry.example/ocu-sandbox:v1",
 		"mount_intent": map[string]any{
 			"destination":      "/workspace/out",
 			"filesystem_id":    "fs-wire-gw",
@@ -222,10 +222,9 @@ func TestGatewayTransportCreateMountIntentMalformedRefused(t *testing.T) {
 			addr, client := boundGatewayWithProvider(t, pair, spy)
 
 			code, body := gwPostText(t, client, addr, "/v1alpha/sessions", map[string]any{
-				"session_hint":    "malformed-mtls",
-				"image":           "img",
-				"control_pub_key": make([]byte, 32),
-				"mount_intent":    tc.intent,
+				"session_hint": "malformed-mtls",
+				"image":        "img",
+				"mount_intent": tc.intent,
 			})
 			if code != http.StatusBadRequest {
 				t.Fatalf("malformed mount_intent create = %d (%s); want 400", code, body)
