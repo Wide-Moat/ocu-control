@@ -277,10 +277,23 @@ func writeReadError(w http.ResponseWriter, err error) {
 // fields are HINTS; the host-attested caller is derived from the connection, never
 // the body (NFR-SEC-43).
 type createBody struct {
-	SessionHint   string           `json:"session_hint"`
-	Image         string           `json:"image"`
-	ControlPubKey []byte           `json:"control_pub_key"`
-	MountIntent   *mountIntentBody `json:"mount_intent"`
+	SessionHint   string            `json:"session_hint"`
+	Image         string            `json:"image"`
+	ControlPubKey []byte            `json:"control_pub_key"`
+	MountIntent   *mountIntentBody  `json:"mount_intent"`
+	EgressPolicy  *egressPolicyBody `json:"egress_policy"`
+}
+
+// egressPolicyBody is the wire shape of the per-session egress trust-edge policy,
+// field names per the frozen session_setup.proto EgressPolicy. default_deny is the
+// posture (true on every production path); allowed_upstream is the single
+// allow-listed object-store the mount client may dial guest-out; filesystem_id
+// binds the egress to the same scope as the mount. The strict decoder refuses any
+// smuggled field (e.g. a credential) as unknown.
+type egressPolicyBody struct {
+	DefaultDeny     bool   `json:"default_deny"`
+	AllowedUpstream string `json:"allowed_upstream"`
+	FilesystemID    string `json:"filesystem_id"`
 }
 
 // mountIntentBody is the wire shape of the per-session storage mount intent,
@@ -330,9 +343,9 @@ func (m *mountIntentBody) validate() error {
 	return nil
 }
 
-// toRequest maps the wire body to the in-process CreateRequest. The egress and
-// resource shapes are carried as their zero values here — the full wire schema
-// fills them in a follow-up. The mount intent maps field-for-field; its
+// toRequest maps the wire body to the in-process CreateRequest. The resource-caps
+// shape is carried as its zero value here — the full wire schema fills it in a
+// follow-up. The mount intent and egress policy map field-for-field; the mount
 // AuthToken is never populated from the wire (custody).
 func (b createBody) toRequest() (CreateRequest, error) {
 	req := CreateRequest{
@@ -340,18 +353,24 @@ func (b createBody) toRequest() (CreateRequest, error) {
 		Image:         b.Image,
 		ControlPubKey: b.ControlPubKey,
 	}
-	if b.MountIntent == nil {
-		return req, nil
+	if b.MountIntent != nil {
+		if err := b.MountIntent.validate(); err != nil {
+			return CreateRequest{}, err
+		}
+		req.Mount = runtime.MountIntent{
+			Destination:   b.MountIntent.Destination,
+			FilesystemID:  b.MountIntent.FilesystemID,
+			MemoryStoreID: b.MountIntent.MemoryStoreID,
+			ReadOnly:      b.MountIntent.ReadOnly,
+			CacheSeconds:  int(b.MountIntent.CacheDurationS),
+		}
 	}
-	if err := b.MountIntent.validate(); err != nil {
-		return CreateRequest{}, err
-	}
-	req.Mount = runtime.MountIntent{
-		Destination:   b.MountIntent.Destination,
-		FilesystemID:  b.MountIntent.FilesystemID,
-		MemoryStoreID: b.MountIntent.MemoryStoreID,
-		ReadOnly:      b.MountIntent.ReadOnly,
-		CacheSeconds:  int(b.MountIntent.CacheDurationS),
+	if b.EgressPolicy != nil {
+		req.Egress = runtime.EgressPolicy{
+			DefaultDeny:     b.EgressPolicy.DefaultDeny,
+			AllowedUpstream: b.EgressPolicy.AllowedUpstream,
+			FilesystemID:    b.EgressPolicy.FilesystemID,
+		}
 	}
 	return req, nil
 }

@@ -298,10 +298,23 @@ type execResponse struct {
 // fields are HINTS; the host-attested caller is derived from the verified SAN,
 // never the body (NFR-SEC-43).
 type createBody struct {
-	SessionHint   string           `json:"session_hint"`
-	Image         string           `json:"image"`
-	ControlPubKey []byte           `json:"control_pub_key"`
-	MountIntent   *mountIntentBody `json:"mount_intent"`
+	SessionHint   string            `json:"session_hint"`
+	Image         string            `json:"image"`
+	ControlPubKey []byte            `json:"control_pub_key"`
+	MountIntent   *mountIntentBody  `json:"mount_intent"`
+	EgressPolicy  *egressPolicyBody `json:"egress_policy"`
+}
+
+// egressPolicyBody is the wire shape of the per-session egress trust-edge policy,
+// field names per the frozen session_setup.proto EgressPolicy. default_deny is the
+// posture (true on every production path); allowed_upstream is the single
+// allow-listed object-store the mount client may dial guest-out; filesystem_id
+// binds the egress to the same scope as the mount. The strict decoder refuses any
+// smuggled field (e.g. a credential) as unknown.
+type egressPolicyBody struct {
+	DefaultDeny     bool   `json:"default_deny"`
+	AllowedUpstream string `json:"allowed_upstream"`
+	FilesystemID    string `json:"filesystem_id"`
 }
 
 // mountIntentBody is the wire shape of the per-session storage mount intent,
@@ -352,12 +365,20 @@ func (m *mountIntentBody) validate() error {
 }
 
 // toRequest maps the wire body to the in-process CreateRequest. The mount intent
-// maps field-for-field; its AuthToken is never populated from the wire (custody).
+// and egress policy map field-for-field; the mount AuthToken is never populated
+// from the wire (custody).
 func (b createBody) toRequest() (CreateRequest, error) {
 	req := CreateRequest{
 		SessionHint:   b.SessionHint,
 		Image:         b.Image,
 		ControlPubKey: b.ControlPubKey,
+	}
+	if b.EgressPolicy != nil {
+		req.Egress = runtime.EgressPolicy{
+			DefaultDeny:     b.EgressPolicy.DefaultDeny,
+			AllowedUpstream: b.EgressPolicy.AllowedUpstream,
+			FilesystemID:    b.EgressPolicy.FilesystemID,
+		}
 	}
 	if b.MountIntent == nil {
 		return req, nil
