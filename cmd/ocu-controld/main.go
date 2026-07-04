@@ -41,6 +41,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/boot"
 	"github.com/Wide-Moat/ocu-control/internal/controlrpc"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
+	"github.com/Wide-Moat/ocu-control/internal/guestexec"
 	"github.com/Wide-Moat/ocu-control/internal/handoff"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/ingress/gateway"
@@ -448,6 +449,17 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		controlDialer = controlrpc.NewDialer(signer, 0)
 	}
 
+	// The guest exec driver (ADR-0024) mints its per-dial container-bound Session
+	// JWT through the same custodian Signer (the narrow MintExecJWT seam, never the
+	// signing key). When the Signer is absent (the minimal shelf) there is no
+	// exec-JWT minter, so the driver stays nil and the gateway exec verb
+	// fail-closes. The execDriverAdapter bridges the two decoupled request/result
+	// shapes so neither the lifecycle nor the guestexec package imports the other.
+	var execDriver lifecycle.ExecDriver
+	if signer != nil {
+		execDriver = execDriverAdapter{driver: guestexec.NewDriver(signer)}
+	}
+
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
 		Custodian: custodian,
 		Provider:  provider,
@@ -470,10 +482,39 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		MountDefaults: defaultMountDefaults(),
 		StorageScope:  defaultStorageScope(),
 		ControlDialer: controlDialer,
+		ExecDriver:    execDriver,
 		Metrics:       collector,
 	})
 	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
 	return mgr, eng, custodian, collector, sink
+}
+
+// execDriverAdapter bridges the guestexec.Driver to the lifecycle.ExecDriver seam.
+// The two packages define their own request/result shapes (identical fields) so
+// neither imports the other; this adapter — the one place that knows both — maps
+// between them at the composition root.
+type execDriverAdapter struct {
+	driver *guestexec.Driver
+}
+
+func (a execDriverAdapter) Exec(ctx context.Context, sockDir, containerName string, req lifecycle.ExecRequest) (lifecycle.ExecResult, error) {
+	res, err := a.driver.Exec(ctx, sockDir, containerName, guestexec.Request{
+		Argv:     req.Argv,
+		Env:      req.Env,
+		Cwd:      req.Cwd,
+		Stdin:    req.Stdin,
+		TimeoutS: req.TimeoutS,
+	})
+	if err != nil {
+		return lifecycle.ExecResult{}, err
+	}
+	return lifecycle.ExecResult{
+		ExitCode:        res.ExitCode,
+		Stdout:          res.Stdout,
+		Stderr:          res.Stderr,
+		StdoutTruncated: res.StdoutTruncated,
+		StderrTruncated: res.StderrTruncated,
+	}, nil
 }
 
 // drainTimeout bounds how long serveListeners waits for both Serve loops to
