@@ -55,6 +55,7 @@ func TestCreateNoStorageScopeSucceeds(t *testing.T) {
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 		Signer:        signer,
 		Push:          pusher,
 		ServiceURL:    testServiceURL,
@@ -67,13 +68,12 @@ func TestCreateNoStorageScopeSucceeds(t *testing.T) {
 	// requested (both FilesystemID and MemoryStoreID empty), and the Egress carries no
 	// FilesystemID either.
 	in := lifecycle.CreateInput{
-		Caller:        testCaller,
-		SessionHint:   "no-scope-session",
-		Image:         "registry.example/ocu-sandbox:v1",
-		Mount:         runtime.MountIntent{},
-		Egress:        runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store"},
-		Resources:     runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
-		ControlPubKey: pub32(),
+		Caller:      testCaller,
+		SessionHint: "no-scope-session",
+		Image:       "registry.example/ocu-sandbox:v1",
+		Mount:       runtime.MountIntent{},
+		Egress:      runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store"},
+		Resources:   runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
 	}
 
 	row, err := mgr.Create(ctx, in)

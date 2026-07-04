@@ -28,15 +28,25 @@ import (
 // paths overflow it).
 func shortSockDir(t *testing.T) string {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "ge")
+	root, err := os.MkdirTemp("", "ge")
 	if err != nil {
 		t.Fatalf("mkdtemp: %v", err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatalf("chmod: %v", err)
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	// The per-session ROOT is 0700 (the trust wall); the sock LEAF inside it is
+	// 0777 (the guest binds(2) there) — the exact layout handoff.Stager writes and
+	// the gate checks.
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("chmod root: %v", err)
 	}
-	return dir
+	leaf := filepath.Join(root, "sock")
+	if err := os.Mkdir(leaf, 0o777); err != nil {
+		t.Fatalf("mkdir sock leaf: %v", err)
+	}
+	if err := os.Chmod(leaf, 0o777); err != nil {
+		t.Fatalf("chmod sock leaf: %v", err)
+	}
+	return leaf
 }
 
 // fakeGuest is a minimal in-process exec-channel guest: it accepts the WebSocket
@@ -218,22 +228,23 @@ func TestDriverExecRunsOneProcessEndToEnd(t *testing.T) {
 }
 
 // TestDriverExecRefusesLooseSockDir pins the pre-connect gate on the Exec path: a
-// group-accessible sock dir is refused with ErrSockDirGate and the guest is never
-// dialled.
+// sock leaf whose ROOT parent is group-accessible is refused with ErrSockDirGate
+// and the guest is never dialled (the traversal wall is the root, not the leaf).
 func TestDriverExecRefusesLooseSockDir(t *testing.T) {
 	t.Parallel()
 	signer, _ := newTestSigner(t)
 	sockDir := shortSockDir(t)
 	guest := &fakeGuest{exitCode: 0}
 	startFakeGuest(t, sockDir, guest)
-	if err := os.Chmod(sockDir, 0o750); err != nil {
-		t.Fatalf("chmod: %v", err)
+	// Make the ROOT parent loose: the gate's trust wall is the per-session root.
+	if err := os.Chmod(filepath.Dir(sockDir), 0o750); err != nil {
+		t.Fatalf("chmod parent: %v", err)
 	}
 
 	d := NewDriver(signer)
 	_, err := d.Exec(context.Background(), sockDir, "ctr", Request{Argv: []string{"true"}})
 	if !errors.Is(err, ErrSockDirGate) {
-		t.Fatalf("Exec on loose sock dir = %v; want ErrSockDirGate", err)
+		t.Fatalf("Exec on loose root = %v; want ErrSockDirGate", err)
 	}
 	if jwtGot, _ := guest.lastHandshake(); jwtGot != "" {
 		t.Fatal("guest saw a handshake despite the gate refusal")

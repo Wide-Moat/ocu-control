@@ -56,15 +56,16 @@ func boundGatewayWithExec(t *testing.T, pair mtlsPair, driver lifecycle.ExecDriv
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 16, CreateRatePerCallerPerMin: 16})
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian:  custodian,
-		Provider:   nopProvider{},
-		Clock:      clk,
-		Quota:      gate,
-		Handoff:    handoff.NewStager(t.TempDir()),
-		Audit:      audit.NewRecordingFake(),
-		Profile:    0,
-		Tier:       ocuruntime.TierRunc,
-		ExecDriver: driver,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       0,
+		Tier:          ocuruntime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
+		ExecDriver:    driver,
 	})
 	deps := gateway.Deps{Manager: mgr, TLSConfig: pair.serverTLS}
 
@@ -102,9 +103,8 @@ func boundGatewayWithExec(t *testing.T, pair mtlsPair, driver lifecycle.ExecDriv
 func createSessionForExec(t *testing.T, client *http.Client, addr string) string {
 	t.Helper()
 	code, _ := gwPostText(t, client, addr, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "exec-target",
-		"image":           "registry.example/ocu-sandbox:v1",
-		"control_pub_key": base64.StdEncoding.EncodeToString(make([]byte, 32)),
+		"session_hint": "exec-target",
+		"image":        "registry.example/ocu-sandbox:v1",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create for exec = %d; want 201", code)

@@ -82,15 +82,16 @@ func newHarnessWithExec(t *testing.T, execDriver lifecycle.ExecDriver) *harness 
 	gate := quota.NewGate(store, clk, generousLimits())
 
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian:  cust,
-		Provider:   provider,
-		Clock:      clk,
-		Quota:      gate,
-		Handoff:    stager,
-		Audit:      sink,
-		Profile:    admission.ProfileTrustedOperator,
-		Tier:       runtime.TierRunc,
-		ExecDriver: execDriver,
+		Custodian:     cust,
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecDriver:    execDriver,
+		ExecVerifyKey: pub32(),
 	})
 	return &harness{
 		mgr:      mgr,
@@ -106,13 +107,12 @@ func newHarnessWithExec(t *testing.T, execDriver lifecycle.ExecDriver) *harness 
 // input builds a CreateInput with a 32-byte key under the test caller.
 func input(hint string) lifecycle.CreateInput {
 	return lifecycle.CreateInput{
-		Caller:        testCaller,
-		SessionHint:   hint,
-		Image:         "registry.example/ocu-sandbox:v1",
-		Mount:         runtime.MountIntent{Destination: "/workspace", FilesystemID: "fs-1", ReadOnly: false, CacheSeconds: 5},
-		Egress:        runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store", FilesystemID: "fs-1"},
-		Resources:     runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
-		ControlPubKey: pub32(),
+		Caller:      testCaller,
+		SessionHint: hint,
+		Image:       "registry.example/ocu-sandbox:v1",
+		Mount:       runtime.MountIntent{Destination: "/workspace", FilesystemID: "fs-1", ReadOnly: false, CacheSeconds: 5},
+		Egress:      runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store", FilesystemID: "fs-1"},
+		Resources:   runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
 	}
 }
 
@@ -265,14 +265,15 @@ func TestCreateAdmissionRejected(t *testing.T) {
 	store := newListerStore(inner)
 	provider := newRecordingProvider()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: registry.NewCustodian(store),
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     quota.NewGate(store, clk, generousLimits()),
-		Handoff:   newFaultStager(t.TempDir()),
-		Audit:     audit.NewRecordingFake(),
-		Profile:   admission.ProfileUntrusted, // untrusted × runc = pairing-rejected
-		Tier:      runtime.TierRunc,
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         quota.NewGate(store, clk, generousLimits()),
+		Handoff:       newFaultStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       admission.ProfileUntrusted, // untrusted × runc = pairing-rejected
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 	})
 
 	_, err := mgr.Create(context.Background(), input("x"))
@@ -302,14 +303,15 @@ func TestCreateQuotaRefusedNoCounter(t *testing.T) {
 	store := newListerStore(inner)
 	provider := newRecordingProvider()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: registry.NewCustodian(store),
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 1, CreateRatePerCallerPerMin: 100}),
-		Handoff:   newFaultStager(t.TempDir()),
-		Audit:     audit.NewRecordingFake(),
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 1, CreateRatePerCallerPerMin: 100}),
+		Handoff:       newFaultStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 	})
 	ctx := context.Background()
 
@@ -406,14 +408,15 @@ func newRejectHarness(t *testing.T, profile admission.WorkloadProfile, tier runt
 	provider := newRecordingProvider()
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: registry.NewCustodian(store),
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     quota.NewGate(store, clk, limits),
-		Handoff:   newFaultStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   profile,
-		Tier:      tier,
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         quota.NewGate(store, clk, limits),
+		Handoff:       newFaultStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       profile,
+		Tier:          tier,
+		ExecVerifyKey: pub32(),
 	})
 	return &rejectHarness{mgr: mgr, store: store, provider: provider, audit: sink}
 }

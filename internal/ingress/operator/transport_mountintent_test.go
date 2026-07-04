@@ -70,14 +70,15 @@ func boundOperatorWithProvider(t *testing.T, resolver ingress.IdentityResolver, 
 	})
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   0, // ProfileTrustedOperator
-		Tier:      ocuruntime.TierRunc,
+		Custodian:     custodian,
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       0, // ProfileTrustedOperator
+		Tier:          ocuruntime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
 	deps := operator.Deps{
@@ -187,10 +188,9 @@ func TestOperatorTransportCreateCarriesMountIntent(t *testing.T) {
 			client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
 
 			code, body := postForText(t, client, "/v1alpha/sessions", map[string]any{
-				"session_hint":    "scoped-session",
-				"image":           "registry.example/ocu-sandbox:v1",
-				"control_pub_key": make([]byte, 32),
-				"mount_intent":    tc.intent,
+				"session_hint": "scoped-session",
+				"image":        "registry.example/ocu-sandbox:v1",
+				"mount_intent": tc.intent,
 			})
 			if code != http.StatusCreated {
 				t.Fatalf("scoped create over the wire = %d (%s); want 201", code, body)
@@ -275,10 +275,9 @@ func TestOperatorTransportCreateMountIntentMalformedRefused(t *testing.T) {
 			client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
 
 			code, body := postForText(t, client, "/v1alpha/sessions", map[string]any{
-				"session_hint":    "malformed",
-				"image":           "img",
-				"control_pub_key": make([]byte, 32),
-				"mount_intent":    tc.intent,
+				"session_hint": "malformed",
+				"image":        "img",
+				"mount_intent": tc.intent,
 			})
 			if code != http.StatusBadRequest {
 				t.Fatalf("malformed mount_intent create = %d (%s); want 400", code, body)
@@ -303,9 +302,8 @@ func TestOperatorTransportCreateMountIntentAuthTokenRefused(t *testing.T) {
 	client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
 
 	code, _ := postForText(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "smuggler",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "smuggler",
+		"image":        "img",
 		"mount_intent": map[string]any{
 			"destination":   "/workspace/out",
 			"filesystem_id": "fs-1",
@@ -329,9 +327,8 @@ func TestOperatorTransportCreateBareBodyStaysNoScope(t *testing.T) {
 	client := boundOperatorWithProvider(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, spy)
 
 	code, body := postForText(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "bare-session",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "bare-session",
+		"image":        "img",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("bare create = %d (%s); want 201", code, body)

@@ -41,14 +41,15 @@ func readEnabledOperator(t *testing.T, resolver ingress.IdentityResolver, deploy
 	})
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  nopProvider{},
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   0,
-		Tier:      ocuruntime.TierRunc,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       0,
+		Tier:          ocuruntime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
 	deps := operator.Deps{
@@ -85,9 +86,8 @@ func TestReadList_LiveSessionsAfterCreate(t *testing.T) {
 
 	// Create a session so a live row exists.
 	code, _ := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "read-list-1",
-		"image":           "ocu/sandbox:test",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "read-list-1",
+		"image":        "ocu/sandbox:test",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create: want 201, got %d", code)
@@ -132,9 +132,8 @@ func TestReadGet_KeyAndNotFound(t *testing.T) {
 	client, _ := readEnabledOperator(t, resolver, operator.DeploymentInfo{RuntimeTier: "gvisor", RuntimeProvider: "docker"})
 
 	code, _ := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "read-get-1",
-		"image":           "ocu/sandbox:test",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "read-get-1",
+		"image":        "ocu/sandbox:test",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create: want 201, got %d", code)

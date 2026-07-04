@@ -50,15 +50,16 @@ func newManagerWithPublisher(t *testing.T, pub lifecycle.EventPublisher) *lifecy
 	gate := quota.NewGate(store, clk, generousLimits())
 
 	return lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: cust,
-		Provider:  newRecordingProvider(),
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   stager,
-		Audit:     sink,
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
-		Events:    pub,
+		Custodian:     cust,
+		Provider:      newRecordingProvider(),
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
+		Events:        pub,
 	})
 }
 

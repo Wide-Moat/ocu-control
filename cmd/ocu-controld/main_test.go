@@ -275,7 +275,7 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 	if err != nil {
 		t.Fatalf("providerOf: %v", err)
 	}
-	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, sink, cfg)
+	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, nil, sink, cfg)
 	seam := ingress.NewOperatorSeam()
 	seq := boot.New(store, clk)
 	op := operator.NewListener(sockPath, operator.Deps{
@@ -341,7 +341,7 @@ func Test_CleanBootCreate_PastDenyGate(t *testing.T) {
 	// the deny gate. On a host with no docker it fails later at Materialize; on a host
 	// with docker it may succeed. Either way the deny sentinels must be absent.
 	_, createErr := op.Handlers().Create(context.Background(), ingress.ConnInfo{Channel: ingress.ChannelOperator}, operator.CreateRequest{
-		SessionHint: "clean-boot", Image: "img", ControlPubKey: make([]byte, 32),
+		SessionHint: "clean-boot", Image: "img",
 	})
 	if errors.Is(createErr, state.ErrKillSwitchEngaged) {
 		t.Fatalf("clean-boot create refused by ErrKillSwitchEngaged — the inert-daemon bug is NOT fixed: %v", createErr)
@@ -357,7 +357,7 @@ func Test_CleanBootCreate_PastDenyGate(t *testing.T) {
 	// authoritative deny-gate check, since the wire status cannot carry the cause.
 	var buf bytes.Buffer
 	_ = json.NewEncoder(&buf).Encode(map[string]any{
-		"session_hint": "clean-boot-wire", "image": "img", "control_pub_key": make([]byte, 32),
+		"session_hint": "clean-boot-wire", "image": "img",
 	})
 	resp, err := client.Post("http://unix/v1alpha/sessions", "application/json", &buf)
 	if err != nil {
@@ -382,7 +382,7 @@ func Test_PersistedGlobalDeny_RefusesUntilResume(t *testing.T) {
 
 	// The restored operator deny refuses the create at the gate.
 	_, createErr := op.Handlers().Create(context.Background(), ingress.ConnInfo{Channel: ingress.ChannelOperator}, operator.CreateRequest{
-		SessionHint: "denied", Image: "img", ControlPubKey: make([]byte, 32),
+		SessionHint: "denied", Image: "img",
 	})
 	if !errors.Is(createErr, state.ErrKillSwitchEngaged) {
 		t.Fatalf("create with a restored operator global deny = %v; want ErrKillSwitchEngaged (durable restore)", createErr)
@@ -401,7 +401,7 @@ func Test_PersistedGlobalDeny_RefusesUntilResume(t *testing.T) {
 
 	// A subsequent create now proceeds past the deny gate.
 	_, afterErr := op.Handlers().Create(context.Background(), ingress.ConnInfo{Channel: ingress.ChannelOperator}, operator.CreateRequest{
-		SessionHint: "after-resume", Image: "img", ControlPubKey: make([]byte, 32),
+		SessionHint: "after-resume", Image: "img",
 	})
 	if errors.Is(afterErr, state.ErrKillSwitchEngaged) {
 		t.Fatalf("create after ResumeAll still refused by ErrKillSwitchEngaged — the in-band lift did not take: %v", afterErr)

@@ -50,14 +50,15 @@ func boundOperatorWithStores(t *testing.T, resolver ingress.IdentityResolver) (*
 	})
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  nopProvider{},
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   0, // ProfileTrustedOperator
-		Tier:      ocuruntime.TierRunc,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       0, // ProfileTrustedOperator
+		Tier:          ocuruntime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
 	mcpStore := mcpkey.NewInMemRecordStore()
@@ -121,9 +122,8 @@ func TestOperatorTransportRevokeOneDeniesTheAddressedKey(t *testing.T) {
 	client, stores := boundOperatorWithStores(t, resolver)
 
 	code, body := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "argseam-revoke-one",
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "argseam-revoke-one",
+		"image":        "img",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create = %d; want 201", code)
@@ -220,9 +220,8 @@ func TestOperatorTransportDestroyAddressesTheBodySession(t *testing.T) {
 
 	const hint = "argseam-destroy"
 	code, _ := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    hint,
-		"image":           "img",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": hint,
+		"image":        "img",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create = %d; want 201", code)

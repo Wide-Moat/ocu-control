@@ -5,9 +5,12 @@ package cred_test
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -102,13 +105,63 @@ func TestMintStorageScopeRefusals(t *testing.T) {
 	}
 }
 
-// TestMintExecIdentityRefusal asserts the exec mint refuses an empty
-// container_name: the subject is the host-attested binding, never absent.
-func TestMintExecIdentityRefusal(t *testing.T) {
+// The exec mint's empty-container_name refusal now lives on *ExecSigner and is
+// covered by TestExecSignerRefusesEmptyContainerName in execsigner_test.go — the
+// storage Signer no longer mints exec JWTs (ADR-0013 key separation).
+
+// TestStorageJWTDistinctJTIAcrossInstants kills the nano-byte-extraction mutant in
+// deriveJTI: two mints for the SAME session at DISTINCT instants must get DISTINCT
+// jti handles (so the Revoker indexes each mint separately). If the mint instant's
+// nanoseconds stopped mixing into the derived handle (the survived no-op mutant on
+// the byte-extraction loop), both mints would collide on one jti and this fails.
+func TestStorageJWTDistinctJTIAcrossInstants(t *testing.T) {
 	t.Parallel()
-	signer, _ := newTestSigner(t, cred.AlgEdDSA, time.Minute)
-	_, err := signer.MintExecJWT(context.Background(), cred.ExecMintReq{ContainerName: "", RequestedTTL: time.Minute})
-	if !errors.Is(err, cred.ErrMintIdentity) {
-		t.Fatalf("empty container_name: want ErrMintIdentity, got %v", err)
+	signer, clk := newTestSigner(t, cred.AlgEdDSA, 10*time.Minute)
+	req := cred.StorageMintReq{
+		SessionKey:   "host-session-key",
+		FilesystemID: "fs-jti",
+		Authz:        cred.AuthorizationMetadata{Intent: cred.IntentRead},
 	}
+
+	tok1, err := signer.MintStorageJWT(context.Background(), req)
+	if err != nil {
+		t.Fatalf("mint 1: %v", err)
+	}
+	// Advance by a sub-second amount so ONLY the nanosecond bytes differ — the exact
+	// bytes the extraction loop mixes in. A whole-second advance would also move the
+	// exp claim; the point here is that the nano bytes alone change the jti.
+	clk.Advance(1234 * time.Nanosecond)
+	tok2, err := signer.MintStorageJWT(context.Background(), req)
+	if err != nil {
+		t.Fatalf("mint 2: %v", err)
+	}
+
+	jti1 := jtiOf(t, tok1.Reveal())
+	jti2 := jtiOf(t, tok2.Reveal())
+	if jti1 == "" || jti2 == "" {
+		t.Fatalf("empty jti: %q / %q", jti1, jti2)
+	}
+	if jti1 == jti2 {
+		t.Fatalf("two mints at distinct instants share jti %q — the mint-instant nanoseconds are not mixed into the handle", jti1)
+	}
+}
+
+// jtiOf decodes the jti claim from a compact JWS payload.
+func jtiOf(t *testing.T, compact string) string {
+	t.Helper()
+	parts := strings.Split(compact, ".")
+	if len(parts) != 3 {
+		t.Fatalf("not a compact JWS: %q", compact)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var claims struct {
+		JTI string `json:"jti"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	return claims.JTI
 }

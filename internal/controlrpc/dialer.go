@@ -47,7 +47,7 @@ const controlSockName = "control.sock"
 const defaultDialTimeout = 5 * time.Second
 
 // execMinter is the NARROW seam the dialer reaches the per-dial exec JWT through.
-// It is satisfied by *cred.Signer but names only MintExecJWT, so the load-bearing
+// It is satisfied by *cred.ExecSigner but names only MintExecJWT, so the load-bearing
 // controlrpc package depends on the mint method, not the whole custody Signer (and
 // never on the signing key). The minted Token redacts on every emit surface; the
 // raw compact JWT is revealed only at the single Authorization-write call site.
@@ -57,7 +57,7 @@ type execMinter interface {
 
 // Compile-time proof *cred.Signer satisfies the narrow execMinter seam, so the
 // production wiring type-checks and a test fake matches the same shape.
-var _ execMinter = (*cred.Signer)(nil)
+var _ execMinter = (*cred.ExecSigner)(nil)
 
 // Dialer dials the host-owned control UDS in the guest's 0700 host-owned sock
 // directory (ADR-0018). It is NOT loopback TCP: a non-host peer cannot connect(2)
@@ -162,41 +162,56 @@ func (d *Dialer) Shutdown(ctx context.Context, sockDir, containerName string) er
 	}
 }
 
-// verifyHostOwnedDir is the 0700 host-owned-directory gate: it asserts sockDir
-// exists, is a directory, is owned by the dialing host process's effective uid,
-// and carries no group/other permission bits (mode 0700, the owner-only mode the
-// handoff stager wrote). A non-host-owned or world-accessible sock dir is refused
-// here, before any connect(2), so the host never speaks to a socket a non-host
-// peer could have planted.
+// verifyHostOwnedDir is the pre-connect trust gate on the staged sock directory.
+// The staged layout is a 0700 per-session ROOT with a 0777 sock LEAF inside it:
+// the leaf is deliberately world-writable so the CapDrop-ALL guest can bind(2) its
+// socket, and the 0700 root PARENT is the trust wall — no other host user can
+// traverse into the root, so no non-host peer can plant a socket the host would
+// dial. The gate asserts the leaf is a host-owned directory (its OWN 0777 mode is
+// intended, not a rejection reason) and the parent root is a host-owned directory
+// with no group/other bits (exactly 0700). A non-host-owned or world-traversable
+// layout is refused here, before any connect(2).
 func verifyHostOwnedDir(sockDir string) error {
 	if sockDir == "" {
 		return fmt.Errorf("%w: empty sock dir", ErrSockDirGate)
 	}
-	info, err := os.Stat(sockDir)
+	// The leaf: a host-owned directory. Its 0777 mode is intended (guest bind(2)).
+	leaf, err := os.Stat(sockDir)
 	if err != nil {
 		return fmt.Errorf("%w: stat %q: %v", ErrSockDirGate, sockDir, err)
 	}
-	if !info.IsDir() {
+	if !leaf.IsDir() {
 		return fmt.Errorf("%w: %q is not a directory", ErrSockDirGate, sockDir)
 	}
-	// Refuse any group- or other-accessible bit: the directory must be exactly
-	// owner-only (0700) so no non-host user can read or plant a socket in it.
-	if info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("%w: %q mode %o is looser than 0700", ErrSockDirGate, sockDir, info.Mode().Perm())
+	if err := assertHostOwned(sockDir, leaf); err != nil {
+		return err
 	}
-	// Assert the directory is owned by the dialing host process: a directory owned
-	// by another uid is not host-owned even at 0700.
+	// The parent root: host-owned AND exactly 0700 (the traversal wall).
+	parent := filepath.Dir(sockDir)
+	pinfo, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("%w: stat parent %q: %v", ErrSockDirGate, parent, err)
+	}
+	if !pinfo.IsDir() {
+		return fmt.Errorf("%w: parent %q is not a directory", ErrSockDirGate, parent)
+	}
+	if pinfo.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("%w: parent %q mode %o is looser than 0700", ErrSockDirGate, parent, pinfo.Mode().Perm())
+	}
+	return assertHostOwned(parent, pinfo)
+}
+
+// assertHostOwned refuses a path whose owner uid is not the dialing host process's
+// effective uid. Geteuid returns -1 where unsupported; the uid is bounded before
+// the narrowing conversion so a uid outside the file-owner space cannot wrap.
+func assertHostOwned(path string, info os.FileInfo) error {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return fmt.Errorf("%w: %q has no ownership metadata", ErrSockDirGate, sockDir)
+		return fmt.Errorf("%w: %q has no ownership metadata", ErrSockDirGate, path)
 	}
-	// Geteuid returns -1 on platforms where it is unsupported; guard both the
-	// negative sentinel and the uint32 range before the narrowing conversion so a
-	// uid outside the file-owner space cannot wrap. A bounded uid then compares
-	// directly against the directory owner.
 	euid := os.Geteuid()
 	if euid >= 0 && uint64(euid) <= math.MaxUint32 && st.Uid != uint32(euid) {
-		return fmt.Errorf("%w: %q owner uid %d is not the host uid %d", ErrSockDirGate, sockDir, st.Uid, euid)
+		return fmt.Errorf("%w: %q owner uid %d is not the host uid %d", ErrSockDirGate, path, st.Uid, euid)
 	}
 	return nil
 }

@@ -42,9 +42,8 @@ func TestOperatorTransportRealPeerCredResolverEndToEnd(t *testing.T) {
 	// kernel attests this process's uid. If the production chain is wired correctly
 	// the create is admitted (a create by an unattested caller would be 401).
 	code, _ := postJSON(t, client, "/v1alpha/sessions", map[string]any{
-		"session_hint":    "peercred-e2e",
-		"image":           "ocu/sandbox:test",
-		"control_pub_key": make([]byte, 32),
+		"session_hint": "peercred-e2e",
+		"image":        "ocu/sandbox:test",
 	})
 	if code != http.StatusCreated {
 		t.Fatalf("create with the real peer-cred resolver over a socket = %d; want 201 (the kernel-attested caller must be admitted end-to-end)", code)

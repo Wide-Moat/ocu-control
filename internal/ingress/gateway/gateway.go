@@ -105,13 +105,12 @@ func (h *Handlers) Create(ctx context.Context, _ ingress.ServiceScope, conn ingr
 		return state.SessionRow{}, err
 	}
 	in := lifecycle.CreateInput{
-		Caller:        caller,
-		SessionHint:   req.SessionHint,
-		Image:         req.Image,
-		Mount:         req.Mount,
-		Egress:        req.Egress,
-		Resources:     req.Resources,
-		ControlPubKey: req.ControlPubKey,
+		Caller:      caller,
+		SessionHint: req.SessionHint,
+		Image:       req.Image,
+		Mount:       req.Mount,
+		Egress:      req.Egress,
+		Resources:   req.Resources,
 	}
 	return h.manager.Create(ctx, in)
 }
@@ -173,8 +172,6 @@ type CreateRequest struct {
 	Egress runtime.EgressPolicy
 	// Resources are the hard caps stamped onto the runtime.
 	Resources runtime.ResourceCaps
-	// ControlPubKey is the raw 32-byte Ed25519 public key staged for the guest.
-	ControlPubKey []byte
 }
 
 // Listener is the gateway TCP/mTLS listener. It owns the bound socket, the

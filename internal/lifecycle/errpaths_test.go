@@ -125,14 +125,15 @@ func newErrManager(t *testing.T) *lcDeps {
 	provider := &teardownFaultProvider{}
 	sink := audit.NewRecordingFake()
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: registry.NewCustodian(store),
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 100, CreateRatePerCallerPerMin: 100}),
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     sink,
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 100, CreateRatePerCallerPerMin: 100}),
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 	})
 	return &lcDeps{mgr: mgr, store: store, provider: provider, audit: sink}
 }
@@ -499,14 +500,15 @@ func TestUnwindCompensatorErrorsAreSwallowed(t *testing.T) {
 	store := &errStore{listerStore: inner, failCommit: true, failRelease: true}
 	provider := &teardownFaultProvider{forceKillErr: errLcInjected}
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: registry.NewCustodian(store),
-		Provider:  provider,
-		Clock:     clk,
-		Quota:     quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 100, CreateRatePerCallerPerMin: 100}),
-		Handoff:   unstageFailStager{inner: handoff.NewStager(t.TempDir())},
-		Audit:     audit.NewRecordingFake(),
-		Profile:   admission.ProfileTrustedOperator,
-		Tier:      runtime.TierRunc,
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 100, CreateRatePerCallerPerMin: 100}),
+		Handoff:       unstageFailStager{inner: handoff.NewStager(t.TempDir())},
+		Audit:         audit.NewRecordingFake(),
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: pub32(),
 	})
 
 	// Commit fails (S7), so the unwind replays S6 (ForceKill -> error), S5 (Unstage ->

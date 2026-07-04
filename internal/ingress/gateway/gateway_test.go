@@ -47,14 +47,15 @@ func newTestHandlers(t *testing.T, resolver ingress.IdentityResolver) (*gateway.
 		CreateRatePerCallerPerMin:   16,
 	})
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
-		Custodian: custodian,
-		Provider:  nopProvider{},
-		Clock:     clk,
-		Quota:     gate,
-		Handoff:   handoff.NewStager(t.TempDir()),
-		Audit:     audit.NewRecordingFake(),
-		Profile:   0, // ProfileTrustedOperator
-		Tier:      runtime.TierRunc,
+		Custodian:     custodian,
+		Provider:      nopProvider{},
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       handoff.NewStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       0, // ProfileTrustedOperator
+		Tier:          runtime.TierRunc,
+		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	h := gateway.NewHandlers(gateway.Deps{Manager: mgr, Resolver: resolver})
 	return h, ingress.ServiceScopeFor()
@@ -75,8 +76,7 @@ func TestUnattestedGatewayConnectionRefused(t *testing.T) {
 	h, scope := newTestHandlers(t, gateway.NewCertSANResolver(nil))
 
 	_, err := h.Create(context.Background(), scope, gatewayConn(), gateway.CreateRequest{
-		Image:         "img",
-		ControlPubKey: make([]byte, 32),
+		Image: "img",
 	})
 	if !errors.Is(err, ingress.ErrUnattested) {
 		t.Fatalf("Create with no verified SAN = %v; want ingress.ErrUnattested", err)
@@ -145,4 +145,15 @@ func TestGatewayBindAndAddr(t *testing.T) {
 	if l.Addr() == "" {
 		t.Fatal("Addr() empty after Bind; want a bound host:port")
 	}
+}
+
+// ingressTestExecVerifyKey is a 32-byte Ed25519-shaped verify key the handoff
+// stager accepts on every scoped create. It stands in for the deployment-fixed
+// exec verify key the daemon derives from -exec-signing-key.
+func ingressTestExecVerifyKey() []byte {
+	k := make([]byte, 32)
+	for i := range k {
+		k[i] = byte(i + 1)
+	}
+	return k
 }
