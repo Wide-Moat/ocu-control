@@ -116,31 +116,52 @@ func TestMinterPropagatesMintError(t *testing.T) {
 	}
 }
 
-// TestVerifyHostOwnedDir pins the pre-connect gate: only an existing, host-owned,
-// exactly-0700 directory passes; a looser mode, a missing path, or a plain file
-// is refused with ErrSockDirGate BEFORE any connect(2).
+// stagedSockDir builds the real handoff layout — a 0700 per-session ROOT with a
+// 0777 sock LEAF inside it (the exact shape handoff.Stager writes: the leaf is
+// world-writable by design so the CapDrop-ALL guest can bind(2) its socket, while
+// the 0700 root parent is the trust wall). It returns the leaf, which is what the
+// driver passes to the gate.
+func stagedSockDir(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatalf("chmod root: %v", err)
+	}
+	leaf := filepath.Join(root, "sock")
+	if err := os.Mkdir(leaf, 0o777); err != nil {
+		t.Fatalf("mkdir leaf: %v", err)
+	}
+	if err := os.Chmod(leaf, 0o777); err != nil {
+		t.Fatalf("chmod leaf: %v", err)
+	}
+	return leaf
+}
+
+// TestVerifyHostOwnedDir pins the pre-connect gate on the REAL staged layout: the
+// sock LEAF is a 0777 euid-owned directory (so the CapDrop guest can bind(2)), and
+// the gate's trust check is on the ROOT PARENT — it must be an exactly-0700
+// host-owned directory. A world/group-accessible PARENT, a missing path, or a
+// plain file is refused with ErrSockDirGate BEFORE any connect(2). The leaf's own
+// 0777 mode is NOT a rejection reason (that was the bug that killed every exec).
 func TestVerifyHostOwnedDir(t *testing.T) {
 	t.Parallel()
 
-	t.Run("owner-only dir passes", func(t *testing.T) {
+	t.Run("0777 leaf under a 0700 root passes", func(t *testing.T) {
 		t.Parallel()
-		dir := t.TempDir()
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Fatalf("chmod: %v", err)
-		}
-		if err := verifyHostOwnedDir(dir); err != nil {
-			t.Fatalf("verifyHostOwnedDir(0700 owned) = %v; want nil", err)
+		leaf := stagedSockDir(t)
+		if err := verifyHostOwnedDir(leaf); err != nil {
+			t.Fatalf("verifyHostOwnedDir(0777 leaf / 0700 root) = %v; want nil", err)
 		}
 	})
 
-	t.Run("group-accessible dir refused", func(t *testing.T) {
+	t.Run("group-accessible PARENT refused", func(t *testing.T) {
 		t.Parallel()
-		dir := t.TempDir()
-		if err := os.Chmod(dir, 0o750); err != nil {
-			t.Fatalf("chmod: %v", err)
+		leaf := stagedSockDir(t)
+		if err := os.Chmod(filepath.Dir(leaf), 0o750); err != nil {
+			t.Fatalf("chmod parent: %v", err)
 		}
-		if err := verifyHostOwnedDir(dir); !errors.Is(err, ErrSockDirGate) {
-			t.Fatalf("verifyHostOwnedDir(0750) = %v; want ErrSockDirGate", err)
+		if err := verifyHostOwnedDir(leaf); !errors.Is(err, ErrSockDirGate) {
+			t.Fatalf("verifyHostOwnedDir(0750 parent) = %v; want ErrSockDirGate", err)
 		}
 	})
 
@@ -151,14 +172,18 @@ func TestVerifyHostOwnedDir(t *testing.T) {
 		}
 	})
 
-	t.Run("plain file refused", func(t *testing.T) {
+	t.Run("plain file leaf refused", func(t *testing.T) {
 		t.Parallel()
-		path := filepath.Join(t.TempDir(), "sock")
-		if err := os.WriteFile(path, nil, 0o700); err != nil {
+		root := t.TempDir()
+		if err := os.Chmod(root, 0o700); err != nil {
+			t.Fatalf("chmod: %v", err)
+		}
+		path := filepath.Join(root, "sock")
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
 			t.Fatalf("write: %v", err)
 		}
 		if err := verifyHostOwnedDir(path); !errors.Is(err, ErrSockDirGate) {
-			t.Fatalf("verifyHostOwnedDir(file) = %v; want ErrSockDirGate", err)
+			t.Fatalf("verifyHostOwnedDir(file leaf) = %v; want ErrSockDirGate", err)
 		}
 	})
 

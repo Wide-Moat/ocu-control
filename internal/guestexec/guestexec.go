@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 
@@ -76,38 +77,65 @@ func (m *Minter) Mint(ttl time.Duration) (string, error) {
 	return tok.Reveal(), nil
 }
 
-// ErrSockDirGate is returned when the host-owned 0700 gate on the exec sock
-// directory fails. The dial is refused BEFORE any connect(2), so a socket
-// planted in a non-host-owned or world-accessible directory is never spoken to
-// (the same host-only-at-accept realization the control-RPC dialer enforces).
-var ErrSockDirGate = errors.New("guestexec: exec sock dir failed the host-owned 0700 gate")
+// ErrSockDirGate is returned when the host-owned gate on the exec sock directory
+// fails. The dial is refused BEFORE any connect(2), so a socket planted in a
+// non-host-owned or world-traversable location is never spoken to (the same
+// host-only-at-accept realization the control-RPC dialer enforces).
+var ErrSockDirGate = errors.New("guestexec: exec sock dir failed the host-owned gate")
 
-// verifyHostOwnedDir asserts sockDir exists, is a directory, is owned by the
-// dialing host process's effective uid, and carries no group/other permission
-// bits (mode 0700 — the owner-only mode the handoff stager wrote).
+// verifyHostOwnedDir is the pre-connect trust gate on the staged sock directory.
+// The staged layout is a 0700 per-session ROOT with a 0777 sock LEAF inside it:
+// the leaf is deliberately world-writable so the CapDrop-ALL guest can bind(2) its
+// socket, and the 0700 root PARENT is the trust wall — no other host user can
+// traverse into the root, so no non-host peer can plant a socket the host would
+// dial. The gate therefore asserts:
+//
+//   - the sock leaf exists, is a directory, and is owned by the dialing host uid
+//     (a leaf owned by another uid is not host-staged); its OWN mode is NOT
+//     checked — 0777 is by design, and gating on it here rejected every real exec.
+//   - the parent root is a directory, is owned by the dialing host uid, and carries
+//     NO group/other permission bits (exactly 0700) — the traversal wall.
 func verifyHostOwnedDir(sockDir string) error {
 	if sockDir == "" {
 		return fmt.Errorf("%w: empty sock dir", ErrSockDirGate)
 	}
-	info, err := os.Stat(sockDir)
+	// The leaf: a host-owned directory. Its 0777 mode is intended (guest bind(2)).
+	leaf, err := os.Stat(sockDir)
 	if err != nil {
 		return fmt.Errorf("%w: stat %q: %v", ErrSockDirGate, sockDir, err)
 	}
-	if !info.IsDir() {
+	if !leaf.IsDir() {
 		return fmt.Errorf("%w: %q is not a directory", ErrSockDirGate, sockDir)
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("%w: %q mode %o is looser than 0700", ErrSockDirGate, sockDir, info.Mode().Perm())
+	if err := assertHostOwned(sockDir, leaf); err != nil {
+		return err
 	}
+	// The parent root: host-owned AND exactly 0700 (the traversal wall).
+	parent := filepath.Dir(sockDir)
+	pinfo, err := os.Stat(parent)
+	if err != nil {
+		return fmt.Errorf("%w: stat parent %q: %v", ErrSockDirGate, parent, err)
+	}
+	if !pinfo.IsDir() {
+		return fmt.Errorf("%w: parent %q is not a directory", ErrSockDirGate, parent)
+	}
+	if pinfo.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("%w: parent %q mode %o is looser than 0700", ErrSockDirGate, parent, pinfo.Mode().Perm())
+	}
+	return assertHostOwned(parent, pinfo)
+}
+
+// assertHostOwned refuses a path whose owner uid is not the dialing host process's
+// effective uid. Geteuid returns -1 where unsupported; the uid is bounded before
+// the narrowing conversion so a uid outside the file-owner space cannot wrap.
+func assertHostOwned(path string, info os.FileInfo) error {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return fmt.Errorf("%w: %q has no ownership metadata", ErrSockDirGate, sockDir)
+		return fmt.Errorf("%w: %q has no ownership metadata", ErrSockDirGate, path)
 	}
-	// Geteuid returns -1 where unsupported; bound the uid before the narrowing
-	// conversion so a uid outside the file-owner space cannot wrap.
 	euid := os.Geteuid()
 	if euid >= 0 && uint64(euid) <= math.MaxUint32 && st.Uid != uint32(euid) {
-		return fmt.Errorf("%w: %q owner uid %d is not the host uid %d", ErrSockDirGate, sockDir, st.Uid, euid)
+		return fmt.Errorf("%w: %q owner uid %d is not the host uid %d", ErrSockDirGate, path, st.Uid, euid)
 	}
 	return nil
 }
