@@ -143,6 +143,21 @@ func (h *Handlers) Status(ctx context.Context, _ ingress.ServiceScope, conn ingr
 	return h.manager.Status(ctx, caller, sessionHint)
 }
 
+// Exec runs one command in the caller's OWN session guest. The host-derived caller
+// gates the row lookup exactly as Destroy/Status do — a foreign or absent
+// sessionHint yields registry.ErrNotOwned (indistinguishable from not-found), so a
+// service caller can neither exec into another tenant's session nor probe its
+// existence (NFR-SEC-43). The body carries the command and its optional
+// environment, working directory, stdin, and timeout as intents; identity is never
+// a field here.
+func (h *Handlers) Exec(ctx context.Context, _ ingress.ServiceScope, conn ingress.ConnInfo, sessionHint string, req lifecycle.ExecRequest) (lifecycle.ExecResult, error) {
+	caller, err := h.resolveCaller(ctx, conn)
+	if err != nil {
+		return lifecycle.ExecResult{}, err
+	}
+	return h.manager.Exec(ctx, caller, sessionHint, req)
+}
+
 // CreateRequest is the body of a gateway create. Its fields are HINTS carried onto
 // the lifecycle CreateInput; the authority is the host-derived caller the resolver
 // produced from the verified SAN, never any field here (NFR-SEC-43).
