@@ -213,6 +213,12 @@ func activityFor(a audit.Action) (uint8, string) {
 		audit.ActionResumeGlobal,
 		audit.ActionMCPKeyCreate, audit.ActionMCPKeyRevoke:
 		return activityUpdate, a.String()
+	case audit.ActionExec:
+		// One exec tool-call spawns a process in the session's guest — the created
+		// resource is the guest child process, so the honest CRUD slot is Create.
+		// The name stays the Action label ("exec"), so the record is
+		// self-describing next to the session-create Create events.
+		return activityCreate, a.String()
 	case audit.ActionCreateRejected:
 		// A refused create produced no resource, so it has no CRUD slot: it maps to
 		// Other(99) by an EXPLICIT case (not the unknown fall-through). The name still

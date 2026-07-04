@@ -47,17 +47,23 @@ func TestProperty_SEC45ExhaustiveOverPrivilegedEnum(t *testing.T) {
 	privSet := actionSet(priv)
 	sec45 := actionSet(audit.SEC45Actions())
 	sec72 := actionSet(audit.SEC72EnumActions())
+	toolCall := actionSet(audit.ToolCallActions())
 
 	// (a) Every privileged action is covered by at least one fixture family (no
-	// escape), and the only double-classification is the pinned teardown overlap.
+	// escape); the only double-classification is the pinned teardown overlap, and
+	// the tool-call family overlaps with neither.
 	for _, a := range priv {
 		in45 := sec45[a]
 		in72 := sec72[a]
-		if !in45 && !in72 {
-			t.Fatalf("privileged action %v is in neither fixture family — it escaped the audit wrap", a)
+		inTool := toolCall[a]
+		if !in45 && !in72 && !inTool {
+			t.Fatalf("privileged action %v is in no fixture family — it escaped the audit wrap", a)
 		}
 		if in45 && in72 && !allowedOverlap[a] {
 			t.Fatalf("privileged action %v is double-classified (SEC45 and SEC72) but is not the pinned teardown overlap", a)
+		}
+		if inTool && (in45 || in72) {
+			t.Fatalf("tool-call action %v is double-classified into SEC45/SEC72 — the families must be disjoint", a)
 		}
 	}
 
@@ -83,6 +89,9 @@ func TestProperty_SEC45ExhaustiveOverPrivilegedEnum(t *testing.T) {
 	for a := range sec72 {
 		union[a] = true
 	}
+	for a := range toolCall {
+		union[a] = true
+	}
 	if len(union) != len(privSet) {
 		t.Fatalf("SEC45 ∪ SEC72-with-enum has %d actions, PrivilegedActions has %d — the wrap is not exhaustive", len(union), len(privSet))
 	}
@@ -104,7 +113,7 @@ func TestProperty_SEC45ExhaustiveOverPrivilegedEnum(t *testing.T) {
 		}
 		// A privileged action must classify into exactly one fixture family; an
 		// unknown must classify into neither.
-		coveredBy45or72 := sec45[a] || sec72[a]
+		coveredBy45or72 := sec45[a] || sec72[a] || toolCall[a]
 		if got != coveredBy45or72 {
 			rt.Fatalf("Action(%d): privileged=%v but covered-by-fixture=%v — classification mismatch", raw, got, coveredBy45or72)
 		}
@@ -129,6 +138,7 @@ func TestEmitCallSiteActionsArePinned(t *testing.T) {
 		audit.ActionCreateRejected, // lifecycle stageAdmit/stageQuotaCharge/stageReserve deny
 		audit.ActionMCPKeyCreate,   // mcpkey Engine Create
 		audit.ActionMCPKeyRevoke,   // mcpkey Engine Revoke
+		audit.ActionExec,           // guest exec tool-call record (ADR-0024 driver wiring)
 	}
 	priv := actionSet(audit.PrivilegedActions())
 	for _, a := range callSiteActions {
@@ -164,8 +174,8 @@ func TestCreateRejectedIsSEC72Only(t *testing.T) {
 // a fixture-set change without a version bump fails this pin.
 func TestFixtureVersionPinned(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v2" {
-		t.Fatalf("FixtureVersion = %q, want v2", audit.FixtureVersion)
+	if audit.FixtureVersion != "v3" {
+		t.Fatalf("FixtureVersion = %q, want v3", audit.FixtureVersion)
 	}
 }
 

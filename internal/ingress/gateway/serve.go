@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -209,6 +210,88 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, sessionResponse{Key: row.Key, State: int(row.State)})
 	})
+
+	mux.HandleFunc("/v1alpha/sessions/exec", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		conn := connInfoFromRequest(r)
+		var body execBody
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeDecodeError(w, err)
+			return
+		}
+		req, err := body.toExecRequest()
+		if err != nil {
+			// A malformed exec body (empty argv, bad base64 stdin) is an invalid
+			// argument: deny -> 400, refused before the row lookup and the driver.
+			writeStatus(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		res, err := h.Exec(r.Context(), scope, conn, body.SessionHint, req)
+		if err != nil {
+			writeServiceError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, execResponse{
+			ExitCode:        res.ExitCode,
+			StdoutB64:       base64.StdEncoding.EncodeToString(res.Stdout),
+			StderrB64:       base64.StdEncoding.EncodeToString(res.Stderr),
+			StdoutTruncated: res.StdoutTruncated,
+			StderrTruncated: res.StderrTruncated,
+		})
+	})
+}
+
+// execBody is the gateway exec request: the addressed session hint plus the
+// command and its optional environment, working directory, base64 stdin, and
+// timeout. The hint ADDRESSES the caller's own row (NFR-SEC-43); no field carries
+// identity or a credential.
+type execBody struct {
+	SessionHint string            `json:"session_hint"`
+	Argv        []string          `json:"argv"`
+	Env         map[string]string `json:"env"`
+	Cwd         string            `json:"cwd"`
+	StdinB64    string            `json:"stdin_b64"`
+	TimeoutS    uint32            `json:"timeout_s"`
+}
+
+// errExecEmptyArgv is the wire refusal for a missing command.
+var errExecEmptyArgv = errors.New("exec: argv must be non-empty")
+
+// toExecRequest validates and maps the wire body to the in-process ExecRequest:
+// argv must be non-empty and stdin_b64 must decode, each a deny -> 400 before the
+// row lookup. Stdin rides base64 (a []byte on the wire), never a credential.
+func (b execBody) toExecRequest() (lifecycle.ExecRequest, error) {
+	if len(b.Argv) == 0 || b.Argv[0] == "" {
+		return lifecycle.ExecRequest{}, errExecEmptyArgv
+	}
+	var stdin []byte
+	if b.StdinB64 != "" {
+		decoded, err := base64.StdEncoding.DecodeString(b.StdinB64)
+		if err != nil {
+			return lifecycle.ExecRequest{}, fmt.Errorf("exec: stdin_b64 is not valid base64: %w", err)
+		}
+		stdin = decoded
+	}
+	return lifecycle.ExecRequest{
+		Argv:     b.Argv,
+		Env:      b.Env,
+		Cwd:      b.Cwd,
+		Stdin:    stdin,
+		TimeoutS: b.TimeoutS,
+	}, nil
+}
+
+// execResponse is the gateway exec result: the guest child's exit code and the
+// captured, per-stream-bounded output as base64, with the truncation flags.
+type execResponse struct {
+	ExitCode        uint8  `json:"exit_code"`
+	StdoutB64       string `json:"stdout_b64"`
+	StderrB64       string `json:"stderr_b64"`
+	StdoutTruncated bool   `json:"stdout_truncated"`
+	StderrTruncated bool   `json:"stderr_truncated"`
 }
 
 // createBody is the minimal JSON create request. SessionHint and the runtime

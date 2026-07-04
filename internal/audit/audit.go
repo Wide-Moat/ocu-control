@@ -74,6 +74,15 @@ const (
 	// fail-closed BEFORE the record status is flipped and the artifact re-rendered.
 	// Inserted BEFORE ActionCreateRejected so the boundary anchor stays last.
 	ActionMCPKeyRevoke
+	// ActionExec is one exec tool-call driven into a session's guest over the
+	// exec channel (ADR-0024). It is the host-authored tool-call record the F10
+	// evidence stream requires — the guest cannot disable it — and it is
+	// durable-before-ack: an exec whose record cannot be committed is answered
+	// with a failure, never a silent success. It is neither an operator/SOAR
+	// state-mutating action (SEC-45) nor a system-initiated lifecycle transition
+	// (SEC-72); it forms the tool-call fixture family. Inserted BEFORE
+	// ActionCreateRejected so the boundary anchor stays last.
+	ActionExec
 	// ActionCreateRejected is a session create REFUSED at a pre-side-effect deny
 	// stage (admission, quota, or the kill-switch/denylist re-check). It is the
 	// system-initiated rejection record NFR-SEC-46/72 require: the deny itself is
@@ -108,6 +117,8 @@ func (a Action) String() string {
 		return "mcp_key_create"
 	case ActionMCPKeyRevoke:
 		return "mcp_key_revoke"
+	case ActionExec:
+		return "exec"
 	case ActionCreateRejected:
 		return "create_rejected"
 	default:

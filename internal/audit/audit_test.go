@@ -138,6 +138,7 @@ func TestActionString(t *testing.T) {
 		{audit.ActionEditDenylist, "edit_denylist"},
 		{audit.ActionOverrideQuota, "override_quota"},
 		{audit.ActionRetentionPolicy, "retention_policy"},
+		{audit.ActionExec, "exec"},
 		{audit.ActionCreateRejected, "create_rejected"},
 		{audit.Action(250), "audit_action_unknown"},
 	}
@@ -164,5 +165,22 @@ func TestActionCreateRejectedStringAndPrivileged(t *testing.T) {
 	beyond := audit.Action(uint8(audit.ActionCreateRejected) + 1)
 	if audit.IsPrivileged(beyond) {
 		t.Fatalf("IsPrivileged(%d) = true, want false (one past the last enum arm)", beyond)
+	}
+}
+
+// TestActionExecStringAndPrivileged pins the exec tool-call arm: its String label
+// is "exec", it is an enumerated privileged Action (the F10 tool-call record is
+// durable-before-ack), and it sits INSIDE the closed enum (the boundary anchor
+// ActionCreateRejected stays last).
+func TestActionExecStringAndPrivileged(t *testing.T) {
+	t.Parallel()
+	if got := audit.ActionExec.String(); got != "exec" {
+		t.Fatalf("ActionExec.String() = %q, want exec", got)
+	}
+	if !audit.IsPrivileged(audit.ActionExec) {
+		t.Fatal("IsPrivileged(ActionExec) = false, want true")
+	}
+	if audit.ActionExec >= audit.ActionCreateRejected {
+		t.Fatal("ActionExec must sit before the ActionCreateRejected boundary anchor")
 	}
 }

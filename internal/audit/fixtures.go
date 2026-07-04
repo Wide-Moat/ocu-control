@@ -21,7 +21,7 @@ package audit
 // a forward-declared deferred-verb label — is a version bump. It is carried in the
 // audit metadata so a downstream fan-in can pin which fixture revision a source was
 // running.
-const FixtureVersion = "v2"
+const FixtureVersion = "v3"
 
 // lastAction is the highest valid Action enum value. It anchors the exhaustive walk
 // of the closed enum: PrivilegedActions enumerates 0..lastAction inclusive, and the
@@ -71,6 +71,19 @@ func SEC45Actions() []Action {
 		ActionResumeGlobal,    // operator global-deny LIFT (symmetric to RevokeAll)
 		ActionMCPKeyCreate,    // operator mcp-key issuance (SEC-45 state-mutating)
 		ActionMCPKeyRevoke,    // operator mcp-key revocation (SEC-45 state-mutating)
+	}
+}
+
+// ToolCallActions returns the F10 tool-call evidence family: the host-authored
+// records of caller-driven tool executions inside a session's guest. It is the
+// third fixture family, DISJOINT from SEC-45 (not operator/SOAR state-mutating)
+// and SEC-72 (not a system-initiated lifecycle transition): an exec is a
+// service-caller verb whose record the exec supervisor authors host-side — the
+// guest cannot disable it. The set is closed and versioned; it participates in
+// the exhaustiveness union alongside the other two families.
+func ToolCallActions() []Action {
+	return []Action{
+		ActionExec, // one exec tool-call driven over the exec channel (ADR-0024)
 	}
 }
 

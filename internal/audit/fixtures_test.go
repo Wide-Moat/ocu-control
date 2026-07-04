@@ -25,6 +25,7 @@ func TestPrivilegedActionsIsClosedEnum(t *testing.T) {
 		audit.ActionResumeGlobal,
 		audit.ActionMCPKeyCreate,
 		audit.ActionMCPKeyRevoke,
+		audit.ActionExec,
 		audit.ActionCreateRejected,
 	}
 	got := audit.PrivilegedActions()
@@ -157,7 +158,34 @@ func TestSEC72EnumActionsDistinct(t *testing.T) {
 // TestFixtureVersion pins the versioned fixture stamp.
 func TestFixtureVersion(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v2" {
-		t.Fatalf("FixtureVersion = %q, want v2", audit.FixtureVersion)
+	if audit.FixtureVersion != "v3" {
+		t.Fatalf("FixtureVersion = %q, want v3", audit.FixtureVersion)
+	}
+}
+
+// TestToolCallActionsFamily pins the third fixture family: the F10 tool-call
+// evidence records. It holds exactly the exec arm, every entry is privileged, and
+// the family is DISJOINT from both SEC-45 (not an operator/SOAR action) and
+// SEC-72 (not a system-initiated lifecycle transition).
+func TestToolCallActionsFamily(t *testing.T) {
+	t.Parallel()
+	got := audit.ToolCallActions()
+	if len(got) != 1 || got[0] != audit.ActionExec {
+		t.Fatalf("ToolCallActions() = %v, want [ActionExec]", got)
+	}
+	for _, a := range got {
+		if !audit.IsPrivileged(a) {
+			t.Fatalf("ToolCallActions() contains non-privileged action %v", a)
+		}
+		for _, s45 := range audit.SEC45Actions() {
+			if a == s45 {
+				t.Fatalf("tool-call action %v also appears in SEC45Actions — the families must be disjoint", a)
+			}
+		}
+		for _, s72 := range audit.SEC72EnumActions() {
+			if a == s72 {
+				t.Fatalf("tool-call action %v also appears in SEC72EnumActions — the families must be disjoint", a)
+			}
+		}
 	}
 }

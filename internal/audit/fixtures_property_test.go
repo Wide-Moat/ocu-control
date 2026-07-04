@@ -74,7 +74,7 @@ func TestActionCreateRejectedIsStillLast(t *testing.T) {
 // baseline (9 actions → 11 actions).
 func TestPrivilegedActionsIncludesMCPKey(t *testing.T) {
 	t.Parallel()
-	const want = 11 // was 9; +ActionMCPKeyCreate +ActionMCPKeyRevoke
+	const want = 12 // was 11; +ActionExec (the F10 tool-call family)
 	got := audit.PrivilegedActions()
 	if len(got) != want {
 		t.Fatalf("PrivilegedActions() len = %d, want %d", len(got), want)
@@ -96,7 +96,7 @@ func TestPrivilegedActionsIncludesMCPKey(t *testing.T) {
 // would leave downstream consumers running the wrong revision.
 func TestFixtureVersionBumped(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v2" {
-		t.Fatalf("FixtureVersion = %q, want v2 after the mcp-key action arms were added", audit.FixtureVersion)
+	if audit.FixtureVersion != "v3" {
+		t.Fatalf("FixtureVersion = %q, want v3 after the exec tool-call arm was added", audit.FixtureVersion)
 	}
 }
