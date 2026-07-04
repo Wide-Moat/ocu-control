@@ -8,13 +8,16 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
 	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
+	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
@@ -38,7 +41,14 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 				writeDecodeError(w, err)
 				return
 			}
-			row, err := h.Create(r.Context(), conn, body.toRequest())
+			req, err := body.toRequest()
+			if err != nil {
+				// A malformed mount_intent is an invalid argument: deny -> 400,
+				// refused before any host state (no admission, quota, or reserve).
+				writeStatus(w, http.StatusBadRequest, err.Error())
+				return
+			}
+			row, err := h.Create(r.Context(), conn, req)
 			if err != nil {
 				writeCreateError(w, err)
 				return
@@ -267,21 +277,83 @@ func writeReadError(w http.ResponseWriter, err error) {
 // fields are HINTS; the host-attested caller is derived from the connection, never
 // the body (NFR-SEC-43).
 type createBody struct {
-	SessionHint   string `json:"session_hint"`
-	Image         string `json:"image"`
-	ControlPubKey []byte `json:"control_pub_key"`
+	SessionHint   string           `json:"session_hint"`
+	Image         string           `json:"image"`
+	ControlPubKey []byte           `json:"control_pub_key"`
+	MountIntent   *mountIntentBody `json:"mount_intent"`
 }
 
-// toRequest maps the wire body to the in-process CreateRequest. The mount, egress,
-// and resource shapes are carried as their zero values here — the minimal Phase-3
-// transport drives the lifecycle path; the full wire schema fills them in a
-// follow-up.
-func (b createBody) toRequest() CreateRequest {
-	return CreateRequest{
+// mountIntentBody is the wire shape of the per-session storage mount intent,
+// field names per the frozen session_setup.proto MountIntent. It carries NO
+// auth_token field: the Storage-JWT is minted host-side and rides the F7
+// mount-config push, never a create body (custody) — the strict decoder refuses
+// a smuggled credential field as unknown.
+type mountIntentBody struct {
+	Destination    string `json:"destination"`
+	FilesystemID   string `json:"filesystem_id"`
+	MemoryStoreID  string `json:"memory_store_id"`
+	ReadOnly       bool   `json:"read_only"`
+	CacheDurationS uint32 `json:"cache_duration_s"`
+}
+
+// The wire-level refusals for a PRESENT mount_intent, mirroring the published
+// contract shape: exactly one scope id (both AND neither are malformed — an
+// ABSENT mount_intent is the legitimate no-scope compute/exec session,
+// ADR-0017), an absolute guest destination, and the 256-char scope-id cap
+// (utf8.RuneCountInString, the same rune-count rule the mcp-key tenant cap
+// uses). Each is a deny -> 400 invalid argument at decode, before any host
+// state exists.
+var (
+	errMountScopeConflict = errors.New("mount_intent: exactly one of filesystem_id / memory_store_id")
+	errMountDestRelative  = errors.New("mount_intent: destination must be an absolute guest path")
+	errMountFSIDTooLong   = errors.New("mount_intent: filesystem_id exceeds 256 characters")
+	errMountMemIDTooLong  = errors.New("mount_intent: memory_store_id exceeds 256 characters")
+)
+
+// scopeIDMaxRunes caps the mount scope ids on the wire.
+const scopeIDMaxRunes = 256
+
+// validate checks a present mount_intent against the wire contract.
+func (m *mountIntentBody) validate() error {
+	if (m.FilesystemID != "") == (m.MemoryStoreID != "") { // both set or neither set
+		return errMountScopeConflict
+	}
+	if !strings.HasPrefix(m.Destination, "/") {
+		return errMountDestRelative
+	}
+	if utf8.RuneCountInString(m.FilesystemID) > scopeIDMaxRunes {
+		return errMountFSIDTooLong
+	}
+	if utf8.RuneCountInString(m.MemoryStoreID) > scopeIDMaxRunes {
+		return errMountMemIDTooLong
+	}
+	return nil
+}
+
+// toRequest maps the wire body to the in-process CreateRequest. The egress and
+// resource shapes are carried as their zero values here — the full wire schema
+// fills them in a follow-up. The mount intent maps field-for-field; its
+// AuthToken is never populated from the wire (custody).
+func (b createBody) toRequest() (CreateRequest, error) {
+	req := CreateRequest{
 		SessionHint:   b.SessionHint,
 		Image:         b.Image,
 		ControlPubKey: b.ControlPubKey,
 	}
+	if b.MountIntent == nil {
+		return req, nil
+	}
+	if err := b.MountIntent.validate(); err != nil {
+		return CreateRequest{}, err
+	}
+	req.Mount = runtime.MountIntent{
+		Destination:   b.MountIntent.Destination,
+		FilesystemID:  b.MountIntent.FilesystemID,
+		MemoryStoreID: b.MountIntent.MemoryStoreID,
+		ReadOnly:      b.MountIntent.ReadOnly,
+		CacheSeconds:  int(b.MountIntent.CacheDurationS),
+	}
+	return req, nil
 }
 
 // destroyBody is the minimal JSON destroy request: a session hint that ADDRESSES

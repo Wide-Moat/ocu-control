@@ -464,7 +464,9 @@ components:
     # (internal/ingress/operator: {SessionHint, Image, Mount, Egress, Resources,
     # ControlPubKey}). Every field is a HINT/INTENT — none names a caller, tenant, or
     # session-authority id (NFR-SEC-43). The minted Storage-JWT is absent by design
-    # (custody plane is separate).
+    # (custody plane is separate). The wire keys use the frozen session_setup.proto
+    # field names (mount_intent / egress_policy / resource_caps), so one JSON body
+    # shape serves both the operator REST surface and the session-setup surface.
     CreateRequest:
       type: object
       additionalProperties: false
@@ -486,11 +488,11 @@ components:
         # field as `reserved 6; reserved "image"`. OpenAPI has no `reserved`
         # primitive, so the field is withheld here and re-added as an additive
         # change once ADR-0020 closes. Do not add it back before then.
-        mount:
+        mount_intent:
           $ref: '#/components/schemas/MountIntent'
-        egress:
+        egress_policy:
           $ref: '#/components/schemas/EgressPolicy'
-        resources:
+        resource_caps:
           $ref: '#/components/schemas/ResourceCaps'
         control_pub_key:
           type: string
