@@ -170,4 +170,18 @@ func TestVerifyHostOwnedDir(t *testing.T) {
 			t.Fatalf("verifyHostOwnedDir(\"\") = %v; want ErrSockDirGate", err)
 		}
 	})
+
+	t.Run("parent that is a file refused", func(t *testing.T) {
+		t.Parallel()
+		// A leaf whose parent is a regular file (not a directory) is refused: the
+		// traversal wall must be a real 0700 directory.
+		root := t.TempDir()
+		fileParent := filepath.Join(root, "notadir")
+		if err := os.WriteFile(fileParent, nil, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := verifyHostOwnedDir(filepath.Join(fileParent, "sock")); !errors.Is(err, ErrSockDirGate) {
+			t.Fatalf("verifyHostOwnedDir(leaf under a file parent) = %v; want ErrSockDirGate", err)
+		}
+	})
 }

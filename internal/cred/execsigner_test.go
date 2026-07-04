@@ -7,15 +7,72 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/cred"
 )
+
+// TestLoadExecSignerFromMount pins the boot-time loader: a valid PKCS8 PEM Ed25519
+// key loads and its VerifyKey matches the key's public half; a missing file and a
+// non-PKCS8 blob each fail closed (the fail-closed boot the daemon relies on).
+func TestLoadExecSignerFromMount(t *testing.T) {
+	t.Parallel()
+
+	t.Run("valid pkcs8 pem loads and verify-key matches", func(t *testing.T) {
+		t.Parallel()
+		pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+		der, err := x509.MarshalPKCS8PrivateKey(priv)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		path := filepath.Join(t.TempDir(), "exec-signing.key")
+		pemBytes := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: der})
+		if err := os.WriteFile(path, pemBytes, 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		s, err := cred.LoadExecSignerFromMount(path)
+		if err != nil {
+			t.Fatalf("LoadExecSignerFromMount: %v", err)
+		}
+		if !s.VerifyKey().Equal(pub) {
+			t.Fatal("VerifyKey does not match the loaded key's public half")
+		}
+		tok, err := s.MintExecJWT(context.Background(), cred.ExecMintReq{ContainerName: "c", RequestedTTL: time.Minute})
+		if err != nil {
+			t.Fatalf("mint: %v", err)
+		}
+		if tok.IsZero() {
+			t.Fatal("minted token is zero")
+		}
+	})
+
+	t.Run("missing file fails closed", func(t *testing.T) {
+		t.Parallel()
+		if _, err := cred.LoadExecSignerFromMount(filepath.Join(t.TempDir(), "absent")); err == nil {
+			t.Fatal("LoadExecSignerFromMount on a missing file = nil error; want fail-closed")
+		}
+	})
+
+	t.Run("non-pkcs8 blob fails closed", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "garbage.key")
+		if err := os.WriteFile(path, []byte("not a pkcs8 key"), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, err := cred.LoadExecSignerFromMount(path); err == nil {
+			t.Fatal("LoadExecSignerFromMount on a non-PKCS8 blob = nil error; want fail-closed")
+		}
+	})
+}
 
 // TestExecSignerMintsGuestVerifiableJWT pins the exec-JWT contract the guest
 // verifies: a compact EdDSA JWS whose claims are EXACTLY {sub,iat,exp} (no aud, no
