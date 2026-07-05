@@ -388,8 +388,10 @@ func TestCreateCommitConflictUnwinds(t *testing.T) {
 
 // TestCreateBindFallbackOnEmptyRuntimeID covers stageBind's empty-RuntimeID
 // fallback: when the provider returns no runtime id, the bind falls back to the
-// host-derived key as the container-name predicate, so the create still completes
-// with a bound row.
+// deterministic host-derived container name "ocu-sess-<key>" — the SAME value the
+// Materialize path and the handoff container_info use — so the guest's boot-bound
+// name and the exec-JWT sub stay byte-identical even on this defensive path (a bare
+// key here would reintroduce the sub-mismatch the exec handshake rejects).
 func TestCreateBindFallbackOnEmptyRuntimeID(t *testing.T) {
 	t.Parallel()
 	d := newErrManager(t)
@@ -399,10 +401,10 @@ func TestCreateBindFallbackOnEmptyRuntimeID(t *testing.T) {
 		t.Fatalf("Create with an empty RuntimeID = %v; want success via the host-derived fallback", err)
 	}
 	if row.ContainerName == "" {
-		t.Fatal("bind fallback produced an empty container name; want the host-derived key")
+		t.Fatal("bind fallback produced an empty container name; want the deterministic host-derived name")
 	}
-	if row.ContainerName != row.Key {
-		t.Fatalf("bind fallback container name = %q; want the host-derived key %q", row.ContainerName, row.Key)
+	if want := "ocu-sess-" + row.Key; row.ContainerName != want {
+		t.Fatalf("bind fallback container name = %q; want the deterministic host-derived name %q", row.ContainerName, want)
 	}
 }
 

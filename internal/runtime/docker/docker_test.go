@@ -691,8 +691,12 @@ func TestMaterialize_HappyPath(t *testing.T) {
 	if sb.Name != spec.Name {
 		t.Errorf("Sandbox.Name: want %q, got %q", spec.Name, sb.Name)
 	}
-	if sb.RuntimeID != fake.nextID {
-		t.Errorf("Sandbox.RuntimeID: want %q, got %q", fake.nextID, sb.RuntimeID)
+	// RuntimeID is the DETERMINISTIC container name (containerName(spec.Name)), NOT
+	// the daemon's post-create container ID: it is the only identity the host can
+	// stage into container_info.json before Materialize, so the guest's boot-bound
+	// name, the staged container_info, and the exec-JWT sub all agree.
+	if wantID := containerName(spec.Name); sb.RuntimeID != wantID {
+		t.Errorf("Sandbox.RuntimeID: want %q (deterministic name), got %q", wantID, sb.RuntimeID)
 	}
 	if sb.Egress.FilesystemID != spec.Egress.FilesystemID {
 		t.Errorf("Sandbox.Egress.FilesystemID: want %q, got %q", spec.Egress.FilesystemID, sb.Egress.FilesystemID)

@@ -364,9 +364,11 @@ func stageBind(ctx context.Context, m *Manager, st *createState) (compensator, e
 	containerName := st.sandbox.RuntimeID
 	if containerName == "" {
 		// The provider should always assign a runtime id on a successful Materialize;
-		// fall back to the host-derived name so the write-once bind still has a stable,
-		// host-derived predicate rather than an empty string.
-		containerName = st.key.String()
+		// fall back to the same host-derived container name the Materialize path and
+		// the handoff container_info use ("ocu-sess-<key>"), so the bound predicate,
+		// the guest's boot-bound name, and the exec-JWT sub stay byte-identical even
+		// on this defensive path — a bare key here would reintroduce the sub-mismatch.
+		containerName = "ocu-sess-" + st.key.String()
 	}
 	row, err := m.reg.BindContainerName(ctx, st.key, st.owner, containerName)
 	if err != nil {

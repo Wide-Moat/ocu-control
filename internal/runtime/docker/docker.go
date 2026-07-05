@@ -321,8 +321,18 @@ func (p *Provider) Materialize(ctx context.Context, spec runtime.SessionSpec) (r
 	}
 
 	return runtime.Sandbox{
-		Name:      spec.Name,
-		RuntimeID: created.ID,
+		Name: spec.Name,
+		// RuntimeID is the DETERMINISTIC container name (containerName(spec.Name),
+		// the same value cname the container was created under), NOT the daemon's
+		// post-create container ID. Docker accepts a name as a handle everywhere the
+		// RuntimeID is later used (teardown, killswitch, exec sock-dir derivation), and
+		// the name is the ONLY identity the host can stage into container_info.json
+		// BEFORE Materialize runs — so the guest's boot-bound container name, the
+		// staged container_info, and the exec-JWT sub all derive from this one
+		// host-chosen name. Binding the post-create ID here made those three diverge
+		// (the ID cannot be pre-staged), which the guest handshake rejects as
+		// "sub does not match container name".
+		RuntimeID: cname,
 		Egress: runtime.EgressBinding{
 			Name:         spec.Name,
 			FilesystemID: spec.Egress.FilesystemID,
