@@ -33,6 +33,9 @@ type config struct {
 	workloadProfile string // deployment-declared trust profile feeding the admission matrix; never per-request
 	jwtSigningKey   string // path to the Storage-JWT signing key (config/secret mount)
 	execSigningKey  string // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
+	gatewayTLSCert  string // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
+	gatewayTLSKey   string // OPTIONAL gateway mTLS server-key PEM (all-or-none)
+	gatewayClientCA string // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
 	jwtAlg          string // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
 	storageIssuer   string // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
 	storageAudience string // provisional Storage-JWT aud (PIN-PENDING)
@@ -67,6 +70,9 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
 	fs.StringVar(&cfg.execSigningKey, "exec-signing-key", "", "path to the SEPARATE exec-channel Ed25519 signing key mount (ADR-0013 key separation); unset disables the exec channel")
+	fs.StringVar(&cfg.gatewayTLSCert, "gateway-tls-cert", "", "gateway mTLS server-cert PEM (all-or-none with -gateway-tls-key/-gateway-client-ca); unset keeps the stubbed plain-TCP fail-closed posture")
+	fs.StringVar(&cfg.gatewayTLSKey, "gateway-tls-key", "", "gateway mTLS server-key PEM (all-or-none)")
+	fs.StringVar(&cfg.gatewayClientCA, "gateway-client-ca", "", "gateway mTLS client-CA PEM the verified client SAN is anchored against (all-or-none)")
 	fs.StringVar(&cfg.jwtAlg, "jwt-alg", "eddsa", "Storage-JWT signing algorithm: eddsa|es256 (default eddsa, NFR-SEC-11)")
 	fs.StringVar(&cfg.storageIssuer, "storage-issuer", "", "provisional Storage-JWT issuer (PIN-PENDING; never hardcoded)")
 	fs.StringVar(&cfg.storageAudience, "storage-audience", "", "provisional Storage-JWT audience (PIN-PENDING)")
@@ -154,6 +160,22 @@ func validate(cfg config) error {
 	// not enum-checked, so a deployment without storage provisioning still validates.
 	if !knownJWTAlgs[cfg.jwtAlg] {
 		return fmt.Errorf("%w: %q (choose eddsa|es256)", errUnknownJWTAlg, cfg.jwtAlg)
+	}
+
+	// Gateway mTLS is ALL-OR-NONE: either all three of -gateway-tls-cert/-key and
+	// -gateway-client-ca are set (real mTLS) or none is (the stubbed plain-TCP
+	// fail-closed posture, which admits no verified SAN so every Resolve fails
+	// closed). A PARTIAL set is a misconfiguration refused fail-closed at boot — it
+	// must never silently degrade to plain TCP while the operator believes mTLS is
+	// on.
+	set := 0
+	for _, v := range []string{cfg.gatewayTLSCert, cfg.gatewayTLSKey, cfg.gatewayClientCA} {
+		if v != "" {
+			set++
+		}
+	}
+	if set != 0 && set != 3 {
+		return fmt.Errorf("%w: gateway mTLS is all-or-none — set all of -gateway-tls-cert/-gateway-tls-key/-gateway-client-ca or none", errRequiredFlagMissing)
 	}
 
 	return nil
