@@ -5,6 +5,7 @@ package handoff
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,5 +68,29 @@ func TestContainerInfoForIsValidJSON(t *testing.T) {
 	}
 	if !bytes.HasPrefix(b, []byte("{")) || !bytes.HasSuffix(b, []byte("}")) {
 		t.Fatalf("container_info.json is not a JSON object: %s", b)
+	}
+}
+
+// TestContainerInfoCarriesContainerName is the exec-identity keystone: the staged
+// container_info.json MUST carry a container_name field equal to the deterministic
+// container name "ocu-sess-<session>" — the SAME value the Materialize path binds
+// as RuntimeID and the exec-signer mints as the JWT sub. The guest binds its own
+// identity from this field at boot and rejects any exec-JWT whose sub differs
+// (auth/claims.rs). Emitting only session_name (the bare key) left the guest with
+// no bound container name, so every exec handshake failed "sub does not match
+// container name". Neuter containerInfoFor back to session_name-only, or change the
+// prefix, and this reds.
+func TestContainerInfoCarriesContainerName(t *testing.T) {
+	t.Parallel()
+	var info struct {
+		SessionName   string `json:"session_name"`
+		ContainerName string `json:"container_name"`
+	}
+	if err := json.Unmarshal(containerInfoFor("sess-x"), &info); err != nil {
+		t.Fatalf("container_info.json does not parse: %v", err)
+	}
+	if want := "ocu-sess-sess-x"; info.ContainerName != want {
+		t.Fatalf("container_info container_name = %q; want the deterministic name %q "+
+			"(must equal Materialize RuntimeID and the exec-JWT sub)", info.ContainerName, want)
 	}
 }

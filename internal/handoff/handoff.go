@@ -158,14 +158,25 @@ func NewStager(base string) Stager {
 
 // containerInfoFor builds the minimal container_info.json bytes the guest reads
 // at boot. The full schema lands with the control-RPC wire in a later phase; this
-// phase writes a well-formed JSON object carrying the host-derived session name
-// and the guest sock-dir mountpoint, which is what the create path needs now.
+// phase writes a well-formed JSON object carrying the host-derived session name,
+// the guest's own CONTAINER NAME, and the guest sock-dir mountpoint.
+//
+// The container_name field is LOAD-BEARING: the guest binds its own identity from
+// it at boot (auth/container_info.rs) and rejects any exec-JWT whose sub does not
+// equal it (auth/claims.rs). It MUST equal the deterministic container name the
+// Materialize path assigns as RuntimeID and the exec-signer mints as sub —
+// "ocu-sess-<name>", the same value docker.containerName(name) builds. Emitting
+// only session_name (the bare key) left the guest with no bound container name, so
+// every exec handshake failed "sub does not match container name".
 func containerInfoFor(name runtime.SessionName) []byte {
 	// A hand-built object keeps this package free of a schema dependency the wire
 	// contract has not pinned yet; the bytes are valid JSON and stable per name.
+	// The "ocu-sess-" prefix mirrors docker.containerName (a cross-package literal,
+	// not an import, to keep handoff free of the runtime/docker dependency).
 	return fmt.Appendf(nil,
-		`{"schema":"v1alpha","session_name":%q,"sock_dir":"/run/ocu"}`,
+		`{"schema":"v1alpha","session_name":%q,"container_name":%q,"sock_dir":"/run/ocu"}`,
 		string(name),
+		"ocu-sess-"+string(name),
 	)
 }
 
