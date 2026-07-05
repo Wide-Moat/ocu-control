@@ -28,6 +28,8 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"os"
@@ -332,12 +334,23 @@ func serve(ctx context.Context, cfg config) error {
 		Metrics:      collector.Handler(),
 		MCPKeyEngine: mcpKeyEngine, // operator adapter alone; gateway adapter gets none
 	})
+	// Gateway mTLS server config, FAIL-CLOSED at boot when configured: with all
+	// three -gateway-tls-* flags set, the gateway binds a real TLS 1.3 listener that
+	// REQUIRES AND VERIFIES a client cert against the client-CA, so a connection's
+	// verified SAN is the host-attested service identity. Unset (validate() already
+	// enforced all-or-none) leaves gwTLS nil and the listener keeps the stubbed
+	// plain-TCP posture (no verified SAN → every Resolve fails closed).
+	gwTLS, err := buildGatewayTLSConfig(cfg)
+	if err != nil {
+		return fmt.Errorf("boot: load gateway mTLS config: %w", err)
+	}
 	gwListener := gateway.NewListener(tcpAddrOf(cfg.gatewayListen), gateway.Deps{
-		Manager:  mgr,
-		Resolver: gateway.NewCertSANResolver(nil),
-		// No TLSConfig wired in this phase: the gateway binds plain TCP whose
-		// connections carry no verified SAN, so every Resolve fails closed (a
-		// clearly-stubbed, fail-closed posture). No OperatorSeam is passed.
+		Manager:   mgr,
+		Resolver:  gateway.NewCertSANResolver(nil),
+		TLSConfig: gwTLS,
+		// When TLSConfig is nil the gateway binds plain TCP whose connections carry
+		// no verified SAN, so every Resolve fails closed (a clearly-stubbed,
+		// fail-closed posture). No OperatorSeam is passed.
 	})
 
 	// The bind hook runs from inside Boot, strictly AFTER readiness flips to ready
@@ -966,6 +979,37 @@ func readCACertPEM(path string) string {
 		return ""
 	}
 	return string(b)
+}
+
+// buildGatewayTLSConfig builds the gateway mTLS server config from the
+// -gateway-tls-* flags, or returns (nil, nil) when they are unset (the stubbed
+// plain-TCP posture). validate() already enforced all-or-none, so an unset cert
+// means all three are unset. It is FAIL-CLOSED: an unreadable cert/key pair or an
+// unparseable client-CA aborts boot before any listener binds. The config REQUIRES
+// AND VERIFIES a client cert against the client-CA at a TLS 1.3 floor, so a
+// connection's verified SAN is a real host-attested identity.
+func buildGatewayTLSConfig(cfg config) (*tls.Config, error) {
+	if cfg.gatewayTLSCert == "" {
+		return nil, nil
+	}
+	serverCert, err := tls.LoadX509KeyPair(cfg.gatewayTLSCert, cfg.gatewayTLSKey)
+	if err != nil {
+		return nil, fmt.Errorf("gateway tls key pair: %w", err)
+	}
+	caPEM, err := os.ReadFile(cfg.gatewayClientCA)
+	if err != nil {
+		return nil, fmt.Errorf("gateway client CA: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(caPEM) {
+		return nil, fmt.Errorf("gateway client CA %q: no PEM certificate parsed", cfg.gatewayClientCA)
+	}
+	return &tls.Config{
+		Certificates: []tls.Certificate{serverCert},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    pool,
+		MinVersion:   tls.VersionTLS13,
+	}, nil
 }
 
 // defaultMountDefaults is the minimal-shelf, schema-validated per-mount posture the
