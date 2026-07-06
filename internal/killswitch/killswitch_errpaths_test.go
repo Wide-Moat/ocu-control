@@ -12,6 +12,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
+	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
@@ -134,7 +135,8 @@ func newFaultEngine(t *testing.T) (*killswitch.Engine, *faultStore, *audit.Recor
 	fs := &faultStore{Store: inner}
 	cust := registry.NewCustodian(fs)
 	sink := audit.NewRecordingFake()
-	eng := killswitch.NewEngine(fs, cust, &faultProvider{}, clk, sink)
+	gate := quota.NewGate(fs, clk, quota.Limits{ConcurrentSessionsPerTenant: 64, CreateRatePerCallerPerMin: 64})
+	eng := killswitch.NewEngine(fs, cust, &faultProvider{}, clk, sink, gate)
 	scope := ingress.NewOperatorSeam().Mint(operatorID)
 	return eng, fs, sink, scope
 }
@@ -241,7 +243,8 @@ func TestRevokeAllForceKillRowError(t *testing.T) {
 	cust := registry.NewCustodian(fs)
 	sink := audit.NewRecordingFake()
 	provider := &faultProvider{forceKillErr: errInjected}
-	eng := killswitch.NewEngine(fs, cust, provider, clk, sink)
+	gate := quota.NewGate(fs, clk, quota.Limits{ConcurrentSessionsPerTenant: 64, CreateRatePerCallerPerMin: 64})
+	eng := killswitch.NewEngine(fs, cust, provider, clk, sink, gate)
 	scope := ingress.NewOperatorSeam().Mint(operatorID)
 	ctx := context.Background()
 
@@ -307,7 +310,8 @@ func TestRevokeAllEnumerationUnsupported(t *testing.T) {
 	bare := &nonEnumerableStore{Store: state.NewInMemory(clk)}
 	cust := registry.NewCustodian(bare)
 	sink := audit.NewRecordingFake()
-	eng := killswitch.NewEngine(bare, cust, &faultProvider{}, clk, sink)
+	gate := quota.NewGate(bare, clk, quota.Limits{ConcurrentSessionsPerTenant: 64, CreateRatePerCallerPerMin: 64})
+	eng := killswitch.NewEngine(bare, cust, &faultProvider{}, clk, sink, gate)
 	scope := ingress.NewOperatorSeam().Mint(operatorID)
 
 	err := eng.RevokeAll(context.Background(), scope, "incident")

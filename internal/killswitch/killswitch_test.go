@@ -16,6 +16,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
+	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
@@ -128,6 +129,7 @@ type engineHarness struct {
 	cust     *registry.Custodian
 	provider *recordingProvider
 	audit    *audit.RecordingFake
+	gate     *quota.Gate
 	scope    ingress.OperatorScope
 }
 
@@ -138,7 +140,15 @@ func newEngineHarness() *engineHarness {
 	cust := registry.NewCustodian(store)
 	provider := newRecordingProvider()
 	sink := audit.NewRecordingFake()
-	engine := killswitch.NewEngine(store, cust, provider, clk, sink)
+	// The refunder is the REAL quota.Gate over the same Store and Clock — the same
+	// type that charges the counter on create, so the force-kill returns the level
+	// slot through the one decrement path the destroy and reconcile paths share (no
+	// mock: the counter arithmetic under test is the Gate's own).
+	gate := quota.NewGate(store, clk, quota.Limits{
+		ConcurrentSessionsPerTenant: 64,
+		CreateRatePerCallerPerMin:   64,
+	})
+	engine := killswitch.NewEngine(store, cust, provider, clk, sink, gate)
 	scope := ingress.NewOperatorSeam().Mint(operatorID)
 	return &engineHarness{
 		engine:   engine,
@@ -146,6 +156,7 @@ func newEngineHarness() *engineHarness {
 		cust:     cust,
 		provider: provider,
 		audit:    sink,
+		gate:     gate,
 		scope:    scope,
 	}
 }

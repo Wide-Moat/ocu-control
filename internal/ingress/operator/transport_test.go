@@ -80,7 +80,7 @@ func operatorDepsFor(t *testing.T, resolver ingress.IdentityResolver, verifier k
 		Tier:          ocuruntime.TierRunc,
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
-	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
+	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink, gate)
 	// The mcp-key engine over an in-memory record store and a no-op rerender, so a
 	// bound transport test can drive POST /v1alpha/mcp-keys create→revoke end to end.
 	mcpEng := mcpkey.NewEngine(
