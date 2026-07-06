@@ -79,6 +79,11 @@ var (
 	errUnknownWorkloadProfile = errors.New("unknown workload profile")
 	errUnknownJWTAlg          = errors.New("unknown jwt signing algorithm")
 	errKillSwitchFirst        = errors.New("kill-switch-first: create before deny posture loaded refused (NFR-SEC-01)")
+	// errCACertUnreadable is the fail-closed boot abort when -ca-cert names a path
+	// that cannot be read. A configured-but-unreadable CA must abort boot exactly as a
+	// missing signing key does — never silently latch an empty CA that would make every
+	// later storage create die at the mount-config render with an opaque refusal.
+	errCACertUnreadable = errors.New("ca-cert configured but unreadable")
 )
 
 // knownRuntimeTiers and knownRuntimeProviders are the closed enumerations the
@@ -237,6 +242,16 @@ func serve(ctx context.Context, cfg config) error {
 		}
 	}
 
+	// Mount-config CA certificate, FAIL-CLOSED at boot: a configured-but-unreadable
+	// -ca-cert aborts before any listener binds, exactly as a bad signing key does.
+	// An unset -ca-cert is the valid minimal-shelf posture (empty CA, no storage
+	// provisioning). Reading it here — not lazily inside compose — means the failure
+	// surfaces as a named boot abort rather than an opaque per-create render refusal.
+	caCertPEM, err := readCACertPEM(cfg.caCert)
+	if err != nil {
+		return fmt.Errorf("boot: %w", err)
+	}
+
 	// Storage-JWT JWKS artifact, FAIL-CLOSED at boot: when -jwks-path is set, render
 	// the static JWKS document the deploy layer serves at the egress edge's
 	// remote_jwks URI (ADR-0019 §35) so the edge can validate the weak Storage-JWT
@@ -297,7 +312,7 @@ func serve(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, execSigner, sink, cfg)
+	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, execSigner, sink, caCertPEM, cfg)
 
 	// MCP API key surface, FAIL-CLOSED at boot: construct the Engine from a
 	// Minter (crypto/rand), the selected RecordStore (Postgres when -state-dsn is
@@ -452,7 +467,7 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 // (chain computed in-process, nothing durably persisted by default), and a
 // deployment Limits — are bound here. profile and tier are deployment-fixed and
 // flow onto the Manager as fixed fields; CreateInput carries neither.
-func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, execSigner *cred.ExecSigner, sink *ocsf.ChainSink, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, execSigner *cred.ExecSigner, sink *ocsf.ChainSink, caCertPEM string, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
 	// The metrics collector reads live state through the same custodian the admin
@@ -502,7 +517,7 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		Signer:        signer,
 		Push:          provisioning.NewPusher(),
 		ServiceURL:    cfg.serviceURL,
-		CACertPEM:     readCACertPEM(cfg.caCert),
+		CACertPEM:     caCertPEM,
 		MountDefaults: defaultMountDefaults(),
 		StorageScope:  defaultStorageScope(),
 		ControlDialer: controlDialer,
@@ -966,19 +981,23 @@ func verifyAuditChainFile(path string) error {
 }
 
 // readCACertPEM reads the CA certificate PEM from the -ca-cert path for rendering
-// into every mount-config. An empty path or an unreadable file yields an empty
-// string: the mount-config render then refuses fail-closed at create time
-// (ErrBadCACert) rather than the daemon aborting at boot — a deployment without
-// storage provisioning configured still boots and serves the lifecycle base path.
-func readCACertPEM(path string) string {
+// into every mount-config. An UNSET path yields an empty string with no error: a
+// deployment without storage provisioning configured still boots and serves the
+// lifecycle base path (the mount-config render then refuses fail-closed at create
+// time on the empty CA). A CONFIGURED-but-unreadable path is a MISCONFIGURATION and
+// fails closed at boot with errCACertUnreadable — exactly as a missing signing key
+// does — rather than silently latching an empty CA that would make every later
+// storage create die at the render with an opaque refusal, the failure mode that is
+// far harder to diagnose than a named boot abort.
+func readCACertPEM(path string) (string, error) {
 	if path == "" {
-		return ""
+		return "", nil
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("%w: -ca-cert %q: %v", errCACertUnreadable, path, err)
 	}
-	return string(b)
+	return string(b), nil
 }
 
 // buildGatewayTLSConfig builds the gateway mTLS server config from the

@@ -305,9 +305,9 @@ func NewManager(deps ManagerDeps) *Manager {
 	// from this slice length, so the new compensators are exercised automatically.
 	m.stages = []stage{
 		{name: "resolveIdentity", run: stageResolveIdentity},
-		{name: "admit", run: stageAdmit},
-		{name: "quotaCharge", run: stageQuotaCharge},
-		{name: "reserve", run: stageReserve},
+		{name: "admit", run: stageAdmit, emitsOwnRejection: true},
+		{name: "quotaCharge", run: stageQuotaCharge, emitsOwnRejection: true},
+		{name: "reserve", run: stageReserve, emitsOwnRejection: true},
 		{name: "stageHandoff", run: stageStageHandoff},
 		{name: "mintStorageJWT", run: stageMintStorageJWT},
 		{name: "renderPushMount", run: stageRenderPushMount},
@@ -327,6 +327,14 @@ func NewManager(deps ManagerDeps) *Manager {
 type stage struct {
 	name string
 	run  func(ctx context.Context, m *Manager, st *createState) (compensator, error)
+	// emitsOwnRejection marks a stage that ALREADY writes its own create-rejection
+	// audit record on failure (the pre-side-effect deny stages: admit, quota,
+	// reserve — each with its own specific cause). For those the runner does NOT emit
+	// a second generic "stage-failed:<name>" record, so a deny keeps exactly one
+	// record carrying its precise cause. A host-side stage (handoff/mint/render/
+	// materialize/commit/bind) leaves this false, so the runner emits the rejection
+	// record on its behalf — the observability the host-side stages previously lacked.
+	emitsOwnRejection bool
 }
 
 // compensator is one entry on the LIFO unwind stack: the reverse of a successful
@@ -376,6 +384,22 @@ func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow,
 	for _, s := range m.stages {
 		comp, err := s.run(ctx, m, st)
 		if err != nil {
+			// A host-side stage (one that does not emit its own rejection) failing after
+			// durable state previously recorded nothing — the refusal surfaced only as an
+			// opaque 409. Emit the SAME ActionCreateRejected the deny stages emit, with the
+			// failing stage in the Reason, so the audit trail names WHICH stage refused.
+			// The deny stages (emitsOwnRejection) already recorded their own specific cause,
+			// so the runner does not double-emit for them. resolveIdentity fails before an
+			// owner exists, so the owner guard skips the emit (no actor to attribute it to);
+			// its ErrUnattested is a pre-owner reject the ingress already refused upstream.
+			if !s.emitsOwnRejection && st.owner.Caller != "" {
+				// The emit is best-effort observability, NOT a second fail-closed gate: the
+				// create already failed and is about to unwind. An emit failure must not
+				// mask the real stage error the caller needs, so it is swallowed here (the
+				// deny stages' emits ARE fail-closed because they are the record of record;
+				// this is a supplementary trail for an already-failing host-side stage).
+				_ = emitCreateRejected(ctx, m, st, "stage-failed:"+s.name)
+			}
 			m.unwind(ctx, compensators)
 			return state.SessionRow{}, fmt.Errorf("lifecycle: create stage %q: %w", s.name, err)
 		}

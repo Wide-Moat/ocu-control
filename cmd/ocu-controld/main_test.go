@@ -275,7 +275,7 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 	if err != nil {
 		t.Fatalf("providerOf: %v", err)
 	}
-	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, nil, sink, cfg)
+	mgr, eng, _, _, _ := compose(store, clk, provider, profile, tier, signer, nil, sink, "", cfg)
 	seam := ingress.NewOperatorSeam()
 	seq := boot.New(store, clk)
 	op := operator.NewListener(sockPath, operator.Deps{
@@ -523,6 +523,38 @@ func Test_run_BadSigningKeyFailsClosedBeforeBind(t *testing.T) {
 	// socket survives the refusal.
 	if _, statErr := os.Stat(filepath.Join(dir, "operator.sock")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("a fail-closed signer-load abort left an operator socket (stat err=%v); want no socket", statErr)
+	}
+}
+
+// Test_run_BadCACertFailsClosedBeforeBind proves a configured-but-unreadable -ca-cert
+// aborts boot fail-closed, exactly as an absent signing key does — it does NOT
+// silently latch an empty CA that would make every later storage create die at the
+// mount-config render with an opaque refusal. An UNSET -ca-cert is the valid
+// minimal-shelf posture (a deployment without storage provisioning boots and serves
+// the lifecycle base path); only a SET-but-unreadable path is the misconfiguration
+// caught here. The abort happens before the bind hook, so no operator socket survives.
+func Test_run_BadCACertFailsClosedBeforeBind(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	// A real signing key so the signer load succeeds and boot reaches the ca-cert read.
+	keyPath := filepath.Join(dir, "signing.key")
+	writeTestKey(t, keyPath)
+	args := []string{
+		"-operator-listen", "unix://" + filepath.Join(dir, "operator.sock"),
+		"-gateway-listen", "127.0.0.1:0",
+		"-runtime-tier", "runc",
+		"-runtime-provider", "docker",
+		"-workload-profile", "trusted_operator",
+		"-jwt-signing-key", keyPath,
+		"-ca-cert", filepath.Join(dir, "absent-ca.pem"), // configured but never written
+		"-audit-sink", filepath.Join(dir, "audit.jsonl"),
+	}
+	err := run(context.Background(), args)
+	if !errors.Is(err, errCACertUnreadable) {
+		t.Fatalf("run() with a configured-but-unreadable -ca-cert must fail closed with errCACertUnreadable, got: %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "operator.sock")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("a fail-closed ca-cert abort left an operator socket (stat err=%v); want no socket", statErr)
 	}
 }
 
