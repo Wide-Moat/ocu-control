@@ -677,8 +677,16 @@ func TestReconcileConcurrentPropagatesReadError(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // a cancelled context makes the Store's ReadQuota fail closed
-	if _, err := g.ReconcileConcurrent(ctx, id, 0); err == nil {
+	surplus, err := g.ReconcileConcurrent(ctx, id, 0)
+	if err == nil {
 		t.Fatal("ReconcileConcurrent with a failing ReadQuota returned nil; want the store error surfaced")
+	}
+	// On the read-error path the surplus MUST be the zero value, never a sentinel like
+	// -1: the caller reads it as "how much was healed", so a non-zero surplus on a
+	// failed read would misreport a heal that never happened. Pinning it kills the
+	// mutant that returns -1 on the read-error branch.
+	if surplus != 0 {
+		t.Fatalf("ReconcileConcurrent read-error surplus = %d, want 0 (no heal on a failed read)", surplus)
 	}
 }
 
