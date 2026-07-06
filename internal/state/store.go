@@ -181,6 +181,12 @@ type EnrichedSessionRow struct {
 	// Caps are the hard resource caps recorded at activation. They are nil until
 	// RecordActivation runs (a still-RESERVED row, or a pre-enrichment row).
 	Caps *Caps
+	// LastActivity is the Clock instant of the row's most recent activity (its
+	// activation, then every exec/control-RPC touch). It is nil for a row with no
+	// recorded activity (still RESERVED). The idle-reaper reads it to measure the
+	// idle window as Clock.Now() minus this stamp — two in-process Clock readings,
+	// never a persisted-timestamp subtraction (NFR-SEC-48).
+	LastActivity *time.Time
 }
 
 // QuotaDim names a counter dimension. The Store holds the counters; the policy

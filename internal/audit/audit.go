@@ -95,6 +95,17 @@ const (
 	// live session already holds its slot). Inserted BEFORE ActionCreateRejected
 	// so the boundary anchor stays last.
 	ActionCreateResume
+	// ActionReconcileReclaim is a SYSTEM-initiated lifecycle reclaim of a session
+	// row whose backing resource is gone or abandoned: the boot reconciler's
+	// substrate-lost sweep and the runtime idle-reaper both emit it before releasing
+	// the row, so a slot returned to the tier cap is never returned un-recorded
+	// (the chain-linked-OCSF-before-ack discipline, NFR-SEC-45). It is a member of
+	// the system-initiated SEC-72 Action family, NOT an operator/SOAR action (it
+	// never enters the operator SEC-45 privileged set) — no human acted; the system
+	// reclaimed a leaked slot. The Reason names the cause (substrate-lost vs
+	// idle-reap) so the operator trail distinguishes the two. Inserted BEFORE
+	// ActionCreateRejected so the boundary anchor stays last.
+	ActionReconcileReclaim
 	// ActionCreateRejected is a session create REFUSED at a pre-side-effect deny
 	// stage (admission, quota, or the kill-switch/denylist re-check). It is the
 	// system-initiated rejection record NFR-SEC-46/72 require: the deny itself is
@@ -133,6 +144,8 @@ func (a Action) String() string {
 		return "exec"
 	case ActionCreateResume:
 		return "create_resume"
+	case ActionReconcileReclaim:
+		return "reconcile_reclaim"
 	case ActionCreateRejected:
 		return "create_rejected"
 	default:

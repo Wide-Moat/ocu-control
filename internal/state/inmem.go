@@ -99,6 +99,13 @@ type rowEnrichment struct {
 	reservedAt time.Time
 	activeAt   time.Time
 	caps       *Caps
+	// lastActivity is the Clock instant of the row's most recent activity (its
+	// activation, then every exec/control-RPC touch). The idle-reaper measures the
+	// idle window as Clock.Now() minus this stamp — two in-process Clock readings,
+	// never a persisted-timestamp subtraction, so a wall-clock setback moves no
+	// reclaim (NFR-SEC-48). It is set to activeAt at activation and advanced by
+	// TouchActivity; the zero value on a still-RESERVED row means "no activity yet".
+	lastActivity time.Time
 }
 
 // NewInMemory returns the in-memory Store backed by clk. It is safe for
@@ -395,6 +402,10 @@ func (m *memStore) LiveSessionsEnriched(ctx context.Context) ([]EnrichedSessionR
 			at := en.activeAt
 			enriched.ActiveAt = &at
 		}
+		if !en.lastActivity.IsZero() {
+			la := en.lastActivity
+			enriched.LastActivity = &la
+		}
 		if en.caps != nil {
 			// Copy the caps (and the PidsLimit pointer target) so the returned
 			// snapshot does not alias the stored enrichment.
@@ -434,6 +445,10 @@ func (m *memStore) RecordActivation(ctx context.Context, key string, caps Caps, 
 
 	en := m.enrichment[key]
 	en.activeAt = at
+	// Activation is the row's first activity: seed lastActivity so an ACTIVE session
+	// that never execs is measured for idleness from when it went live, not from the
+	// zero instant. Every later exec/control-RPC advances it via TouchActivity.
+	en.lastActivity = at
 	// Copy caps defensively so the stored enrichment does not alias the caller's
 	// PidsLimit pointer.
 	c := caps
@@ -442,6 +457,32 @@ func (m *memStore) RecordActivation(ctx context.Context, key string, caps Caps, 
 		c.PidsLimit = &p
 	}
 	en.caps = &c
+	m.enrichment[key] = en
+	return nil
+}
+
+// TouchActivity advances the row's lastActivity enrichment to now — the caller
+// passes Clock.Now() so the store does no time math (the idle window is measured by
+// the reaper as Clock.Now() minus this stamp, two in-process Clock readings, never a
+// persisted-timestamp subtraction: NFR-SEC-48). It is the ActivityToucher optional
+// capability the lifecycle exec path calls after a successful dispatch. It takes the
+// key stripe then rowMu, the same order the mutators use. It is a no-op on a missing
+// or still-RESERVED-only enrichment row that is fine to touch (the reaper only reads
+// ACTIVE rows); a cancelled context fails closed with ErrStoreUnavailable.
+func (m *memStore) TouchActivity(ctx context.Context, key string, now time.Time) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+
+	stripe := m.keyStripe(key)
+	stripe.Lock()
+	defer stripe.Unlock()
+
+	m.rowMu.Lock()
+	defer m.rowMu.Unlock()
+
+	en := m.enrichment[key]
+	en.lastActivity = now
 	m.enrichment[key] = en
 	return nil
 }

@@ -74,7 +74,11 @@ func TestActionCreateRejectedIsStillLast(t *testing.T) {
 // baseline (9 actions → 11 actions).
 func TestPrivilegedActionsIncludesMCPKey(t *testing.T) {
 	t.Parallel()
-	const want = 13 // was 12; +ActionCreateResume (the session-resume SEC-72 arm)
+	// 12 base arms, +ActionCreateResume (main) and +ActionReconcileReclaim (reaper) =
+	// 14. PrivilegedActions() enumerates the whole 0..lastAction range, so every new
+	// arm grows the count; both new arms are system-initiated (SEC-72), not operator
+	// (SEC-45), yet still fall inside the privileged enum range.
+	const want = 14
 	got := audit.PrivilegedActions()
 	if len(got) != want {
 		t.Fatalf("PrivilegedActions() len = %d, want %d", len(got), want)
@@ -96,7 +100,7 @@ func TestPrivilegedActionsIncludesMCPKey(t *testing.T) {
 // would leave downstream consumers running the wrong revision.
 func TestFixtureVersionBumped(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v4" {
-		t.Fatalf("FixtureVersion = %q, want v4 after the session-resume arm was added", audit.FixtureVersion)
+	if audit.FixtureVersion != "v5" {
+		t.Fatalf("FixtureVersion = %q, want v5 after the reconcile-reclaim arm was added atop the session-resume arm", audit.FixtureVersion)
 	}
 }

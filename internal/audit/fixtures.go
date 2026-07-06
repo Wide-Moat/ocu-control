@@ -21,7 +21,7 @@ package audit
 // a forward-declared deferred-verb label — is a version bump. It is carried in the
 // audit metadata so a downstream fan-in can pin which fixture revision a source was
 // running.
-const FixtureVersion = "v4"
+const FixtureVersion = "v5"
 
 // lastAction is the highest valid Action enum value. It anchors the exhaustive walk
 // of the closed enum: PrivilegedActions enumerates 0..lastAction inclusive, and the
@@ -139,6 +139,14 @@ func SEC72Actions() []ActionMeta {
 		{Label: "quota-rejection", Action: ActionCreateRejected, HasEnum: true},
 		{Label: "admission-rejection", Action: ActionCreateRejected, HasEnum: true},
 		{Label: "killswitch-rejection", Action: ActionCreateRejected, HasEnum: true},
+		// The system-initiated lifecycle RECLAIM of a leaked slot. Both causes — the
+		// boot reconciler finding a session's substrate gone (substrate-lost) and the
+		// runtime idle-reaper finding a session abandoned past its idle window
+		// (idle-reap) — map onto the single ActionReconcileReclaim arm, exactly as the
+		// three rejection causes map onto ActionCreateRejected. No human acted; the
+		// system returned a slot the tier cap would otherwise leak (NFR-SEC-72).
+		{Label: "substrate-lost", Action: ActionReconcileReclaim, HasEnum: true},
+		{Label: "idle-reap", Action: ActionReconcileReclaim, HasEnum: true},
 	}
 }
 

@@ -101,5 +101,19 @@ func (m *Manager) Exec(ctx context.Context, caller ingress.AuthenticatedCaller, 
 	// pure function the create-path handoff stager used), and the container name is
 	// the host-attested row value — never a body hint (NFR-SEC-43).
 	sockDir := m.handoff.SockDir(runtime.SessionName(row.Key))
-	return m.execDriver.Exec(ctx, sockDir, row.ContainerName, req)
+	res, err := m.execDriver.Exec(ctx, sockDir, row.ContainerName, req)
+	if err != nil {
+		return ExecResult{}, err
+	}
+
+	// A successful exec is activity: advance the row's last-activity stamp so the
+	// idle-reaper measures idleness from THIS exec, not from creation — a session that
+	// keeps exec'ing is never reaped. The stamp is Clock.Now() (the reaper compares two
+	// in-process Clock readings, never a persisted timestamp: NFR-SEC-48). The touch is
+	// NON-FATAL: the exec already succeeded and its result is owed to the caller, so a
+	// touch failure (or a Store without the ActivityToucher capability) is swallowed —
+	// the session simply keeps its prior stamp and may be reaped one idle window early
+	// at worst, never a failed exec.
+	_ = m.reg.TouchActivity(ctx, key, m.clk.Now())
+	return res, nil
 }

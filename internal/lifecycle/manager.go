@@ -808,3 +808,75 @@ func (m *Manager) releaseReclaimed(ctx context.Context, row state.SessionRow) er
 	}
 	return nil
 }
+
+// ReapIdle reclaims every ACTIVE session whose last activity is older than idleTTL —
+// an abandoned session (the client crashed, dropped, or was OOM-killed without
+// calling destroy) whose container is still Up so neither the boot reconciler
+// (substrate-lost only) nor the kill-switch (operator-driven) reclaims it. Without
+// this a session with no client holds its concurrency slot forever, wedging the tier
+// cap: a fail-open DoS. It returns the number of sessions reaped.
+//
+// The idle window is measured entirely through the injected Clock: LastActivity is a
+// Clock stamp (set at activation, advanced on every exec), and idleness is
+// Clock.Now() minus that stamp — two in-process Clock readings, never a persisted-
+// timestamp subtraction, so a wall-clock setback moves no reclaim (NFR-SEC-48). A
+// row with no LastActivity (still RESERVED, or a Store without the enrichment) is
+// skipped: only a committed ACTIVE session with a recorded activity stamp is a reap
+// candidate, so a crashed-mid-create RESERVED row is left to the boot reconciler.
+//
+// Each reap is AUDIT-FIRST and fail-closed: the system-initiated reconcile-reclaim
+// record (idle-reap cause, NFR-SEC-72) is emitted BEFORE the row is released, so a
+// slot returned to the tier cap is never returned un-recorded. A Store that cannot
+// enumerate enriched rows surfaces the typed error (fail-closed — the reaper refuses
+// to claim it reaped rows it could not list).
+func (m *Manager) ReapIdle(ctx context.Context, idleTTL time.Duration) (int, error) {
+	rows, err := m.reg.EnrichedLiveSessions(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("lifecycle: reap-idle list rows: %w", err)
+	}
+	now := m.clk.Now()
+	reaped := 0
+	for i := range rows {
+		r := rows[i]
+		// Only a committed ACTIVE session with a recorded activity stamp is a reap
+		// candidate. A RESERVED row (crashed mid-create) is the boot reconciler's; a row
+		// with no stamp cannot be measured for idleness, so it is left alone.
+		if r.State != state.StateActive || r.LastActivity == nil {
+			continue
+		}
+		if now.Sub(*r.LastActivity) <= idleTTL {
+			continue // recent activity: a live session, keep its slot
+		}
+		if err := m.reapOne(ctx, r.SessionRow); err != nil {
+			return reaped, fmt.Errorf("lifecycle: reap-idle %q: %w", r.Key, err)
+		}
+		reaped++
+	}
+	return reaped, nil
+}
+
+// reapOne reclaims one idle ACTIVE row. It is AUDIT-FIRST and fail-closed: the
+// reconcile-reclaim record (idle-reap cause) is emitted BEFORE the row is released,
+// so the returned slot is never returned un-recorded (NFR-SEC-72). It then releases
+// the row to the tombstone and returns the concurrency slot through the SAME single
+// decrement the destroy and boot-reconcile paths use. Release and ReleaseConcurrency
+// are idempotent, so a re-run never double-credits.
+func (m *Manager) reapOne(ctx context.Context, row state.SessionRow) error {
+	rec := audit.Record{
+		Action: audit.ActionReconcileReclaim,
+		Key:    row.Key,
+		Caller: row.Owner.Caller,
+		Tenant: row.Owner.Tenant,
+		Reason: "idle-reap: session idle past the idle-TTL with no exec or control activity",
+	}
+	if err := m.audit.Emit(ctx, rec); err != nil {
+		return fmt.Errorf("idle-reap audit: %w", err)
+	}
+	if _, err := m.reg.ReleaseRow(ctx, row); err != nil {
+		return fmt.Errorf("release reaped row: %w", err)
+	}
+	if err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {
+		return fmt.Errorf("release reaped concurrency: %w", err)
+	}
+	return nil
+}
