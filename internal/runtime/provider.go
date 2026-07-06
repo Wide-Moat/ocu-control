@@ -337,6 +337,18 @@ type Sandbox struct {
 	// Tier is the isolation tier the provider materialized under, echoed for
 	// audit. It equals the provider's deployment-wide tier; it is informational.
 	Tier RuntimeTier
+	// Alive reports whether the substrate container is in a RUNNING run-state
+	// (running or restarting) as opposed to a terminal one (created, exited, dead).
+	// It is populated only on the Reconcile enumeration path — the boot orphan sweep
+	// lists every managed container regardless of run-state, and a present-but-dead
+	// container must NOT hold its session row's concurrency slot. The reconciler
+	// treats a present-but-!Alive container as substrate-lost: it reclaims the row
+	// (returning the slot) AND force-kills the dead container (sweeping the garbage),
+	// so neither the slot nor the container leaks. It is informational and defaults to
+	// the zero value (false) on every other path, where it is unread. A newly
+	// Materialized sandbox does not set it (the caller has just created a running
+	// container; there is nothing to reconcile).
+	Alive bool
 }
 
 // Sentinel errors. Callers match with errors.Is; implementations wrap with %w

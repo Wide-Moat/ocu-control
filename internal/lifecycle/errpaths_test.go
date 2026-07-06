@@ -321,6 +321,12 @@ func TestReconcileSkipsActiveRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	// Model the running session: its container IS in the live substrate snapshot
+	// provider.Reconcile returns AND is running (Alive true). The reconciler must then
+	// leave the ACTIVE row alone — a RUNNING container matched to an active row is never
+	// killed and the row is not reclaimed. (An exited-but-present container is instead
+	// substrate-lost and reclaimed; that is the F-2 keystone.)
+	d.provider.orphans = []runtime.Sandbox{{Name: runtime.SessionName(created.Key), Alive: true}}
 	if err := d.mgr.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
