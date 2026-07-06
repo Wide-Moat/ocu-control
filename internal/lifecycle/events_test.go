@@ -58,6 +58,7 @@ func newManagerWithPublisher(t *testing.T, pub lifecycle.EventPublisher) *lifecy
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 		Events:        pub,
 	})

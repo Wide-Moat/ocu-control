@@ -83,6 +83,15 @@ const (
 	// (SEC-72); it forms the tool-call fixture family. Inserted BEFORE
 	// ActionCreateRejected so the boundary anchor stays last.
 	ActionExec
+	// ActionReconcileReclaim is the boot reconciler reclaiming a non-terminal
+	// session row whose substrate container is gone (out-of-band removal, host
+	// crash, OOM-kill) — a system-initiated lifecycle transition (the SEC-72
+	// family, like ActionCreateRejected, NOT an operator SEC-45 action). It returns
+	// the row's concurrency slot and drives the row to the released tombstone; the
+	// Reason field carries the substrate-lost cause so the operator trail
+	// distinguishes it from a normal destroy without a distinct row state. Inserted
+	// BEFORE ActionCreateRejected so the boundary anchor stays last.
+	ActionReconcileReclaim
 	// ActionCreateRejected is a session create REFUSED at a pre-side-effect deny
 	// stage (admission, quota, or the kill-switch/denylist re-check). It is the
 	// system-initiated rejection record NFR-SEC-46/72 require: the deny itself is
@@ -119,6 +128,8 @@ func (a Action) String() string {
 		return "mcp_key_revoke"
 	case ActionExec:
 		return "exec"
+	case ActionReconcileReclaim:
+		return "reconcile_reclaim"
 	case ActionCreateRejected:
 		return "create_rejected"
 	default:

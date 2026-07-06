@@ -26,6 +26,7 @@ func TestPrivilegedActionsIsClosedEnum(t *testing.T) {
 		audit.ActionMCPKeyCreate,
 		audit.ActionMCPKeyRevoke,
 		audit.ActionExec,
+		audit.ActionReconcileReclaim,
 		audit.ActionCreateRejected,
 	}
 	got := audit.PrivilegedActions()

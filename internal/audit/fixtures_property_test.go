@@ -74,7 +74,7 @@ func TestActionCreateRejectedIsStillLast(t *testing.T) {
 // baseline (9 actions → 11 actions).
 func TestPrivilegedActionsIncludesMCPKey(t *testing.T) {
 	t.Parallel()
-	const want = 12 // was 11; +ActionExec (the F10 tool-call family)
+	const want = 13 // was 12; +ActionReconcileReclaim (the boot-reconciler orphan-row reclaim, SEC-72)
 	got := audit.PrivilegedActions()
 	if len(got) != want {
 		t.Fatalf("PrivilegedActions() len = %d, want %d", len(got), want)

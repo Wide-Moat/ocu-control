@@ -137,6 +137,10 @@ func SEC72Actions() []ActionMeta {
 		{Label: "quota-rejection", Action: ActionCreateRejected, HasEnum: true},
 		{Label: "admission-rejection", Action: ActionCreateRejected, HasEnum: true},
 		{Label: "killswitch-rejection", Action: ActionCreateRejected, HasEnum: true},
+		// The boot reconciler reclaiming a container-less non-terminal row is a
+		// system-initiated transition: it returns the concurrency slot and drives the
+		// row to the released tombstone, and NFR-SEC-72 requires that transition audited.
+		{Label: "reconcile-reclaim", Action: ActionReconcileReclaim, HasEnum: true},
 	}
 }
 

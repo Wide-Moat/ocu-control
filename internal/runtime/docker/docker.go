@@ -84,6 +84,22 @@ const (
 	// controlSockName is the advisory control-RPC UDS filename inside guestSockDir;
 	// the guest binds it under --control-listen-uds (additive, ADR-0018).
 	controlSockName = "control.sock"
+	// mountReadyName is the ready-file filename inside guestSockDir the mount
+	// boot-child creates once every mount is up; the guest gates serving on it.
+	mountReadyName = "mount.ready"
+	// mountBinGuestPath is the in-guest path of the co-located mount binary in the
+	// assembled guest image — a cross-repo contract pinned in the guest image
+	// (deploy/guest-image) and the guest INTEGRATION.md. It is the first
+	// --boot-child-argv token for a storage-scoped session.
+	mountBinGuestPath = "/ocu-rclone-filestore"
+	// guestAgentBinPath is the in-guest path of the guest agent binary (PID 1). It
+	// is the SAME cross-repo contract the assembled guest image pins as its
+	// ENTRYPOINT (deploy/guest-image). The provider sets it EXPLICITLY as the
+	// container Entrypoint rather than trusting the image metadata: the agent argv
+	// (the Cmd below) is a control-owned contract, so a BYO image whose ENTRYPOINT
+	// drifts — or is empty — must fail loudly at start (the runtime cannot find the
+	// binary) instead of silently running Cmd[0] ("--listen-uds") as the executable.
+	guestAgentBinPath = "/usr/local/bin/process_api"
 )
 
 // defaultSeccomp is the embedded deny-default seccomp profile, applied verbatim
@@ -171,6 +187,32 @@ type Provider struct {
 	// revoke effect a no-op. Kept separate from revoker so the revoke effect and
 	// its audit are independently wired.
 	revokeAuditor RevokeAuditor
+	// INTERIM: this shared-network attach deviates from ADR-0021 (host-side L3 egress
+	// attach seam), which keeps every session on its per-session Internal bridge and
+	// reaches the edge via a host-root-netns listener on the per-session bridge
+	// gateway IP — structural (kernel-enforced) cross-session isolation, not a shared
+	// network. The shim exists only because a runsc guest cannot reach Docker embedded
+	// DNS; the ADR-0021 attach works under gVisor when the guest dials the literal
+	// per-session gateway IP (proven). Converge to ADR-0021 and remove this shim per
+	// open-computer-use#333.
+	//
+	// egressNetwork is the deployment-fixed docker network a STORAGE-scoped guest
+	// attaches to so its co-located mount can reach the egress edge — the only
+	// component on that network the guest may talk to (the edge is multi-homed:
+	// this guest-facing network on one side, the credential-bearing upstream
+	// network on the other, which the guest is never placed on). A pure-exec
+	// session ignores it entirely and stays on its own per-session deny-all
+	// Internal bridge. Empty (the minimal shelf / no storage deployment) leaves
+	// every session on the per-session Internal bridge, exactly as before. It is a
+	// provider-construction value, NEVER a per-request body field (NFR-SEC-43).
+	egressNetwork string
+	// edgeHost is the deployment-fixed IP the guest resolves the `edge` name to via
+	// a static ExtraHosts entry. A gVisor (runsc) guest cannot reach docker's
+	// embedded DNS resolver at 127.0.0.11, so the `edge` name in the mount-config
+	// service_url (kept a NAME for TLS SAN verification) is resolved by this pinned
+	// host entry instead. Only applied to a storage-scoped session on the egress
+	// network; empty adds no entry.
+	edgeHost string
 	// stagerBase is the deployment-fixed host directory under which the create-path
 	// handoff stager writes each per-session 0700 root (base/<SessionName>). It is a
 	// PROVIDER CONSTRUCTION value — never a per-request body field (NFR-SEC-43) — so
@@ -211,6 +253,14 @@ type Deps struct {
 	// Empty leaves step 3 a host-side no-op (the minimal shelf), exactly as a nil
 	// Revoker leaves step 1.
 	StagerBase string
+	// EgressNetwork is the deployment-fixed docker network a STORAGE-scoped guest
+	// joins so its mount can reach the egress edge (see Provider.egressNetwork).
+	// Empty keeps every session on its own per-session Internal bridge.
+	EgressNetwork string
+	// EdgeHost is the deployment-fixed IP the guest's static `edge` ExtraHosts entry
+	// resolves to, working around gVisor's inability to use the embedded DNS
+	// resolver (see Provider.edgeHost). Empty adds no ExtraHosts entry.
+	EdgeHost string
 }
 
 // NewDockerProvider builds the Docker provider bound to the deployment-wide
@@ -227,7 +277,7 @@ func NewDockerProvider(tier runtime.RuntimeTier, deps Deps) (*Provider, error) {
 		}
 		api = cli
 	}
-	return &Provider{api: api, tier: tier, revoker: deps.Revoker, revokeAuditor: deps.RevokeAuditor, stagerBase: deps.StagerBase}, nil
+	return &Provider{api: api, tier: tier, revoker: deps.Revoker, revokeAuditor: deps.RevokeAuditor, stagerBase: deps.StagerBase, egressNetwork: deps.EgressNetwork, edgeHost: deps.EdgeHost}, nil
 }
 
 // networkName is the pure function from session name to per-session bridge name,
@@ -238,30 +288,64 @@ func networkName(name runtime.SessionName) string { return "ocu-net-" + string(n
 // containerName is the pure function from session name to container name.
 func containerName(name runtime.SessionName) string { return "ocu-sess-" + string(name) }
 
-// dockerRuntimeForTier maps the deployment-wide isolation tier to the Docker
-// HostConfig.Runtime string. Empty means "the daemon default" (runc under a
-// stock dockerd) — it is correct NOT to hardcode "runc", since the daemon may
-// name its default differently. TierGvisor asks dockerd for the gVisor sentry
-// ("runsc"); without this the gVisor admission decision is not enforced at the
-// OCI layer (admission admits internal_workforce and untrusted-tier workloads
-// on TierGvisor expecting the sentry, but a container created on the daemon
-// default lands on a shared-kernel runc boundary). TierFirecracker never reaches
-// here (Materialize aborts before buildHostConfig) so it has no arm and falls
-// into the safe empty-string default.
-func dockerRuntimeForTier(tier runtime.RuntimeTier) string {
+// dockerRuntimeForTier maps the deployment-wide isolation tier — and, within
+// TierGvisor, the per-session FUSE need — to the Docker HostConfig.Runtime string.
+// Empty means "the daemon default" (runc under a stock dockerd) — it is correct
+// NOT to hardcode "runc", since the daemon may name its default differently.
+// TierGvisor asks dockerd for the gVisor sentry; without this the gVisor admission
+// decision is not enforced at the OCI layer (admission admits internal_workforce
+// and untrusted-tier workloads on TierGvisor expecting the sentry, but a container
+// created on the daemon default lands on a shared-kernel runc boundary).
+// TierFirecracker never reaches here (Materialize aborts before buildHostConfig)
+// so it has no arm and falls into the safe empty-string default.
+//
+// A gVisor host registers two runsc runtimes: "runsc" (the plain sentry) and
+// "runsc-fuse" (the sentry started with --fuse, the ONLY variant whose sentry
+// serves the co-located mount's in-guest FUSE mount(2)). The variant is selected
+// PER SESSION on fuse — the SAME MountConfigGuestPath signal that scopes the
+// CAP_SYS_ADMIN + /dev/fuse add-back in buildHostConfig (ADR-0020). This is
+// least-privilege at session granularity: a pure-exec gVisor session gets the
+// plain sentry, and the wider --fuse sentry surface is confined to sessions whose
+// validated MountIntent actually mounts. It never confers authority — fuse shapes
+// the caller's OWN sandbox, the mount stays inert without the independently
+// host-attested Storage-JWT (NFR-SEC-43), exactly as the cap-add gate already
+// rules. Selecting runtime, cap, and device on one predicate keeps the three from
+// ever disagreeing (no /dev/fuse on a non-fuse runtime; no fuse runtime without a
+// mount-config).
+func dockerRuntimeForTier(tier runtime.RuntimeTier, fuse bool) string {
 	switch tier {
 	case runtime.TierGvisor:
-		// "runsc" is the plain gVisor sentry. A gVisor-enabled host may register
-		// two runsc runtimes — "runsc" (no --fuse) and "runsc-fuse" (with --fuse);
-		// the v1 control plane materializes an ordinary untrusted COMPUTE sandbox
-		// (the rclone-filestore mount runs in-guest behind the egress edge, not as
-		// a host-level FUSE runtime), so "runsc" is correct. A future FUSE workload
-		// would need the "runsc-fuse" variant — named here so the choice is
-		// deliberate, not accidental; v1 does not run it, so no arm is added.
+		if fuse {
+			return "runsc-fuse"
+		}
 		return "runsc"
 	default: // TierRunc (and any not-yet-mapped tier): the daemon default.
 		return ""
 	}
+}
+
+// needsFUSE is the single per-session predicate for the co-located mount's FUSE
+// need: a storage-scoped session is exactly one whose rendered mount-config was
+// staged into the guest (MountConfigGuestPath set). It is the sole gate for the
+// runsc-fuse runtime variant, the CAP_SYS_ADMIN + /dev/fuse add-back, and the
+// boot-child --boot-child-argv wiring — one signal, so a session can never hold
+// the FUSE runtime without the device, or the device without the mount.
+func needsFUSE(spec runtime.SessionSpec) bool {
+	return spec.Handoff.MountConfigGuestPath != ""
+}
+
+// sessionNetwork is the SINGLE source of the docker network a session's guest
+// attaches to: the shared egress network for a storage-scoped session on a
+// deployment that wired one, else the per-session Internal deny-all bridge. Both
+// the container's HostConfig.NetworkMode and the NetworkingConfig endpoint derive
+// from THIS one function, so they can never name different networks (a mismatch is
+// a "network not found" materialize failure). It takes the same egressNetwork the
+// provider holds; an empty egressNetwork always yields the per-session bridge.
+func sessionNetwork(spec runtime.SessionSpec, egressNetwork string) string {
+	if needsFUSE(spec) && egressNetwork != "" {
+		return egressNetwork
+	}
+	return networkName(spec.Name)
 }
 
 // Materialize creates the per-session Internal bridge, the HOST-01 container, and
@@ -281,7 +365,7 @@ func (p *Provider) Materialize(ctx context.Context, spec runtime.SessionSpec) (r
 		return runtime.Sandbox{}, fmt.Errorf("docker: tier firecracker: %w", runtime.ErrNotImplemented)
 	}
 
-	hostCfg, err := buildHostConfig(spec, p.tier)
+	hostCfg, err := buildHostConfig(spec, p.tier, p.egressNetwork, p.edgeHost)
 	if err != nil {
 		return runtime.Sandbox{}, err
 	}
@@ -289,26 +373,46 @@ func (p *Provider) Materialize(ctx context.Context, spec runtime.SessionSpec) (r
 	bridge := networkName(spec.Name)
 	cname := containerName(spec.Name)
 
-	// 1. Per-session deny-all Internal bridge (stronger than a plain bridge: no
-	//    outbound NAT, so guest-out egress is denied by default).
-	if _, nerr := p.api.NetworkCreate(ctx, bridge, network.CreateOptions{
-		Driver:   "bridge",
-		Internal: true,
-		Labels: map[string]string{
-			labelManaged:      managedLabelValue,
-			labelSessionName:  string(spec.Name),
-			labelFilesystemID: spec.Egress.FilesystemID,
-		},
-	}); nerr != nil {
-		// Nothing created yet — map the conflict but no rollback is needed.
-		return runtime.Sandbox{}, fmt.Errorf("docker: network create %q: %w", bridge, materializeError(nerr))
+	// A storage-scoped session (needsFUSE) reaches the egress edge over the
+	// deployment-fixed shared egress network the edge is multi-homed onto; a
+	// pure-exec session stays on its own per-session deny-all Internal bridge. The
+	// choice is made on the SAME needsFUSE predicate as the runtime/cap/device
+	// gate, so a session's network posture can never disagree with its FUSE need.
+	// The egress network is only used when the deployment actually wired one
+	// (egressNetwork != ""); otherwise even a storage session falls back to the
+	// per-session Internal bridge (the minimal shelf), which has no edge and so
+	// cannot complete a mount — a fail-closed default, never a silent leak.
+	attachNet := sessionNetwork(spec, p.egressNetwork)
+	useEgressNet := attachNet != bridge
+
+	// 1. Per-session deny-all Internal bridge — SKIPPED for a session that joins the
+	//    shared egress network instead. The Internal bridge is stronger than a plain
+	//    bridge: no outbound NAT, so guest-out egress is denied by default. A storage
+	//    session gets its reachability from the egress network (edge only), not NAT.
+	if !useEgressNet {
+		if _, nerr := p.api.NetworkCreate(ctx, bridge, network.CreateOptions{
+			Driver:   "bridge",
+			Internal: true,
+			Labels: map[string]string{
+				labelManaged:      managedLabelValue,
+				labelSessionName:  string(spec.Name),
+				labelFilesystemID: spec.Egress.FilesystemID,
+			},
+		}); nerr != nil {
+			// Nothing created yet — map the conflict but no rollback is needed.
+			return runtime.Sandbox{}, fmt.Errorf("docker: network create %q: %w", bridge, materializeError(nerr))
+		}
 	}
 
-	// 2. The HOST-01 container, attached to the per-session bridge.
-	created, cerr := p.api.ContainerCreate(ctx, buildContainerConfig(spec), hostCfg, buildNetworkingConfig(bridge), nil, cname)
+	// 2. The HOST-01 container, attached to its network (the SAME sessionNetwork the
+	//    HostConfig.NetworkMode names — one source, so they cannot disagree).
+	created, cerr := p.api.ContainerCreate(ctx, buildContainerConfig(spec), hostCfg, buildNetworkingConfig(attachNet), nil, cname)
 	if cerr != nil {
-		// Roll back the bridge (no container exists to remove first).
-		p.rollbackNetwork(ctx, bridge)
+		// Roll back the per-session bridge if we created one (the shared egress
+		// network is deploy-owned and never rolled back).
+		if !useEgressNet {
+			p.rollbackNetwork(ctx, bridge)
+		}
 		return runtime.Sandbox{}, fmt.Errorf("docker: container create %q: %w", cname, materializeError(cerr))
 	}
 
@@ -316,7 +420,9 @@ func (p *Provider) Materialize(ctx context.Context, spec runtime.SessionSpec) (r
 	if serr := p.api.ContainerStart(ctx, created.ID, container.StartOptions{}); serr != nil {
 		// Roll back container-then-network (the active-endpoints constraint).
 		p.rollbackContainer(ctx, created.ID)
-		p.rollbackNetwork(ctx, bridge)
+		if !useEgressNet {
+			p.rollbackNetwork(ctx, bridge)
+		}
 		return runtime.Sandbox{}, fmt.Errorf("docker: container start %q: %w", created.ID, materializeError(serr))
 	}
 
@@ -436,8 +542,9 @@ func (p *Provider) Reconcile(ctx context.Context) ([]runtime.Sandbox, error) {
 
 // validateSpec runs BEFORE any substrate call and rejects a malformed production
 // spec with ErrUnsupportedSpec (zero substrate calls): an unknown SchemaVersion, a
-// non-32-byte Ed25519 public key, a permissive EgressPolicy (DefaultDeny false), or
-// a missing HOST-01 bind path (requirement 5 — fail-closed, never the daemon
+// non-32-byte Ed25519 public key, a permissive EgressPolicy (DefaultDeny false), a
+// missing HOST-01 bind path, or a storage-scoped mount that arrives without its
+// mount-config guest path (requirement 5 — fail-closed, never the daemon
 // default). The order is fixed so a malformed-key spec and a permissive-egress spec
 // reject deterministically.
 func validateSpec(spec runtime.SessionSpec) error {
@@ -455,6 +562,18 @@ func validateSpec(spec runtime.SessionSpec) error {
 		spec.Handoff.PublicKeyHostPath == "" || spec.Handoff.PublicKeyGuestPath == "" ||
 		spec.Handoff.HostSockDir == "" {
 		return fmt.Errorf("docker: missing HOST-01 bind path: %w", runtime.ErrUnsupportedSpec)
+	}
+	// A storage-scoped mount (a MountIntent naming a filesystem/memory-store
+	// scope) must arrive WITH the in-guest mount-config path. Without it the guest
+	// boots with no boot-child and no mount: not fail-OPEN (no scope is granted)
+	// but a fail-SILENT invariant loss — the session was admitted with a storage
+	// scope it never received, and nothing downstream notices the missing mount.
+	// Refuse fail-closed instead. The converse (config path set, no scoped mount)
+	// stays legal: the config is what carries the scope detail.
+	for _, m := range spec.Mounts {
+		if (m.FilesystemID != "" || m.MemoryStoreID != "") && spec.Handoff.MountConfigGuestPath == "" {
+			return fmt.Errorf("docker: storage-scoped mount without a mount-config guest path (mount-config-missing, fail-silent invariant loss): %w", runtime.ErrUnsupportedSpec)
+		}
 	}
 	return nil
 }
@@ -492,18 +611,44 @@ func validateSpec(spec runtime.SessionSpec) error {
 // flag and value are SEPARATE elements, and it carries NO TCP-perimeter flag
 // (--addr / --block-local-connections) and NO NotImplemented flag.
 func buildContainerConfig(spec runtime.SessionSpec) *container.Config {
+	// Exec-form argv: separate tokens, no shell. --listen-uds is the required
+	// listener (fail-STOP guard); --auth-public-key turns on JWT verification
+	// (fail-OPEN guard); --control-listen-uds is the additive advisory /shutdown
+	// surface (ADR-0018), NOT part of the listener ArgGroup.
+	cmd := []string{
+		"--listen-uds", guestSockDir + "/" + execSockName,
+		"--control-listen-uds", guestSockDir + "/" + controlSockName,
+		"--auth-public-key", spec.Handoff.PublicKeyGuestPath,
+	}
+	// A storage-scoped session (MountConfigGuestPath set) appends the managed
+	// boot-child flags so the guest agent starts the co-located mount binary and
+	// gates serving on its ready-file, fail-closed. The mount config path IS the
+	// Handoff field (single source, same discipline as PublicKeyGuestPath), and
+	// the ready-file is a fixed name inside the RW sock dir. --boot-child-argv is
+	// repeated once per token; the child's own --config/--ready-file ride through
+	// as VALUES (the guest declares allow_hyphen_values). A pure-exec session
+	// leaves cmd byte-identical to the pre-boot-child form.
+	if spec.Handoff.MountConfigGuestPath != "" {
+		readyPath := guestSockDir + "/" + mountReadyName
+		cmd = append(cmd,
+			"--boot-child-argv", mountBinGuestPath,
+			"--boot-child-argv", "--config",
+			"--boot-child-argv", spec.Handoff.MountConfigGuestPath,
+			"--boot-child-argv", "--ready-file",
+			"--boot-child-argv", readyPath,
+			"--boot-child-ready-file", readyPath,
+		)
+	}
 	return &container.Config{
 		Image: spec.Image,
-		Env:   []string{}, // EMPTY on every production path (requirement 5).
-		// Exec-form argv: separate tokens, no shell. --listen-uds is the required
-		// listener (fail-STOP guard); --auth-public-key turns on JWT verification
-		// (fail-OPEN guard); --control-listen-uds is the additive advisory /shutdown
-		// surface (ADR-0018), NOT part of the listener ArgGroup.
-		Cmd: []string{
-			"--listen-uds", guestSockDir + "/" + execSockName,
-			"--control-listen-uds", guestSockDir + "/" + controlSockName,
-			"--auth-public-key", spec.Handoff.PublicKeyGuestPath,
-		},
+		// Entrypoint is set EXPLICITLY to the guest-agent binary, never left to the
+		// image metadata: the argv in Cmd is a control-owned cross-repo contract, so a
+		// BYO/mis-tagged image with a drifted or empty ENTRYPOINT fails loudly at start
+		// (executable not found) instead of running Cmd[0] ("--listen-uds") as the
+		// program. Exec form, single element.
+		Entrypoint: []string{guestAgentBinPath},
+		Env:        []string{}, // EMPTY on every production path (requirement 5).
+		Cmd:        cmd,
 		Labels: map[string]string{
 			labelManaged:      managedLabelValue,
 			labelSessionName:  string(spec.Name),
@@ -534,7 +679,7 @@ func buildNetworkingConfig(bridge string) *network.NetworkingConfig {
 // so a gVisor sandbox runs the same hardened HostConfig as a runc one, differing
 // only in which OCI runtime dockerd hands the create to. Without this the gVisor
 // admission decision would not be enforced at the OCI layer.
-func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier) (*container.HostConfig, error) {
+func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier, egressNetwork, edgeHost string) (*container.HostConfig, error) {
 	if compactSeccomp == "" {
 		return nil, fmt.Errorf("docker: build host config: %w", runtime.ErrSeccompProfileMissing)
 	}
@@ -562,7 +707,7 @@ func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier) (*conta
 		ReadonlyRootfs: true,
 		Tmpfs:          map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=64m"},
 		Binds:          binds,
-		NetworkMode:    container.NetworkMode(networkName(spec.Name)),
+		NetworkMode:    container.NetworkMode(sessionNetwork(spec, egressNetwork)),
 		Resources: container.Resources{
 			// HARD CPU ceiling, never a relative weight: NanoCPUs is set,
 			// CPUShares stays 0 (requirement 5 — caps not shares).
@@ -573,12 +718,45 @@ func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier) (*conta
 		// PortBindings deliberately nil: no host port is published; the exec
 		// channel rides the UDS sock bind, not a TCP port.
 	}
-	// The deployment-wide isolation tier selects the OCI runtime dockerd uses:
-	// "runsc" for the gVisor sentry, "" (the daemon default) otherwise. This is the
-	// only tier-dependent field; everything above is identical across tiers. An
-	// empty string omits the field (json:",omitempty"), so dockerd applies its
-	// default runtime for TierRunc — confirming empty is the correct runc value.
-	hostCfg.Runtime = dockerRuntimeForTier(tier)
+	// A storage-scoped session (mount config delivered) needs the minimal add-back
+	// for the co-located mount's in-guest mount(2): CAP_SYS_ADMIN in the effective
+	// set plus the /dev/fuse device. The add-back is SCOPED — a pure-exec session
+	// gets neither, so SYS_ADMIN can never leak onto a session that does not mount.
+	// The rclone VFS write-cache also needs a writable /root/.cache; the rootfs is
+	// read-only, so a small tmpfs is added there for the mount to cache into.
+	// cap-drop ALL stays (this is add-back over drop-all, per NFR-SEC / invariant
+	// 7 "cap-drop ALL with minimal add-back"); no-new-privileges and the read-only
+	// rootfs are untouched — mount(2) works under both.
+	fuse := needsFUSE(spec)
+	if fuse {
+		hostCfg.CapAdd = []string{"SYS_ADMIN"}
+		hostCfg.Devices = []container.DeviceMapping{{
+			PathOnHost:        "/dev/fuse",
+			PathInContainer:   "/dev/fuse",
+			CgroupPermissions: "rwm",
+		}}
+		hostCfg.Tmpfs["/root/.cache"] = "rw,nosuid,nodev,size=64m"
+		// A gVisor (runsc) guest cannot reach docker's embedded DNS resolver at
+		// 127.0.0.11, so the `edge` NAME in the mount-config service_url would not
+		// resolve. The deployment pins the edge's IP on the shared egress network and
+		// hands it here; a static ExtraHosts entry maps `edge` to it, keeping the wire
+		// service_url a NAME (TLS SAN verification stays a DNS SAN, not a brittle IP
+		// SAN). Only a storage session on the egress network needs it; empty edgeHost
+		// (the minimal shelf) adds nothing.
+		if edgeHost != "" {
+			hostCfg.ExtraHosts = append(hostCfg.ExtraHosts, "edge:"+edgeHost)
+		}
+	}
+
+	// The isolation tier plus the per-session FUSE need select the OCI runtime
+	// dockerd uses: "runsc-fuse" for a gVisor session that mounts, "runsc" for a
+	// plain gVisor session, "" (the daemon default) under runc. This is the only
+	// tier-dependent field; everything above is identical across tiers. An empty
+	// string omits the field (json:",omitempty"), so dockerd applies its default
+	// runtime for TierRunc — confirming empty is the correct runc value. fuse is
+	// the SAME predicate that scoped the cap/device add-back above, so a session's
+	// runtime and its capabilities can never disagree.
+	hostCfg.Runtime = dockerRuntimeForTier(tier, fuse)
 	return hostCfg, nil
 }
 

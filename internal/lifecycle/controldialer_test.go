@@ -88,6 +88,7 @@ func newManagerWithDialer(t *testing.T, dialer *recordingDialer) (*lifecycle.Man
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 		ControlDialer: dialer,
 	})

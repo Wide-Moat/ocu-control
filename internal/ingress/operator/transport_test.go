@@ -78,6 +78,7 @@ func operatorDepsFor(t *testing.T, resolver ingress.IdentityResolver, verifier k
 		Audit:         sink,
 		Profile:       0, // ProfileTrustedOperator
 		Tier:          ocuruntime.TierRunc,
+		AllowedImages: []string{"img", "ocu/sandbox:test", "registry.example/ocu-sandbox:v1"},
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)

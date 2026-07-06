@@ -206,7 +206,11 @@ func activityFor(a audit.Action) (uint8, string) {
 	switch a {
 	case audit.ActionCreateCommit:
 		return activityCreate, a.String()
-	case audit.ActionDestroy:
+	case audit.ActionDestroy, audit.ActionReconcileReclaim:
+		// A reconcile-reclaim, like a destroy, tears a session down — it drives the row
+		// to the released tombstone and returns its concurrency slot — so the honest
+		// CRUD slot is Delete. The name stays the Action label ("reconcile_reclaim"), so
+		// the record is self-describing next to the operator-driven destroy events.
 		return activityDelete, a.String()
 	case audit.ActionRevokeOne, audit.ActionRevokeAll,
 		audit.ActionEditDenylist, audit.ActionOverrideQuota, audit.ActionRetentionPolicy,

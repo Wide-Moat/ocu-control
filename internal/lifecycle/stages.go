@@ -228,8 +228,10 @@ func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (comp
 // stageRenderPushMount (S7) renders the frozen-schema mount-config carrying the
 // freshly minted weak Storage-JWT, marshals it (the single Reveal boundary that
 // materializes the raw token into the host-only push bytes), and pushes it into the
-// host-owned handoff bind. Because it runs BEFORE stageMaterialize, the config is on
-// the bind before the in-guest mount client boots (the must-fix ordering). Its
+// RW sock dir — the one handoff directory the provider binds into the guest — so
+// the guest reads it at the Pushed.GuestPath without a new bind (NFR-SEC-25).
+// Because it runs BEFORE stageMaterialize, the config is on the bind before the
+// in-guest mount client boots (the must-fix ordering). Its
 // compensator is provisioning.Scrub, which removes the pushed config host-side; the
 // scrub is idempotent so it never races the finalizer's own scrub-trigger. When the
 // Signer/Push are absent (the Phase-3 minimal shelf), the stage is a clean no-op.
@@ -287,6 +289,17 @@ func stageMaterialize(ctx context.Context, m *Manager, st *createState) (compens
 		Egress:        st.in.Egress,
 		Resources:     st.in.Resources,
 		Handoff:       st.staged.Material,
+	}
+	if st.pushed.Path != "" {
+		// The rendered mount-config landed inside the RW sock dir (S7), so its
+		// in-guest path rides the existing sock-dir bind — no fourth bind and no :ro
+		// secret mount (NFR-SEC-25). Setting the GUEST path (never the host path) on
+		// the spec's Handoff copy flips the provider's storage-scoped posture: the
+		// managed boot-child argv plus the scoped SYS_ADMIN//dev/fuse add-back.
+		// Both-or-neither with the host-side render: a no-storage create pushed
+		// nothing and leaves the field empty, keeping today's pure-exec posture
+		// byte-identical.
+		spec.Handoff.MountConfigGuestPath = st.pushed.GuestPath
 	}
 	st.spec = spec
 	sandbox, err := m.provider.Materialize(ctx, spec)
