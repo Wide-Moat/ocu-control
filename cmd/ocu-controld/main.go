@@ -523,7 +523,11 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		ExecVerifyKey: execVerifyKeyOf(execSigner),
 		Metrics:       collector,
 	})
-	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
+	// The kill-switch refunds the per-tenant concurrency slot through the SAME
+	// quota.Gate that charged it on create, so a force-kill returns the level counter
+	// via the one decrement path the destroy and reconcile paths share (F-1: without
+	// this the counter is a write-only ratchet on the kill path).
+	eng := killswitch.NewEngine(store, custodian, provider, clk, sink, gate)
 	return mgr, eng, custodian, collector, sink
 }
 

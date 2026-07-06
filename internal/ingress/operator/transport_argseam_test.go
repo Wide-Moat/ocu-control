@@ -61,7 +61,7 @@ func boundOperatorWithStores(t *testing.T, resolver ingress.IdentityResolver) (*
 		AllowedImages: []string{"img", "ocu/sandbox:test", "registry.example/ocu-sandbox:v1"},
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
-	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
+	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink, gate)
 	mcpStore := mcpkey.NewInMemRecordStore()
 	mcpEng := mcpkey.NewEngine(
 		mcpkey.NewMinter(),

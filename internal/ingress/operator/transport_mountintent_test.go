@@ -81,7 +81,7 @@ func boundOperatorWithProvider(t *testing.T, resolver ingress.IdentityResolver, 
 		AllowedImages: []string{"img", "ocu/sandbox:test", "registry.example/ocu-sandbox:v1"},
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
-	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
+	eng := killswitch.NewEngine(store, custodian, provider, clk, sink, gate)
 	deps := operator.Deps{
 		Manager:  mgr,
 		Engine:   eng,
