@@ -754,6 +754,37 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 			return fmt.Errorf("lifecycle: reconcile reclaim orphan row %q: %w", rows[i].Key, err)
 		}
 	}
+
+	// Step 3: heal any DimConcurrentSessions cell drift. The cell is a separate lock
+	// domain from the rows, moved only by +1 charge / -1 refund; a refund lost to a
+	// swallowed unwind error (an aborted create whose Receipt.Apply failed) leaves the
+	// cell ABOVE the true live count with no row to reclaim, so Step 2 cannot correct
+	// it — the counter over-counts until it wedges the tier cap with zero live rows.
+	// Recompute the truth from the rows that SURVIVE Step 2 (the ACTIVE rows; every
+	// RESERVED one was just reclaimed) and correct each tenant's cell down to that
+	// count. This makes a restart restore cell-truth regardless of past refund
+	// reliability — the cell equivalent of the row-based reclaim above. It only
+	// corrects DOWN (ReconcileConcurrent never inflates), so a genuine live session
+	// keeps its charge.
+	liveByTenant := make(map[state.Identity]int64)
+	for i := range rows {
+		if rows[i].State == state.StateActive {
+			liveByTenant[rows[i].Owner]++
+		}
+	}
+	// Include tenants whose only rows were reclaimed RESERVED ones (now zero live) so a
+	// cell they leaked is still healed to zero: seed each row owner at its ACTIVE count
+	// (0 for a tenant with no surviving ACTIVE row).
+	for i := range rows {
+		if _, seen := liveByTenant[rows[i].Owner]; !seen {
+			liveByTenant[rows[i].Owner] = 0
+		}
+	}
+	for owner, live := range liveByTenant {
+		if _, err := m.quota.ReconcileConcurrent(ctx, owner, live); err != nil {
+			return fmt.Errorf("lifecycle: reconcile concurrency cell for %q: %w", owner.Tenant, err)
+		}
+	}
 	return nil
 }
 

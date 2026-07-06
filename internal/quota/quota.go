@@ -243,3 +243,38 @@ func (g *Gate) RefundConcurrent(ctx context.Context, id state.Identity) error {
 	}
 	return nil
 }
+
+// ReconcileConcurrent heals a drifted per-tenant DimConcurrentSessions cell down to
+// liveCount — the true number of live (RESERVED+ACTIVE) rows the boot reconciler
+// counted for the tenant. The cell is a separate lock domain from the rows and is
+// only ever moved by +1 charge / -1 refund; if a refund is lost (an aborted create
+// whose unwind refund failed and was swallowed), the cell drifts ABOVE the live-row
+// count with no row to reclaim, so the row-based reconcile cannot correct it and the
+// counter permanently over-counts until it wedges the tier cap. This recomputes the
+// truth from the rows and refunds exactly the surplus (cell - liveCount) as a single
+// negative-delta Charge, so a restart restores cell-truth regardless of past refund
+// reliability. It only corrects DOWN: a cell at or below liveCount is left untouched
+// (the reconciler never charges the cell up — a genuine live session already holds
+// its charge, and inflating would itself leak). It returns the surplus it refunded
+// (0 when there was no drift) so the reconciler can log how much it healed. It runs
+// through the injected Clock/Store contract with no time math — the correction is a
+// count comparison, never a timestamp subtraction.
+func (g *Gate) ReconcileConcurrent(ctx context.Context, id state.Identity, liveCount int64) (int64, error) {
+	concKey := state.QuotaKey{
+		Dim:      state.DimConcurrentSessions,
+		Identity: id,
+		Window:   "", // level dimension: empty window per the Store contract
+	}
+	current, err := g.store.ReadQuota(ctx, concKey)
+	if err != nil {
+		return 0, fmt.Errorf("quota: reconcile concurrent read: %w", err)
+	}
+	surplus := current - liveCount
+	if surplus <= 0 {
+		return 0, nil // no drift (or an under-count the heal must never inflate)
+	}
+	if _, err := g.store.Charge(ctx, concKey, -surplus, 0); err != nil {
+		return 0, fmt.Errorf("quota: reconcile concurrent refund: %w", err)
+	}
+	return surplus, nil
+}
