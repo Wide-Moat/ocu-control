@@ -53,6 +53,13 @@ type Collector struct {
 	// createsTotal / destroysTotal are monotonic process-lifetime counters.
 	createsTotal  uint64
 	destroysTotal uint64
+	// quotaRefundFailedTotal counts quota-refund compensator failures on the create
+	// unwind. A non-zero value is a leaked-counter alarm: a refund that failed and was
+	// swallowed leaves the concurrency cell drifted above the true live count until the
+	// boot cell-reconcile heals it. The metric makes that otherwise-silent drift
+	// observable so an operator can alert on it rather than discover it as an opaque
+	// tier-cap wedge.
+	quotaRefundFailedTotal uint64
 	// startBucketCounts[i] is the count of start-durations <= buckets[i] (filled
 	// cumulatively at emit). startCount and startSum drive the histogram's _count
 	// and _sum and thus the average (sum/count = avg start seconds).
@@ -82,6 +89,18 @@ func (c *Collector) IncCreate() {
 func (c *Collector) IncDestroy() {
 	c.mu.Lock()
 	c.destroysTotal++
+	c.mu.Unlock()
+}
+
+// IncQuotaRefundFailed records one quota-refund compensator failure on the create
+// unwind — a refund that could not be applied and was swallowed, leaving the
+// concurrency cell drifted until the boot cell-reconcile heals it. It is the
+// observability half of the create-abort concurrency-leak fix: the boot reconcile
+// self-heals the drift, this counter makes the drift's cause visible so it is never
+// silent.
+func (c *Collector) IncQuotaRefundFailed() {
+	c.mu.Lock()
+	c.quotaRefundFailedTotal++
 	c.mu.Unlock()
 }
 
@@ -157,6 +176,7 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	c.mu.Lock()
 	creates := c.createsTotal
 	destroys := c.destroysTotal
+	quotaRefundFailed := c.quotaRefundFailedTotal
 	startCount := c.startCount
 	startSum := c.startSum
 	bucketCounts := make([]uint64, len(c.startBucketCounts))
@@ -188,6 +208,9 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	writeln(w, "# HELP ocu_control_session_destroys_total Sessions successfully destroyed.")
 	writeln(w, "# TYPE ocu_control_session_destroys_total counter")
 	fmt.Fprintf(w, "ocu_control_session_destroys_total %d\n", destroys)
+	writeln(w, "# HELP ocu_control_quota_refund_failed_total Quota-refund compensator failures on the create unwind (leaked-counter alarm).")
+	writeln(w, "# TYPE ocu_control_quota_refund_failed_total counter")
+	fmt.Fprintf(w, "ocu_control_quota_refund_failed_total %d\n", quotaRefundFailed)
 
 	// Reserved->active start-duration histogram. Buckets are cumulative le-bounds;
 	// +Inf equals _count. avg start = _sum / _count.

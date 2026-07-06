@@ -80,7 +80,23 @@ func stageQuotaCharge(ctx context.Context, m *Manager, st *createState) (compens
 	}
 	// The receipt refunds EXACTLY the two cells charged; pushing it onto the unwind
 	// stack means a downstream failure decrements only what this stage incremented.
-	return receipt.Apply, nil
+	// Wrap the refund so a FAILED refund is OBSERVABLE, not silent: the unwind swallows
+	// every compensator error (the create already failed and the compensators are
+	// idempotent), so a refund that could not apply — the exact create-abort leak that
+	// drifts the concurrency cell above the true live count — would otherwise vanish. On
+	// a refund error the wrapper increments the leaked-counter metric so the drift is
+	// alarmable; the boot cell-reconcile still heals the drift itself. The error is
+	// returned unchanged so the unwind's existing swallow behaviour is preserved (the
+	// metric is a side effect, not a new failure path).
+	return func(cctx context.Context) error {
+		if err := receipt.Apply(cctx); err != nil {
+			if m.metrics != nil {
+				m.metrics.IncQuotaRefundFailed()
+			}
+			return err
+		}
+		return nil
+	}, nil
 }
 
 // stageReserve (S4) writes the first DURABLE host state via the Custodian (the SOLE

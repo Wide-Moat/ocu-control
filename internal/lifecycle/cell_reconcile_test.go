@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/registry"
+	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
@@ -29,11 +30,12 @@ import (
 // count). Skip the cell-reconcile and the cell stays inflated — this reds.
 func TestReconcile_HealsConcurrencyCellDrift(t *testing.T) {
 	t.Parallel()
-	mgr, store, _ := newShippedManager(t)
+	mgr, store, provider := newShippedManager(t)
 	ctx := context.Background()
 	owner := testCaller.Identity
 
-	// One genuinely live ACTIVE session: the true concurrency count is 1.
+	// One genuinely live ACTIVE session with a RUNNING container, so the reconciler
+	// leaves the row alone and the true concurrency count is 1.
 	key := registry.DeriveKey(owner, "live-session")
 	if _, err := store.Reserve(ctx, key.String(), owner); err != nil {
 		t.Fatalf("seed reserve: %v", err)
@@ -41,6 +43,10 @@ func TestReconcile_HealsConcurrencyCellDrift(t *testing.T) {
 	if _, err := store.Commit(ctx, key.String(), owner); err != nil {
 		t.Fatalf("seed commit: %v", err)
 	}
+	provider.mu.Lock()
+	provider.live["ctr-live"] = true
+	provider.reconcileOrphans = []runtime.Sandbox{{Name: runtime.SessionName(key.String()), RuntimeID: "ctr-live", Alive: true}}
+	provider.mu.Unlock()
 
 	// Inflate the concurrency cell to 5 — one honest charge for the live row plus four
 	// phantom charges that model refunds lost to swallowed unwind errors on aborted
@@ -68,11 +74,14 @@ func TestReconcile_HealsConcurrencyCellDrift(t *testing.T) {
 // the true live count. A cell already equal to the live-row count is left untouched.
 func TestReconcile_CellDriftHealDoesNotUndercount(t *testing.T) {
 	t.Parallel()
-	mgr, store, _ := newShippedManager(t)
+	mgr, store, provider := newShippedManager(t)
 	ctx := context.Background()
 	owner := testCaller.Identity
 
-	// Two live ACTIVE sessions and a cell that already reads exactly 2 (no drift).
+	// Two live ACTIVE sessions, each with a RUNNING (Alive) container so the reconciler
+	// leaves them alone (a present-and-Alive container is a live session, not
+	// substrate-lost), and a cell that already reads exactly 2 (no drift).
+	var orphans []runtime.Sandbox
 	for _, h := range []string{"s1", "s2"} {
 		key := registry.DeriveKey(owner, h)
 		if _, err := store.Reserve(ctx, key.String(), owner); err != nil {
@@ -81,7 +90,14 @@ func TestReconcile_CellDriftHealDoesNotUndercount(t *testing.T) {
 		if _, err := store.Commit(ctx, key.String(), owner); err != nil {
 			t.Fatalf("seed commit %s: %v", h, err)
 		}
+		orphans = append(orphans, runtime.Sandbox{Name: runtime.SessionName(key.String()), RuntimeID: "ctr-" + h, Alive: true})
 	}
+	provider.mu.Lock()
+	for _, o := range orphans {
+		provider.live[o.RuntimeID] = true
+	}
+	provider.reconcileOrphans = orphans
+	provider.mu.Unlock()
 	concKey := state.QuotaKey{Dim: state.DimConcurrentSessions, Identity: owner}
 	if _, err := store.Charge(ctx, concKey, 2, 1000); err != nil {
 		t.Fatalf("seed matching cell: %v", err)
