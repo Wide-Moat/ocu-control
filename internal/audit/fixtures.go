@@ -21,7 +21,7 @@ package audit
 // a forward-declared deferred-verb label — is a version bump. It is carried in the
 // audit metadata so a downstream fan-in can pin which fixture revision a source was
 // running.
-const FixtureVersion = "v3"
+const FixtureVersion = "v4"
 
 // lastAction is the highest valid Action enum value. It anchors the exhaustive walk
 // of the closed enum: PrivilegedActions enumerates 0..lastAction inclusive, and the
@@ -107,8 +107,9 @@ type ActionMeta struct {
 }
 
 // SEC72Actions returns the system-initiated lifecycle transitions — the SEC-72
-// fixture family — as a versioned LABEL set. Session create-commit and the
-// system-driven teardown map to existing enum arms (ActionCreateCommit,
+// fixture family — as a versioned LABEL set. Session create-commit, the
+// session-resume of an already-live caller-owned session, and the system-driven
+// teardown map to existing enum arms (ActionCreateCommit, ActionCreateResume,
 // ActionDestroy); auto-lease issue and pool-claim land on the create-commit arm
 // (they reach the same privileged checkpoint), and scrub/teardown land on the
 // destroy arm. The three create-rejection causes (quota, admission, kill-switch)
@@ -121,6 +122,7 @@ type ActionMeta struct {
 func SEC72Actions() []ActionMeta {
 	return []ActionMeta{
 		{Label: "session-create", Action: ActionCreateCommit, HasEnum: true},
+		{Label: "session-resume", Action: ActionCreateResume, HasEnum: true},
 		{Label: "session-destroy", Action: ActionDestroy, HasEnum: true},
 		{Label: "pool-claim", Action: ActionCreateCommit, HasEnum: true},
 		{Label: "auto-lease-issue", Action: ActionCreateCommit, HasEnum: true},

@@ -26,6 +26,7 @@ func TestPrivilegedActionsIsClosedEnum(t *testing.T) {
 		audit.ActionMCPKeyCreate,
 		audit.ActionMCPKeyRevoke,
 		audit.ActionExec,
+		audit.ActionCreateResume,
 		audit.ActionCreateRejected,
 	}
 	got := audit.PrivilegedActions()
@@ -146,9 +147,13 @@ func TestSEC72EnumActionsDistinct(t *testing.T) {
 			t.Fatalf("SEC72EnumActions() contains non-privileged action %v", a)
 		}
 	}
-	// The two enum-backed transitions create-commit and destroy must be present.
+	// The enum-backed transitions create-commit, session-resume, and destroy must be
+	// present.
 	if !seen[audit.ActionCreateCommit] {
 		t.Fatal("SEC72EnumActions() missing ActionCreateCommit")
+	}
+	if !seen[audit.ActionCreateResume] {
+		t.Fatal("SEC72EnumActions() missing ActionCreateResume")
 	}
 	if !seen[audit.ActionDestroy] {
 		t.Fatal("SEC72EnumActions() missing ActionDestroy")
@@ -158,8 +163,8 @@ func TestSEC72EnumActionsDistinct(t *testing.T) {
 // TestFixtureVersion pins the versioned fixture stamp.
 func TestFixtureVersion(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v3" {
-		t.Fatalf("FixtureVersion = %q, want v3", audit.FixtureVersion)
+	if audit.FixtureVersion != "v4" {
+		t.Fatalf("FixtureVersion = %q, want v4", audit.FixtureVersion)
 	}
 }
 

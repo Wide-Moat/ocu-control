@@ -196,12 +196,12 @@ const ChainBreakUnreadable = "unreadable"
 // activityFor maps a privileged audit.Action onto its OCSF activity_id and a
 // human-readable activity_name. Create-commit is Create(1); destroy is Delete(4);
 // the revoke / denylist-edit / quota-override / retention-policy / resume-global
-// actions are state-mutating operator controls that map to Update(3); a
-// create-rejected is a
-// refusal that produced no resource and so maps to Other(99) by an explicit case;
-// an unknown action falls to Other(99) so a forgotten arm surfaces as an explicit
-// Other rather than a silent mislabel. The name always reflects the Action.String
-// label so the event is self-describing even on the Other path.
+// actions are state-mutating operator controls that map to Update(3); the
+// create-rejected refusal and the create-resume reuse each produced or changed no
+// resource and so map to Other(99) by explicit cases; an unknown action falls to
+// Other(99) so a forgotten arm surfaces as an explicit Other rather than a silent
+// mislabel. The name always reflects the Action.String label so the event is
+// self-describing even on the Other path.
 func activityFor(a audit.Action) (uint8, string) {
 	switch a {
 	case audit.ActionCreateCommit:
@@ -213,6 +213,15 @@ func activityFor(a audit.Action) (uint8, string) {
 		audit.ActionResumeGlobal,
 		audit.ActionMCPKeyCreate, audit.ActionMCPKeyRevoke:
 		return activityUpdate, a.String()
+	case audit.ActionCreateResume:
+		// A resume neither provisions a new resource (Create), mutates one (Update),
+		// nor tears one down (Delete): the session is already ACTIVE and unchanged —
+		// the record attests that the live session was re-addressed and returned, not
+		// altered. Its honest CRUD slot is therefore Other(99) by an EXPLICIT case, the
+		// same faithful "no CRUD effect" slot the create-rejected record takes (a
+		// refusal produced no resource; a resume changed none). The name still reflects
+		// the Action label ("create_resume"), so the Other event is self-describing.
+		return activityOther, a.String()
 	case audit.ActionExec:
 		// One exec tool-call spawns a process in the session's guest — the created
 		// resource is the guest child process, so the honest CRUD slot is Create.

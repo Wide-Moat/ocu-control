@@ -103,6 +103,7 @@ func TestActivityForMapsEveryPrivilegedAction(t *testing.T) {
 		{audit.ActionResumeGlobal, activityUpdate},
 		{audit.ActionMCPKeyCreate, activityUpdate},
 		{audit.ActionMCPKeyRevoke, activityUpdate},
+		{audit.ActionCreateResume, activityOther},
 		{audit.ActionCreateRejected, activityOther},
 		{audit.Action(200), activityOther},
 	}
@@ -115,11 +116,17 @@ func TestActivityForMapsEveryPrivilegedAction(t *testing.T) {
 			t.Fatalf("activityFor(%v) name = %q, want %q", c.a, name, c.a.String())
 		}
 	}
-	// No privileged action falls to Other EXCEPT the create-rejected refusal, which
-	// faithfully has no CRUD slot and maps to Other(99) by design. Excepting exactly
-	// this one arm keeps the guard for any genuinely-forgotten arm.
+	// No privileged action falls to Other EXCEPT the two arms that faithfully have no
+	// CRUD slot and map to Other(99) BY DESIGN: the create-rejected refusal (produced
+	// no resource) and the create-resume reuse (changed no resource). Excepting exactly
+	// these two declared arms keeps the guard sharp for any genuinely-forgotten arm — a
+	// new action that silently falls through to Other still reds here.
+	otherByDesign := map[audit.Action]bool{
+		audit.ActionCreateRejected: true,
+		audit.ActionCreateResume:   true,
+	}
 	for _, a := range audit.PrivilegedActions() {
-		if a == audit.ActionCreateRejected {
+		if otherByDesign[a] {
 			continue
 		}
 		if id, _ := activityFor(a); id == activityOther {

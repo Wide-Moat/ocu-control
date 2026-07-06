@@ -83,6 +83,18 @@ const (
 	// (SEC-72); it forms the tool-call fixture family. Inserted BEFORE
 	// ActionCreateRejected so the boundary anchor stays last.
 	ActionExec
+	// ActionCreateResume is a create that RESUMED an already-live, caller-owned
+	// session instead of provisioning a new one: the deterministic host handle a
+	// stable session hint seeds derives the SAME key as the live session, so the
+	// create returns the existing ACTIVE row rather than refusing with a
+	// reservation conflict. It is a system-initiated lifecycle transition (the
+	// SEC-72 family) — the counterpart to session-create — audited fail-closed
+	// BEFORE the resumed row is acknowledged, so the trail records that a session
+	// was reused, not created anew (an operator distinguishes reuse from fresh
+	// provisioning). It deliberately does NOT re-charge the concurrency cell (the
+	// live session already holds its slot). Inserted BEFORE ActionCreateRejected
+	// so the boundary anchor stays last.
+	ActionCreateResume
 	// ActionCreateRejected is a session create REFUSED at a pre-side-effect deny
 	// stage (admission, quota, or the kill-switch/denylist re-check). It is the
 	// system-initiated rejection record NFR-SEC-46/72 require: the deny itself is
@@ -119,6 +131,8 @@ func (a Action) String() string {
 		return "mcp_key_revoke"
 	case ActionExec:
 		return "exec"
+	case ActionCreateResume:
+		return "create_resume"
 	case ActionCreateRejected:
 		return "create_rejected"
 	default:
