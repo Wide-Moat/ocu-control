@@ -713,14 +713,18 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		rowKeys[runtime.SessionName(rows[i].Key)] = true
 	}
 
-	// Direction 1 — substrate without a non-terminal row → destroy. A container
+	// Direction 1 — substrate without a LIVE row-backed session → destroy. A container
 	// whose row is absent (or already terminal) is a true orphan: crashed-mid-create
-	// residue, or a container whose row this same sweep reclaims below. Force-kill is
-	// idempotent; an already-gone container is a satisfied kill.
+	// residue, or a container whose row this same sweep reclaims below. A container
+	// that IS matched to a row but has EXITED (Alive false) is ALSO swept: its row is
+	// reclaimed in Direction 2, so leaving the dead container behind would trade the
+	// slot leak for a container-garbage leak. Only a RUNNING container matched to a row
+	// is a live session and is never killed. Force-kill is idempotent; an already-gone
+	// container is a satisfied kill.
 	finalizer := m.provider.Teardown()
 	for i := range live {
-		if rowKeys[live[i].Name] {
-			continue // matched to a live row: this is a running session, never killed
+		if rowKeys[live[i].Name] && live[i].Alive {
+			continue // matched to a row AND running: a live session, never killed
 		}
 		if err := finalizer.ForceKill(ctx, live[i]); err != nil {
 			if !errors.Is(err, runtime.ErrNoSuchContainer) {
@@ -729,17 +733,22 @@ func (m *Manager) Reconcile(ctx context.Context) error {
 		}
 	}
 
-	// Direction 2 — non-terminal row without live substrate → reclaim. A RESERVED row
-	// whose create crashed before Commit, or an ACTIVE row whose container vanished
-	// out-of-band (host crash, OOM-kill, external removal), has lost its backing
-	// resource but still holds a concurrency slot. Reclaim it: emit the
-	// system-initiated reconcile-reclaim audit event (fail-closed, NFR-SEC-72),
-	// release the row to the tombstone, and return the slot so the leak cannot wedge
-	// the tier cap. An ACTIVE row WITH a live container is a running session, left
-	// untouched (its slot stays charged).
+	// Direction 2 — non-terminal row without a LIVE backing container → reclaim. A
+	// RESERVED row whose create crashed before Commit, an ACTIVE row whose container
+	// vanished out-of-band (host crash, OOM-kill, external removal), OR a row whose
+	// container is still PRESENT but has EXITED, has lost its live backing resource
+	// while still holding a concurrency slot. A present-but-!Alive container is
+	// substrate-lost exactly like an absent one: the boot sweep lists exited containers
+	// too, and one must not wedge its row's slot. Reclaim: emit the system-initiated
+	// reconcile-reclaim audit event (fail-closed, NFR-SEC-72), release the row to the
+	// tombstone, and return the slot so the leak cannot wedge the tier cap. Only an
+	// ACTIVE row WITH a RUNNING container is a live session, left untouched (slot stays
+	// charged); Direction 1 above force-killed the exited container, so no garbage is
+	// left behind for the row this reclaims.
 	for i := range rows {
-		if liveByName[runtime.SessionName(rows[i].Key)].Name != "" {
-			continue // substrate present: a live (or crashed-RESERVED-but-container-up) session
+		sb := liveByName[runtime.SessionName(rows[i].Key)]
+		if sb.Name != "" && sb.Alive {
+			continue // substrate present AND running: a live session, keep its slot
 		}
 		if err := m.reclaimOrphanRow(ctx, rows[i]); err != nil {
 			return fmt.Errorf("lifecycle: reconcile reclaim orphan row %q: %w", rows[i].Key, err)

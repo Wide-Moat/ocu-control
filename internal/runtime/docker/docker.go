@@ -535,6 +535,13 @@ func (p *Provider) Reconcile(ctx context.Context) ([]runtime.Sandbox, error) {
 				FilesystemID: string(name),
 			},
 			Tier: p.tier,
+			// A container the boot sweep lists is Alive only when its run-state is
+			// running or restarting. ListOptions{All:true} returns EXITED-but-present
+			// containers too; the reconciler must not let one hold its session row's
+			// concurrency slot. Marking it !Alive lets the reconciler treat it as
+			// substrate-lost (reclaim the slot) and force-kill the dead container
+			// (sweep the garbage) — neither leaks.
+			Alive: s.State == container.StateRunning || s.State == container.StateRestarting,
 		})
 	}
 	return sandboxes, nil
