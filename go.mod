@@ -8,7 +8,7 @@ go 1.26.4
 
 require (
 	github.com/Wide-Moat/ocu-sandbox/host/exec v0.1.0
-	github.com/coder/websocket v1.8.14
+	github.com/coder/websocket v1.8.15
 	github.com/containerd/errdefs v1.0.0
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/golang-jwt/jwt/v5 v5.3.1
