@@ -381,6 +381,23 @@ type createState struct {
 // or sockdir.
 func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow, error) {
 	st := &createState{in: in}
+
+	// Idempotent-create guard: a gateway that reuses a stable per-chat session hint
+	// sends the SAME hint on every tool-call in an agent loop. Because the host handle
+	// mintHandle produces is DETERMINISTIC in the hint and DeriveKey mixes the
+	// host-attested owner in, the second create derives the SAME key as the live
+	// session — so S4 Reserve would fail ErrReservationExists and the ingress would map
+	// it to an opaque 409, breaking the multi-step chat. Instead, if the derived key
+	// already names the caller's OWN, ACTIVE session, RESUME it: return the existing row
+	// (the guest is already up) BEFORE the pipeline runs. The guard resolves identity
+	// first (the same read-only S1 the loop re-runs — a pure re-derivation, no side
+	// effect) so it addresses the row by the host-derived key, never a body hint.
+	if resumed, row, err := m.tryResume(ctx, st); err != nil {
+		return state.SessionRow{}, err
+	} else if resumed {
+		return row, nil
+	}
+
 	// The unwind stack grows as each stage succeeds; on a failure it is replayed in
 	// reverse. A nil compensator (read-only stage) is never pushed.
 	compensators := make([]compensator, 0, len(m.stages))
@@ -422,6 +439,74 @@ func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow,
 	// polls the GET endpoints until then.
 	m.publishEvent(ctx, state.StateActive, st.row.Key)
 	return st.row, nil
+}
+
+// tryResume implements the idempotent-create guard. It resolves the host-derived
+// identity and key (the read-only S1 derivation) and looks the caller's OWN row up by
+// that key. It returns (resumed=true, row, nil) ONLY when the key already names a
+// live, caller-owned ACTIVE session — in which case the create RESUMES it: the
+// existing row is returned and the whole S2..S10 pipeline is skipped, so the
+// concurrency cell is NOT charged a second time (the live session already holds its
+// slot — a clean skip, never a charge-then-refund). The resume is audited fail-closed
+// (ActionCreateResume) BEFORE the row is returned, so an audit-write failure denies
+// the resume exactly as a create-commit audit failure denies a create.
+//
+// It returns (false, _, nil) — fall through to the normal pipeline — in every case
+// that is NOT an own-ACTIVE collision:
+//   - no such row (LookupForCaller ErrNotOwned, which also collapses a FOREIGN owner's
+//     row: DeriveKey mixed a different owner in, so a foreign caller derives a
+//     DIFFERENT key and never lands on the victim's row — NFR-SEC-43, boundary #1);
+//   - a RELEASED tombstone (the prior session ended; a fresh create is correct);
+//   - a RESERVED row (a create is racing in-flight; resuming a not-yet-active row
+//     would hand back an unbound session, so this falls through and S4 Reserve returns
+//     the honest ErrReservationExists — boundary #2, ACTIVE-only).
+//
+// A lookup error other than a benign not-found is returned as a hard failure: the
+// guard must not fall through to a create on an ambiguous store fault (that could
+// double-provision), so it fails closed.
+func (m *Manager) tryResume(ctx context.Context, st *createState) (bool, state.SessionRow, error) {
+	// Resolve the host-derived owner and key via the same read-only S1 stage the loop
+	// re-runs. A pure re-derivation with no side effect: it only fills st.owner/st.key.
+	if _, err := stageResolveIdentity(ctx, m, st); err != nil {
+		return false, state.SessionRow{}, fmt.Errorf("lifecycle: create resolve identity: %w", err)
+	}
+
+	row, err := m.reg.LookupForCaller(ctx, st.key, st.owner)
+	if err != nil {
+		if errors.Is(err, registry.ErrNotOwned) {
+			// No caller-owned row at this key (absent, or a foreign owner's row collapsed
+			// to not-found). Not a resume — run the normal create.
+			return false, state.SessionRow{}, nil
+		}
+		// An ambiguous store fault: fail closed rather than risk a double-provision.
+		return false, state.SessionRow{}, fmt.Errorf("lifecycle: create resume lookup: %w", err)
+	}
+
+	// Boundary #2: resume ONLY a live ACTIVE session. A RESERVED row (create racing) or
+	// a RELEASED tombstone (prior session ended) falls through to the normal pipeline.
+	if row.State != state.StateActive {
+		return false, state.SessionRow{}, nil
+	}
+
+	// The key names the caller's OWN, ACTIVE session: RESUME it. Audit FIRST,
+	// fail-closed — the trail must record the reuse as durable before the row is
+	// acknowledged, exactly as create-commit audits before ack. The actor is the
+	// host-attested owner (NFR-SEC-43); the correlation handle is the host-derived key.
+	rec := audit.Record{
+		Action:  audit.ActionCreateResume,
+		Channel: st.in.Caller.Channel.String(),
+		Key:     st.key.String(),
+		Caller:  st.owner.Caller,
+		Tenant:  st.owner.Tenant,
+	}
+	if err := m.audit.Emit(ctx, rec); err != nil {
+		return false, state.SessionRow{}, fmt.Errorf("lifecycle: create resume audit: %w", err)
+	}
+
+	// Publish the live-view delta (the session is reused, still ACTIVE) to the
+	// design-fenced fan-out — non-fatal, nil-safe, mirroring the create/destroy path.
+	m.publishEvent(ctx, state.StateActive, row.Key)
+	return true, row, nil
 }
 
 // unwind runs every pushed compensator in REVERSE (LIFO) under a context detached

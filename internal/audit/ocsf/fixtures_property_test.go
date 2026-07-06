@@ -174,8 +174,8 @@ func TestCreateRejectedIsSEC72Only(t *testing.T) {
 // a fixture-set change without a version bump fails this pin.
 func TestFixtureVersionPinned(t *testing.T) {
 	t.Parallel()
-	if audit.FixtureVersion != "v3" {
-		t.Fatalf("FixtureVersion = %q, want v3", audit.FixtureVersion)
+	if audit.FixtureVersion != "v4" {
+		t.Fatalf("FixtureVersion = %q, want v4", audit.FixtureVersion)
 	}
 }
 
