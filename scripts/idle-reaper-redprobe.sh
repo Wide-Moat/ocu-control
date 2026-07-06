@@ -22,12 +22,15 @@ teardown_keystone="TestReapIdle_AbandonedSessionReclaimed" # asserts liveCount()
 restore() { git checkout -- "$mgr" 2>/dev/null || true; }
 trap restore EXIT
 
-# The two lines the neuters delete. Each must be present exactly once in reapOne, or
-# the probe is stale against a refactored manager.
+# The text the neuters delete. The force-kill guard line is unique to reapOne. The
+# concurrency-refund CALL line (`m.ReleaseConcurrency(ctx, row.Owner)`) is NOT unique —
+# the boot reconciler's reclaimOrphanRow returns a slot through the same call — so the
+# neuter-2 guard keys on reapOne's UNIQUE error string ("release reaped concurrency"),
+# not the shared call line, to detect whether reapOne's refund specifically is gone.
 forcekill_line='if err := m.provider.Teardown().ForceKill(ctx, sandbox); err != nil {'
-refund_call='if err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {'
+reap_refund_marker='release reaped concurrency'
 
-for needle in "$forcekill_line" "$refund_call"; do
+for needle in "$forcekill_line" "$reap_refund_marker"; do
   if [ "$(grep -cF "$needle" "$mgr")" -lt 1 ]; then
     echo "::error::idle-reaper-redprobe is stale: expected '$needle' in $mgr"
     exit 1
@@ -54,7 +57,10 @@ restore
 #      slot is never returned, so the keystone's post-reap concurrency==0 assertion
 #      goes RED (slot stuck). Replace the guarded refund with a no-op.
 perl -0777 -i -pe 's/\Qif err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {\E\n\t\treturn fmt\.Errorf\("release reaped concurrency: %w", err\)\n\t}/\/\/ NEUTERED: concurrency refund removed/' "$mgr"
-if grep -qF "$refund_call" "$mgr"; then
+# Key the guard on reapOne's UNIQUE error string, not the shared ReleaseConcurrency call
+# line (which the boot reconciler also uses): the neuter is proven applied iff reapOne's
+# "release reaped concurrency" text is gone.
+if grep -qF "$reap_refund_marker" "$mgr"; then
   echo "::error::idle-reaper-redprobe failed to neuter the concurrency refund"
   exit 1
 fi

@@ -141,6 +141,7 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 		Audit:         auditSink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		Signer:        signer,
 		Push:          pusher,
 		ServiceURL:    testServiceURL,

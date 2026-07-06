@@ -73,6 +73,17 @@ const destroyGrace runtime.Duration = 5
 // can never seed a Key or touch host state.
 var ErrUnattested = errors.New("lifecycle: caller identity unattested, refused (fail-closed)")
 
+// ErrInvalidArgument marks a create refused because the REQUEST itself (body +
+// deployment-wide config, never per-tenant or store state) does not resolve to a
+// runnable session. The gateway maps it to HTTP 400: it is the same
+// request-derived, client-error class as the ingress toRequest() decode refusal,
+// evaluated after image resolution. It is SAFE to surface (unlike the 409/404
+// collapse that hides cross-tenant existence) precisely because it consults no
+// tenant state — so it can never be an existence oracle. Contract: the Manager
+// wraps ONLY request-derivable failures in this sentinel; an error that touched
+// the store or another tenant's row must NEVER be wrapped here.
+var ErrInvalidArgument = errors.New("lifecycle: invalid create argument")
+
 // CreateInput is what an ingress hands the Manager. It carries NO trusted identity:
 // the authority is the host-derived AuthenticatedCaller the ingress resolved, and
 // SessionHint is explicitly a HINT — it seeds the human-readable host-minted handle,
@@ -118,6 +129,24 @@ type ManagerDeps struct {
 	Profile admission.WorkloadProfile
 	// Tier is the deployment-wide isolation tier (fixed).
 	Tier runtime.RuntimeTier
+	// DefaultImage is the deployment-declared guest image a create runs when the
+	// body names none — the inject-at-materialize default of the ADR-0020
+	// provisioning ladder (image is deployment configuration, never caller data).
+	// The body image, when set, is an override. Create resolves the effective image
+	// from this default BEFORE admission, so admission validates the resolved value
+	// and an empty result is refused as a clean invalid-argument, never a cryptic
+	// rolled-back materialize. Empty here is a valid minimal-shelf posture: a create
+	// that also names no body image is then refused (fail-closed, no silent "").
+	DefaultImage string
+	// AllowedImages is the deployment-declared allow-list of guest images a create
+	// BODY may override the default with (ADR-0020 BYO rung). Membership is EXACT
+	// string match — no glob or prefix (image refs carry tags/digests a prefix rule
+	// would foot-gun). The DefaultImage is IMPLICITLY allowed (the operator already
+	// trusted it), so a body naming the default is always equivalent to an empty
+	// body. Empty here is deny-by-default: only the default is allowed, so a body
+	// override is refused unless the operator explicitly lists it. The solo
+	// one-command path names no body image, so it never touches this gate.
+	AllowedImages []string
 
 	// Signer is the SOLE Storage-JWT custodian the mint stage calls. It mints the
 	// weak, edge-only Storage-JWT and records its jti against the host-derived
@@ -245,6 +274,16 @@ type Manager struct {
 	profile  admission.WorkloadProfile
 	tier     runtime.RuntimeTier
 
+	// defaultImage is the deployment-declared guest image a create falls back to
+	// when the body names none (ADR-0020 inject-at-materialize). Resolved in Create
+	// before admission; empty + no body image is a fail-closed refusal.
+	defaultImage string
+	// allowedImages is the exact-match allow-list a create BODY may override the
+	// default with (deny-by-default: a body image not here AND not equal to
+	// defaultImage is refused). Built as a set at construction so the Create check is
+	// O(1); the defaultImage is added implicitly.
+	allowedImages map[string]bool
+
 	// Storage-JWT custody + mount-config provisioning (Phase 4). signer/push are nil
 	// on the Phase-3 minimal shelf, which the mint+render stages skip cleanly.
 	signer        *cred.Signer
@@ -290,6 +329,8 @@ func NewManager(deps ManagerDeps) *Manager {
 		profile:  deps.Profile,
 		tier:     deps.Tier,
 
+		defaultImage: deps.DefaultImage,
+
 		signer:        deps.Signer,
 		push:          deps.Push,
 		serviceURL:    deps.ServiceURL,
@@ -301,6 +342,20 @@ func NewManager(deps ManagerDeps) *Manager {
 		execVerifyKey: deps.ExecVerifyKey,
 		metrics:       deps.Metrics,
 		events:        deps.Events,
+	}
+	// Build the body-image override allow-set: the explicitly listed images plus the
+	// deployment default (implicitly allowed — the operator already trusted it by
+	// setting -guest-image; requiring it to be re-listed would 400 a body that names
+	// the same ref as the empty-body default). An empty list yields a set holding only
+	// the default: deny-by-default for overrides.
+	m.allowedImages = make(map[string]bool, len(deps.AllowedImages)+1)
+	if deps.DefaultImage != "" {
+		m.allowedImages[deps.DefaultImage] = true
+	}
+	for _, img := range deps.AllowedImages {
+		if img != "" {
+			m.allowedImages[img] = true
+		}
 	}
 	// The mint + render/push stages slot AFTER stageHandoff and BEFORE
 	// stageMaterialize: the host-owned bind must carry the mount-config before
@@ -380,6 +435,30 @@ type createState struct {
 // orphan — then returns the typed stage error, leaving no row, counter, container,
 // or sockdir.
 func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow, error) {
+	// Resolve the effective guest image BEFORE admission, so admission and every
+	// later stage see the deployment-injected default, and a request that resolves
+	// to no image is refused as a request-derived invalid argument (clean 400) here
+	// — never as a cryptic rolled-back materialize below the runtime seam. The body
+	// image (in.Image) is the override; the deployment default fills an empty body.
+	// This is request-derived only (body + fixed config), so wrapping it in
+	// ErrInvalidArgument leaks no tenant state.
+	if in.Image == "" {
+		in.Image = m.defaultImage
+	}
+	if in.Image == "" {
+		return state.SessionRow{}, fmt.Errorf("%w: no guest image (body named none and no deployment default is configured)", ErrInvalidArgument)
+	}
+	// Gate the resolved image against the deployment allow-set (ADR-0020 BYO rung):
+	// the default is implicitly a member (resolved above), so an empty body always
+	// passes; a body override that is not listed is refused as a request-derived
+	// invalid argument (clean 400) HERE, before admission — an untrusted MCP caller
+	// cannot name an arbitrary image. Deny-by-default: an empty allow-list admits only
+	// the default. This consults only the request image and fixed config, so wrapping
+	// it in ErrInvalidArgument leaks no tenant state.
+	if !m.allowedImages[in.Image] {
+		return state.SessionRow{}, fmt.Errorf("%w: guest image %q is not in the deployment allow-list", ErrInvalidArgument, in.Image)
+	}
+
 	st := &createState{in: in}
 
 	// Idempotent-create guard: a gateway that reuses a stable per-chat session hint

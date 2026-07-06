@@ -16,6 +16,8 @@ import (
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/registry"
 )
 
 // errUnclassified is a refusal that is neither unattested nor not-owned, so
@@ -101,6 +103,30 @@ func TestWriteServiceErrorDefaultIs409(t *testing.T) {
 	writeServiceError(rec, errUnclassified)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("writeServiceError(unclassified) = %d; want 409", rec.Code)
+	}
+}
+
+// TestWriteServiceErrorInvalidArgumentIs400 is the keystone for the request-derived
+// invalid-argument arm: a lifecycle.ErrInvalidArgument (e.g. no resolvable guest
+// image) maps to 400, NOT the 409 default. This is the client-error class — the
+// refusal is a pure function of the request + fixed config, consults no tenant
+// state, and so is safe to surface (unlike the 409/404 collapse that hides
+// cross-tenant existence). Red-probe: delete the ErrInvalidArgument arm in
+// writeServiceError → this falls through to 409 and reds.
+func TestWriteServiceErrorInvalidArgumentIs400(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	writeServiceError(rec, lifecycle.ErrInvalidArgument)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("writeServiceError(ErrInvalidArgument) = %d; want 400", rec.Code)
+	}
+	// A not-owned refusal must STILL be 404, never collapsed into the new 400 arm —
+	// the arm is narrow (request-derived only), so it must not swallow the
+	// existence-hiding 404.
+	rec404 := httptest.NewRecorder()
+	writeServiceError(rec404, registry.ErrNotOwned)
+	if rec404.Code != http.StatusNotFound {
+		t.Fatalf("writeServiceError(ErrNotOwned) = %d; want 404 (the 400 arm must not swallow it)", rec404.Code)
 	}
 }
 

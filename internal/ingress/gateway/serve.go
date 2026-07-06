@@ -466,6 +466,13 @@ func writeServiceError(w http.ResponseWriter, err error) {
 		writeStatus(w, http.StatusUnauthorized, "caller identity unattested")
 	case errors.Is(err, registry.ErrNotOwned):
 		writeStatus(w, http.StatusNotFound, "session not addressable")
+	case errors.Is(err, lifecycle.ErrInvalidArgument):
+		// A request-derived invalid argument (e.g. no resolvable guest image) is a
+		// client error: 400, same class as the toRequest() decode refusal. It is safe
+		// to surface — the Manager wraps ONLY request-derivable failures in this
+		// sentinel, so no tenant state is consulted and it is never an existence
+		// oracle. The message is the sentinel chain, never raw internal detail.
+		writeStatus(w, http.StatusBadRequest, err.Error())
 	default:
 		writeStatus(w, http.StatusConflict, "request refused")
 	}

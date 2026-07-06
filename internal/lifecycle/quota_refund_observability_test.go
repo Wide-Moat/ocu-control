@@ -47,6 +47,7 @@ func TestQuotaRefundFailureIsObservable(t *testing.T) {
 		Audit:         audit.NewRecordingFake(),
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage}, // the mount-config leg gates create on the image allow-list; the test image must be allowed so the create reaches materialize
 		ExecVerifyKey: pub32(),
 		Metrics:       rec,
 	})

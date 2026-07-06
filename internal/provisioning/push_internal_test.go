@@ -11,7 +11,25 @@ import (
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/handoff"
+	"github.com/Wide-Moat/ocu-control/internal/runtime"
 )
+
+// stagedSock builds the minimal Staged the push targets: a 0700 per-session root
+// with the 0777 sock leaf inside (the handoff stager's layout), so the fault
+// tests exercise writeFileExact against the real push target — the BOUND sock
+// dir, not the unbound root.
+func stagedSock(t *testing.T) handoff.Staged {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "session-root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatalf("mkdir root: %v", err)
+	}
+	sock := filepath.Join(root, "sock")
+	if err := os.Mkdir(sock, 0o777); err != nil {
+		t.Fatalf("mkdir sock: %v", err)
+	}
+	return handoff.Staged{Root: root, Material: runtime.HandoffMaterial{HostSockDir: sock}}
+}
 
 // faultTempFile is a tempFile that lands a short write on Write, so the push's
 // short-write fail-closed guard is exercised without a real partial-write fault on
@@ -42,10 +60,7 @@ func (f faultTempFile) Write(p []byte) (int, error) {
 // failure (ErrPushFailed): a truncated mount-config never lands on the bind, and
 // the partial temp file is cleaned up so nothing half-written survives.
 func TestPushShortWriteFailsClosed(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "session-root")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatalf("mkdir root: %v", err)
-	}
+	staged := stagedSock(t)
 
 	orig := createTemp
 	createTemp = func(dir, pattern string) (tempFile, error) {
@@ -58,15 +73,15 @@ func TestPushShortWriteFailsClosed(t *testing.T) {
 	defer func() { createTemp = orig }()
 
 	p := NewPusher()
-	_, err := p.Push(context.Background(), handoff.Staged{Root: root}, []byte(`{"a":1,"b":2}`))
+	_, err := p.Push(context.Background(), staged, []byte(`{"a":1,"b":2}`))
 	if !errors.Is(err, ErrPushFailed) {
 		t.Fatalf("short write: want ErrPushFailed, got %v", err)
 	}
 
 	// Nothing half-written survives: no mount-config.json and no stray temp file.
-	entries, err := os.ReadDir(root)
+	entries, err := os.ReadDir(staged.Material.HostSockDir)
 	if err != nil {
-		t.Fatalf("read root: %v", err)
+		t.Fatalf("read sock dir: %v", err)
 	}
 	if len(entries) != 0 {
 		names := make([]string, 0, len(entries))
@@ -81,17 +96,14 @@ func TestPushShortWriteFailsClosed(t *testing.T) {
 // branch: when the temp file cannot be created the push fails closed (ErrPushFailed)
 // and nothing lands on the bind.
 func TestPushCreateTempErrorFailsClosed(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "session-root")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatalf("mkdir root: %v", err)
-	}
+	staged := stagedSock(t)
 
 	orig := createTemp
 	createTemp = func(_, _ string) (tempFile, error) { return nil, errInjectedCreateTemp }
 	defer func() { createTemp = orig }()
 
 	p := NewPusher()
-	_, err := p.Push(context.Background(), handoff.Staged{Root: root}, []byte(`{"a":1}`))
+	_, err := p.Push(context.Background(), staged, []byte(`{"a":1}`))
 	if !errors.Is(err, ErrPushFailed) {
 		t.Fatalf("create-temp error: want ErrPushFailed, got %v", err)
 	}
@@ -102,7 +114,8 @@ func TestPushCreateTempErrorFailsClosed(t *testing.T) {
 var errInjectedCreateTemp = errors.New("provisioning: injected create-temp fault")
 
 // chmodFailTempFile fails Chmod, so writeFileExact's chmod-temp branch is exercised
-// (the config must be 0600 before any byte; a chmod failure is fatal).
+// (the config must carry the exact filePerm mode before any byte; a chmod failure
+// is fatal).
 type chmodFailTempFile struct{ real *os.File }
 
 func (f chmodFailTempFile) Name() string                { return f.real.Name() }
@@ -114,13 +127,10 @@ func (f chmodFailTempFile) Close() error                { return f.real.Close() 
 var errInjectedChmod = errors.New("provisioning: injected chmod fault")
 
 // TestPushChmodErrorFailsClosed covers writeFileExact's chmod-temp error branch: a
-// failure to set 0600 on the temp file fails the push closed and leaves nothing on
-// the bind.
+// failure to set the exact file mode on the temp file fails the push closed and
+// leaves nothing on the bind.
 func TestPushChmodErrorFailsClosed(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "session-root")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatalf("mkdir root: %v", err)
-	}
+	staged := stagedSock(t)
 
 	orig := createTemp
 	createTemp = func(dir, pattern string) (tempFile, error) {
@@ -133,11 +143,11 @@ func TestPushChmodErrorFailsClosed(t *testing.T) {
 	defer func() { createTemp = orig }()
 
 	p := NewPusher()
-	_, err := p.Push(context.Background(), handoff.Staged{Root: root}, []byte(`{"a":1}`))
+	_, err := p.Push(context.Background(), staged, []byte(`{"a":1}`))
 	if !errors.Is(err, ErrPushFailed) {
 		t.Fatalf("chmod error: want ErrPushFailed, got %v", err)
 	}
-	entries, _ := os.ReadDir(root)
+	entries, _ := os.ReadDir(staged.Material.HostSockDir)
 	if len(entries) != 0 {
 		t.Fatalf("chmod-fail push left artifacts behind: %d entries", len(entries))
 	}
@@ -158,10 +168,7 @@ var errInjectedSync = errors.New("provisioning: injected sync fault")
 // TestPushSyncErrorFailsClosed covers writeFileExact's sync-temp error branch: a
 // failed durability barrier fails the push closed and leaves nothing on the bind.
 func TestPushSyncErrorFailsClosed(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "session-root")
-	if err := os.Mkdir(root, 0o700); err != nil {
-		t.Fatalf("mkdir root: %v", err)
-	}
+	staged := stagedSock(t)
 
 	orig := createTemp
 	createTemp = func(dir, pattern string) (tempFile, error) {
@@ -174,11 +181,11 @@ func TestPushSyncErrorFailsClosed(t *testing.T) {
 	defer func() { createTemp = orig }()
 
 	p := NewPusher()
-	_, err := p.Push(context.Background(), handoff.Staged{Root: root}, []byte(`{"a":1}`))
+	_, err := p.Push(context.Background(), staged, []byte(`{"a":1}`))
 	if !errors.Is(err, ErrPushFailed) {
 		t.Fatalf("sync error: want ErrPushFailed, got %v", err)
 	}
-	entries, _ := os.ReadDir(root)
+	entries, _ := os.ReadDir(staged.Material.HostSockDir)
 	if len(entries) != 0 {
 		t.Fatalf("sync-fail push left artifacts behind: %d entries", len(entries))
 	}

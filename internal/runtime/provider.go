@@ -157,6 +157,16 @@ type HandoffMaterial struct {
 	// /run/ocu inside the guest, where the GUEST creates the exec UDS. The
 	// provider does not pre-create the socket; it owns and locks down the dir.
 	HostSockDir string
+
+	// MountConfigGuestPath is the absolute in-guest path the rendered storage
+	// mount-config is delivered to — a file INSIDE the RW sock dir (/run/ocu),
+	// NOT a new :ro bind. The mount-config carries the one guest-held bearer (the
+	// weak Storage-JWT), and NFR-SEC-25 forbids bind-mounting a secret :ro; the
+	// mount client unlinks it after load (the scrub evidence). Empty on a
+	// no-storage session, set on a storage-scoped one — both-or-neither with the
+	// host-side render. When set, the guest is launched with the managed
+	// boot-child flags naming the co-located mount binary + this config path.
+	MountConfigGuestPath string
 }
 
 // MountIntent is the substrate-NEUTRAL per-session storage-mount description

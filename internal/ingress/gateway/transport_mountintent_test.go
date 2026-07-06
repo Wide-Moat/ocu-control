@@ -69,6 +69,7 @@ func boundGatewayWithProvider(t *testing.T, pair mtlsPair, provider ocuruntime.R
 		Audit:         audit.NewRecordingFake(),
 		Profile:       0, // ProfileTrustedOperator (admits on runc)
 		Tier:          ocuruntime.TierRunc,
+		AllowedImages: []string{"img", "ocu/sandbox:test", "registry.example/ocu-sandbox:v1"},
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	deps := gateway.Deps{Manager: mgr, TLSConfig: pair.serverTLS}

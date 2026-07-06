@@ -88,6 +88,7 @@ func newOrphanHarness(t *testing.T) *orphanHarness {
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 		Signer:        signer,
 		Push:          pusher,
@@ -324,6 +325,7 @@ func TestUnwindRunsUnderCancelledContext(t *testing.T) {
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 	})
 
