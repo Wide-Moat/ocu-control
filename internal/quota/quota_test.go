@@ -565,6 +565,131 @@ func TestRefundConcurrentChargesExactlyMinusOne(t *testing.T) {
 	}
 }
 
+// TestReconcileConcurrentHealsDriftDown pins the boot cell-reconcile: a cell drifted
+// ABOVE the true live count is corrected DOWN to that count, and the surplus it
+// refunded is returned. It kills the mutants on the surplus computation and the
+// down-only guard: a mutant that flips the surplus sign, drops the refund, or changes
+// the comparison would leave the cell inflated or drive it below the live count.
+func TestReconcileConcurrentHealsDriftDown(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	inner := state.NewInMemory(clk)
+	g := quota.NewGate(inner, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 100})
+	store := inner
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	// Inflate the cell to 5; the true live count is 2 (three phantom charges).
+	concKey := state.QuotaKey{Dim: state.DimConcurrentSessions, Identity: id}
+	if _, err := store.Charge(context.Background(), concKey, 5, 1000); err != nil {
+		t.Fatalf("seed inflated cell: %v", err)
+	}
+
+	surplus, err := g.ReconcileConcurrent(context.Background(), id, 2)
+	if err != nil {
+		t.Fatalf("ReconcileConcurrent: %v", err)
+	}
+	if surplus != 3 {
+		t.Fatalf("ReconcileConcurrent refunded surplus = %d, want 3 (5 - 2)", surplus)
+	}
+	if got := readConcurrent(t, store, id); got != 2 {
+		t.Fatalf("cell after reconcile = %d, want 2 (healed down to the live count)", got)
+	}
+}
+
+// TestReconcileConcurrentNoDriftIsNoOp pins the down-only guard on the two boundary
+// cases: a cell that already MATCHES the live count and a cell BELOW it (an
+// under-count the heal must never inflate). Both leave the cell untouched and refund
+// nothing. It kills a mutant that flips the surplus<=0 guard (which would charge the
+// cell UP or drive a matched cell down).
+func TestReconcileConcurrentNoDriftIsNoOp(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	inner := state.NewInMemory(clk)
+	g := quota.NewGate(inner, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 100})
+	store := inner
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+	concKey := state.QuotaKey{Dim: state.DimConcurrentSessions, Identity: id}
+
+	// Matched: cell == liveCount.
+	if _, err := store.Charge(context.Background(), concKey, 2, 1000); err != nil {
+		t.Fatalf("seed matched cell: %v", err)
+	}
+	surplus, err := g.ReconcileConcurrent(context.Background(), id, 2)
+	if err != nil {
+		t.Fatalf("ReconcileConcurrent matched: %v", err)
+	}
+	if surplus != 0 {
+		t.Fatalf("matched reconcile surplus = %d, want 0 (no drift)", surplus)
+	}
+	if got := readConcurrent(t, store, id); got != 2 {
+		t.Fatalf("matched cell after reconcile = %d, want 2 (untouched)", got)
+	}
+
+	// Below: liveCount exceeds the cell — the heal must NOT charge up.
+	surplus, err = g.ReconcileConcurrent(context.Background(), id, 5)
+	if err != nil {
+		t.Fatalf("ReconcileConcurrent below: %v", err)
+	}
+	if surplus != 0 {
+		t.Fatalf("below-count reconcile surplus = %d, want 0 (never inflates)", surplus)
+	}
+	if got := readConcurrent(t, store, id); got != 2 {
+		t.Fatalf("below-count cell after reconcile = %d, want 2 (never charged up)", got)
+	}
+}
+
+// TestReconcileConcurrentPropagatesRefundError pins the refund-error path: when the
+// down-correcting Charge itself fails, ReconcileConcurrent surfaces the error wrapped
+// and does NOT report a surplus it did not actually refund. It kills the mutant that
+// drops the `return 0, err` on the refund Charge (which would claim a heal that never
+// landed, leaving the cell still drifted while the reconciler reports success).
+func TestReconcileConcurrentPropagatesRefundError(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 100})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	// Inflate the cell so there IS a surplus to refund, then fault the refund Charge.
+	concKey := state.QuotaKey{Dim: state.DimConcurrentSessions, Identity: id}
+	if _, err := rec.Store.Charge(context.Background(), concKey, 5, 1000); err != nil {
+		t.Fatalf("seed inflated cell: %v", err)
+	}
+	rec.failNegCharge = true
+
+	surplus, err := g.ReconcileConcurrent(context.Background(), id, 2)
+	if err == nil {
+		t.Fatal("ReconcileConcurrent with a failing refund Charge returned nil; want the store error surfaced")
+	}
+	if surplus != 0 {
+		t.Fatalf("ReconcileConcurrent on a failed refund reported surplus = %d, want 0 (no heal actually landed)", surplus)
+	}
+}
+
+// TestReconcileConcurrentPropagatesReadError pins the read-error path: a failing
+// ReadQuota is surfaced wrapped (not swallowed, not treated as zero — which would
+// spuriously refund the whole cell). It kills a mutant that drops the read-error
+// branch.
+func TestReconcileConcurrentPropagatesReadError(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g := quota.NewGate(state.NewInMemory(clk), clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 100})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // a cancelled context makes the Store's ReadQuota fail closed
+	surplus, err := g.ReconcileConcurrent(ctx, id, 0)
+	if err == nil {
+		t.Fatal("ReconcileConcurrent with a failing ReadQuota returned nil; want the store error surfaced")
+	}
+	// On the read-error path the surplus MUST be the zero value, never a sentinel like
+	// -1: the caller reads it as "how much was healed", so a non-zero surplus on a
+	// failed read would misreport a heal that never happened. Pinning it kills the
+	// mutant that returns -1 on the read-error branch.
+	if surplus != 0 {
+		t.Fatalf("ReconcileConcurrent read-error surplus = %d, want 0 (no heal on a failed read)", surplus)
+	}
+}
+
 // TestReceiptApplyChargesExactChargedDeltaPerCell pins the per-cell refund delta
 // the unwind compensator issues: each cell is refunded by EXACTLY the negation of
 // what was charged (-1), not more. A mutant that records Delta:2 in the Receipt (or
