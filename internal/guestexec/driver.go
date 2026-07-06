@@ -13,6 +13,7 @@ import (
 	"io"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Wide-Moat/ocu-sandbox/host/exec/dial"
@@ -29,6 +30,24 @@ const execSockName = "exec.sock"
 // totalExecCap is the MANDATORY total exec bound (D-03): dial + handshake + the
 // whole drive. A requested timeout above it is CLAMPED down, never honored.
 const totalExecCap = 5 * time.Minute
+
+// dialWaitBudget bounds the cold-start re-dial poll: create returns the instant a
+// guest is materialized, but its exec.sock is not dial-able until the FUSE mount
+// and boot-child finish — a sub-second window where an immediate exec would hit a
+// connect(2) ENOENT/ECONNREFUSED that is provably TRANSIENT (the row is already
+// audience-scoped ACTIVE-and-owned above this driver, so a dial refusal here is a
+// not-yet-ready guest, not a wrong/absent one). Rather than surface that transient
+// as a refusal, the dial re-tries until the socket comes up. The budget is a few
+// seconds — long enough to bridge the real cold window with headroom, short enough
+// that a genuinely dead guest fails fast instead of pinning the connection for the
+// multi-minute exec cap. It is DISTINCT from totalExecCap: that bounds a running
+// command, this bounds only the wait for the socket to appear.
+const dialWaitBudget = 5 * time.Second
+
+// redialInterval is the poll cadence across the cold window: short enough that the
+// exec starts within a poll tick of the socket appearing (the live window is
+// sub-second), long enough not to busy-spin connect(2).
+const redialInterval = 75 * time.Millisecond
 
 // defaultStdioCap bounds each captured output stream (05-SS): bytes past the cap
 // are discarded with the truncated flag set, so a flooding guest cannot balloon
@@ -167,7 +186,7 @@ func (d *Driver) Exec(ctx context.Context, sockDir, containerName string, req Re
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	ch, err := dial.DialUDS(ctx, filepath.Join(sockDir, execSockName), minter)
+	ch, err := dialWithColdWait(ctx, filepath.Join(sockDir, execSockName), minter)
 	if err != nil {
 		return Result{}, fmt.Errorf("guestexec: dial exec channel: %w", err)
 	}
@@ -200,6 +219,64 @@ func (d *Driver) Exec(ctx context.Context, sockDir, containerName string, req Re
 		StdoutTruncated: stdout.truncated,
 		StderrTruncated: stderr.truncated,
 	}, nil
+}
+
+// dialWithColdWait dials the exec socket, re-dialling across the sub-second cold
+// window where the guest is materialized but has not yet bound exec.sock. A dial
+// that fails with a PROVABLY-TRANSIENT connect(2) error (ENOENT: the socket file
+// is not there yet; ECONNREFUSED: it is bound but the listener is not accepting
+// yet) is retried on redialInterval until the socket comes up or the wait budget
+// expires. Any OTHER dial error — a handshake failure, a context cancellation, an
+// unexpected syscall — is returned at once: only the not-yet-ready shape is
+// transient, everything else is terminal and re-dialling it would only burn the
+// budget.
+//
+// The wait is bounded by min(dialWaitBudget, the caller's ctx deadline): the cold
+// wait never outlives the exec's own deadline, and a genuinely dead guest fails a
+// few seconds in rather than pinning the connection for the multi-minute exec cap.
+// The transient/terminal split lives HERE, not at the state layer: the row was
+// already resolved ACTIVE-and-owned before the driver ran, so a not-owned or
+// absent session is refused ABOVE this call (a fast, driver-never-reached 404) and
+// never enters this poll — the wait is spent only on a guest that is provably ours
+// and provably coming up, so no timing signal leaks about a foreign or absent row.
+func dialWithColdWait(ctx context.Context, socketPath string, minter dial.Minter) (*dial.Channel, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, dialWaitBudget)
+	defer cancel()
+
+	for {
+		// Each dial is bounded by waitCtx so a single hanging connect/handshake cannot
+		// outlive the cold-wait budget; the returned channel keeps no reference to this
+		// ctx — the handshake and drive that follow use the exec's own full deadline.
+		ch, err := dial.DialUDS(waitCtx, socketPath, minter)
+		if err == nil {
+			return ch, nil
+		}
+		// Terminal error, or the wait budget / caller deadline is spent: surface it.
+		if !isTransientDialError(err) || waitCtx.Err() != nil {
+			return nil, err
+		}
+		// Provably-transient: the socket is not up yet. Sleep a poll tick (or bail
+		// the instant the wait budget or the caller's context is done) and re-dial.
+		select {
+		case <-waitCtx.Done():
+			return nil, err
+		case <-time.After(redialInterval):
+		}
+	}
+}
+
+// isTransientDialError reports whether a dial failure is the not-yet-ready cold
+// shape worth re-dialling: a connect(2) that found no socket file (ENOENT) or a
+// bound-but-not-accepting listener (ECONNREFUSED). errors.Is walks the wrapped
+// chain the websocket-over-UDS dialer builds (fmt.Errorf %w → *url.Error →
+// *net.OpError → *os.SyscallError → syscall.Errno), so the classification reaches
+// the real errno regardless of the wrapping. A cancelled/expired context is NOT
+// transient here — it is the caller's own bound and must surface at once.
+func isTransientDialError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED)
 }
 
 // buildProcessConnection maps the Request onto the frozen handshake envelope: a
