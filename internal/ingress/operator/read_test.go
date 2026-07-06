@@ -51,7 +51,7 @@ func readEnabledOperator(t *testing.T, resolver ingress.IdentityResolver, deploy
 		Tier:          ocuruntime.TierRunc,
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
-	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
+	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink, gate)
 	deps := operator.Deps{
 		Manager:    mgr,
 		Engine:     eng,

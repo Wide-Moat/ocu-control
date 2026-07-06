@@ -65,7 +65,7 @@ func newTestHandlers(t *testing.T, resolver ingress.IdentityResolver, verifier k
 		Tier:          runtime.TierRunc,
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
-	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
+	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink, gate)
 	h := operator.NewHandlers(operator.Deps{
 		Manager:  mgr,
 		Engine:   eng,

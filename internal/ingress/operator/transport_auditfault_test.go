@@ -55,7 +55,7 @@ func boundOperatorFaultable(t *testing.T, resolver ingress.IdentityResolver) (*h
 		Tier:          ocuruntime.TierRunc,
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
-	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink)
+	eng := killswitch.NewEngine(store, custodian, nopProvider{}, clk, sink, gate)
 	mcpEng := mcpkey.NewEngine(
 		mcpkey.NewMinter(),
 		mcpkey.NewInMemRecordStore(),

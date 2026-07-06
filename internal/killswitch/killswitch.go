@@ -65,31 +65,48 @@ var ErrScopeInvalid = errors.New("killswitch: operator scope invalid, revoke ref
 // (P2-R2). Callers match it with errors.Is.
 var ErrSOARUnverified = errors.New("killswitch: SOAR signature unverifiable, revoke rejected (P2-R2)")
 
+// ConcurrencyRefunder returns one per-tenant DimConcurrentSessions slot for a row the
+// kill-switch force-killed. It is the SAME single decrement lifecycle.Destroy and the
+// boot reconciler use (quota.Gate.RefundConcurrent) — a negative-delta Charge the
+// Store saturates at zero, so a double refund never drives the counter negative. The
+// kill path MUST call it: without it the level counter is a write-only ratchet on
+// force-kill (charged on create, never returned on an emergency revoke), and after a
+// RevokeAll the tenant's slot stays charged with zero live rows, refusing every later
+// create with ErrQuotaExceeded against a phantom count.
+type ConcurrencyRefunder interface {
+	RefundConcurrent(ctx context.Context, tenant state.Identity) error
+}
+
 // Engine authors the durable denylist (state.Store.SetDeny) and force-kills live
 // rows. It is reachable ONLY from the operator ingress: every method takes an
 // ingress.OperatorScope, so no gateway route can form a call. It holds the Store (to
 // author the deny posture), the registry Custodian (to enumerate live rows and drive
 // a force-killed row to the RELEASED tombstone), the runtime provider (the force-kill
-// finalizer), the injected Clock (the deny entry's Since stamp), and the fail-closed
-// audit sink.
+// finalizer), the injected Clock (the deny entry's Since stamp), the fail-closed audit
+// sink, and the concurrency refunder (to return the level-counter slot a force-kill
+// frees, the SAME decrement the destroy and reconcile paths use).
 type Engine struct {
 	store    state.Store
 	reg      *registry.Custodian
 	provider runtime.RuntimeProvider
 	clk      state.Clock
 	audit    audit.AuditSink
+	refund   ConcurrencyRefunder
 }
 
 // NewEngine constructs an Engine from its collaborators. The same Clock the Store
 // was built with must be passed so the whole revoke path reads time through one
-// seam.
-func NewEngine(store state.Store, reg *registry.Custodian, provider runtime.RuntimeProvider, clk state.Clock, sink audit.AuditSink) *Engine {
+// seam. The refunder is the quota.Gate that also charged the counter on create, so
+// the force-kill returns the level slot through the one decrement path the destroy
+// and reconcile paths share.
+func NewEngine(store state.Store, reg *registry.Custodian, provider runtime.RuntimeProvider, clk state.Clock, sink audit.AuditSink, refund ConcurrencyRefunder) *Engine {
 	return &Engine{
 		store:    store,
 		reg:      reg,
 		provider: provider,
 		clk:      clk,
 		audit:    sink,
+		refund:   refund,
 	}
 }
 
@@ -296,6 +313,18 @@ func (e *Engine) forceKillRow(ctx context.Context, row state.SessionRow) error {
 		// An already-released row is idempotent inside the Store; a real release fault is
 		// surfaced so the sweep records it.
 		return fmt.Errorf("release force-killed row: %w", err)
+	}
+	// Return the per-tenant concurrency slot the force-kill frees, the SAME decrement
+	// lifecycle.Destroy and the boot reconciler use. Without this the level counter is a
+	// write-only ratchet on the kill path: charged on create, never returned on an
+	// emergency revoke, so the tenant's slot stays charged with zero live rows and every
+	// later create is refused ErrQuotaExceeded against a phantom count. The refund keys
+	// on the ROW OWNER (the tenant the create charged), never the operator actor, and is
+	// idempotent — the Store saturates the negative delta at zero, so ForceReleaseRow's
+	// already-released idempotence and a re-run of the sweep never drive the count below
+	// the true live count.
+	if err := e.refund.RefundConcurrent(ctx, row.Owner); err != nil {
+		return fmt.Errorf("refund force-killed concurrency: %w", err)
 	}
 	return nil
 }

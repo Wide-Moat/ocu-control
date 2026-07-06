@@ -14,6 +14,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
+	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
@@ -77,7 +78,8 @@ func newKSRevokeHarness(t *testing.T) *ksRevokeHarness {
 	store := state.NewInMemory(clk)
 	cust := registry.NewCustodian(store)
 	sink := audit.NewRecordingFake()
-	engine := killswitch.NewEngine(store, cust, provider, clk, sink)
+	gate := quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 64, CreateRatePerCallerPerMin: 64})
+	engine := killswitch.NewEngine(store, cust, provider, clk, sink, gate)
 	scope := ingress.NewOperatorSeam().Mint(ksOperator)
 
 	return &ksRevokeHarness{

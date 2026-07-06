@@ -80,7 +80,7 @@ func boundOperatorWithProvider(t *testing.T, resolver ingress.IdentityResolver, 
 		Tier:          ocuruntime.TierRunc,
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
-	eng := killswitch.NewEngine(store, custodian, provider, clk, sink)
+	eng := killswitch.NewEngine(store, custodian, provider, clk, sink, gate)
 	deps := operator.Deps{
 		Manager:  mgr,
 		Engine:   eng,
