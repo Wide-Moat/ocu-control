@@ -638,6 +638,33 @@ func TestReconcileConcurrentNoDriftIsNoOp(t *testing.T) {
 	}
 }
 
+// TestReconcileConcurrentPropagatesRefundError pins the refund-error path: when the
+// down-correcting Charge itself fails, ReconcileConcurrent surfaces the error wrapped
+// and does NOT report a surplus it did not actually refund. It kills the mutant that
+// drops the `return 0, err` on the refund Charge (which would claim a heal that never
+// landed, leaving the cell still drifted while the reconciler reports success).
+func TestReconcileConcurrentPropagatesRefundError(t *testing.T) {
+	t.Parallel()
+	clk := state.NewFakeClock(gateStart)
+	g, rec := newRecorderGate(t, clk, quota.Limits{CreateRatePerCallerPerMin: 10, ConcurrentSessionsPerTenant: 100})
+	id := state.Identity{Tenant: "t1", Caller: "c1"}
+
+	// Inflate the cell so there IS a surplus to refund, then fault the refund Charge.
+	concKey := state.QuotaKey{Dim: state.DimConcurrentSessions, Identity: id}
+	if _, err := rec.Store.Charge(context.Background(), concKey, 5, 1000); err != nil {
+		t.Fatalf("seed inflated cell: %v", err)
+	}
+	rec.failNegCharge = true
+
+	surplus, err := g.ReconcileConcurrent(context.Background(), id, 2)
+	if err == nil {
+		t.Fatal("ReconcileConcurrent with a failing refund Charge returned nil; want the store error surfaced")
+	}
+	if surplus != 0 {
+		t.Fatalf("ReconcileConcurrent on a failed refund reported surplus = %d, want 0 (no heal actually landed)", surplus)
+	}
+}
+
 // TestReconcileConcurrentPropagatesReadError pins the read-error path: a failing
 // ReadQuota is surfaced wrapped (not swallowed, not treated as zero — which would
 // spuriously refund the whole cell). It kills a mutant that drops the read-error
