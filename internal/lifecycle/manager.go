@@ -196,6 +196,10 @@ type Recorder interface {
 	IncDestroy()
 	// ObserveStart records one reserved->active start duration.
 	ObserveStart(d time.Duration)
+	// IncQuotaRefundFailed records one quota-refund compensator failure on the create
+	// unwind — a swallowed refund that leaves the concurrency cell drifted until the
+	// boot cell-reconcile heals it.
+	IncQuotaRefundFailed()
 }
 
 // ControlDialer is the NARROW seam the Destroy path reaches the advisory

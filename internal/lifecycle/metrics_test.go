@@ -21,13 +21,15 @@ import (
 // increments and captures every observed start duration, so a test can assert the
 // Manager recorded the lifecycle metrics on the success paths.
 type recordingRecorder struct {
-	creates  int
-	destroys int
-	starts   []time.Duration
+	creates           int
+	destroys          int
+	quotaRefundFailed int
+	starts            []time.Duration
 }
 
-func (r *recordingRecorder) IncCreate()  { r.creates++ }
-func (r *recordingRecorder) IncDestroy() { r.destroys++ }
+func (r *recordingRecorder) IncCreate()            { r.creates++ }
+func (r *recordingRecorder) IncDestroy()           { r.destroys++ }
+func (r *recordingRecorder) IncQuotaRefundFailed() { r.quotaRefundFailed++ }
 func (r *recordingRecorder) ObserveStart(d time.Duration) {
 	r.starts = append(r.starts, d)
 }
