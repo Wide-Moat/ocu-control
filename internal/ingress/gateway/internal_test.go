@@ -9,10 +9,12 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
@@ -127,6 +129,25 @@ func TestWriteServiceErrorInvalidArgumentIs400(t *testing.T) {
 	writeServiceError(rec404, registry.ErrNotOwned)
 	if rec404.Code != http.StatusNotFound {
 		t.Fatalf("writeServiceError(ErrNotOwned) = %d; want 404 (the 400 arm must not swallow it)", rec404.Code)
+	}
+
+	// The 400 body must NOT reflect the request-derived detail the Manager wraps
+	// into the sentinel (e.g. the rejected image name, a caller-supplied value). The
+	// Manager wraps user input — `fmt.Errorf("%w: guest image %q is not in the
+	// allow-list", ErrInvalidArgument, in.Image)` — so echoing err.Error() back into
+	// the response body reflects attacker-controlled bytes to the client (a taint
+	// flow gosec flags as G705). The arm surfaces a fixed client-error string; the
+	// status code carries the class, not the raw internal detail. Red-probe: change
+	// the arm to write err.Error() → this reds on the reflected marker.
+	const attackerMarker = "reflected-injection-marker-9f3a2b"
+	wrapped := fmt.Errorf("%w: guest image %q is not in the allow-list", lifecycle.ErrInvalidArgument, attackerMarker)
+	recEcho := httptest.NewRecorder()
+	writeServiceError(recEcho, wrapped)
+	if recEcho.Code != http.StatusBadRequest {
+		t.Fatalf("writeServiceError(wrapped ErrInvalidArgument) = %d; want 400", recEcho.Code)
+	}
+	if strings.Contains(recEcho.Body.String(), attackerMarker) {
+		t.Fatalf("400 body reflects request-derived detail %q (body=%q); it must surface a fixed string, never echo caller input", attackerMarker, recEcho.Body.String())
 	}
 }
 
