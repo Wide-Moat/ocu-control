@@ -124,6 +124,14 @@ jobs:
       # committed (a checkout restores it), which holds on the PR branch.
       - name: cold-exec keystone RED-when-neutered proof
         run: bash scripts/coldexec-redprobe.sh
+      # RED-when-neutered proof for the idle reaper's two load-bearing reapOne steps:
+      # a reaper that skips the substrate force-kill leaks an orphan container, and one
+      # that skips the concurrency refund leaks the tier-cap slot. The probe removes
+      # each step in turn, asserts the reap keystone goes RED, restores from git, and
+      # asserts it goes green — it needs the code committed (a checkout restores it),
+      # which holds on the PR branch.
+      - name: idle-reaper keystone RED-when-neutered proof
+        run: bash scripts/idle-reaper-redprobe.sh
 
   # race runs the whole suite under the race detector (T1-14): the daemon is
   # concurrency-heavy (admission gate, per-session supervisor, host-dialled

@@ -110,6 +110,41 @@ reads a reservation's age, and adding an age column now would invite the
 "subtract a loaded timestamp from `Clock.Now()`" defect the monotonic seam
 forbids. The reaper lands with the phase that builds tombstone aging.
 
+This is a distinct mechanism from the **idle-ACTIVE session reaper** (NFR-SEC-40,
+below): that one reclaims *live* `ACTIVE` sessions abandoned past their idle
+window — an availability/tier-cap concern that creates tombstones — whereas this
+deferred evictor ages out `RELEASED` tombstones already at end of life, a
+storage-hygiene concern. The idle reaper is built; the tombstone evictor stays
+deferred.
+
+### Idle-ACTIVE reaper: no age column, in-process stamp, boot-reseed
+
+The idle-session reaper (NFR-SEC-40, NFR-REL-09) reclaims a live `ACTIVE`
+session whose client vanished without a destroy — the container is still Up, so
+neither the boot reconciler (substrate-lost only) nor the kill-switch
+(operator-driven) reclaims it, and the slot leaks until it wedges the tier cap.
+Idleness is measured from the session's **last activity** (its activation, then
+each exec), not from creation, so a long-running session that keeps working is
+never reaped.
+
+The last-activity stamp is held **in process, in no persisted column**. It is
+seeded at activation and advanced on every exec, and idleness is `Clock.Now()`
+minus that stamp — two in-process `Clock` readings, never a `TIMESTAMPTZ`
+round-trip subtraction (the NFR-SEC-48 seam above). A persisted age column was
+rejected twice over: it would (1) reintroduce exactly the load-then-subtract
+defect the monotonic seam forbids, and (2) turn an NTP step or a VM-resume
+clock-jump-forward into a fleet-wide mass-reap, killing every live session at
+once. So the full-shelf store keeps the stamp in an in-process map, persists
+nothing, and on boot **reseeds** every loaded `ACTIVE` row's stamp to
+`Clock.Now()`: a session that survives a control restart gets one fresh idle
+window rather than being judged against a stamp that did not survive — the honest
+posture when the true last-activity instant is not durably known, and the one
+that cannot be moved by a wall-clock jump. The reaper's per-session reclaim is
+audit-first (a system-initiated reconcile-reclaim record, NFR-SEC-72), then a
+force-kill of the substrate, then the row release and the concurrency-slot
+return — the teardown before the release so a freed slot is never reused while
+the abandoned container is still breathing.
+
 ## Two listeners, two endpoints, no shared mux
 
 The operator/lifecycle ingress and the gateway service-identity ingress are

@@ -412,6 +412,21 @@ func serve(ctx context.Context, cfg config) error {
 		return err
 	}
 
+	// Start the idle-session reaper AFTER a clean boot (deny posture durable, listeners
+	// bound) and BEFORE serving. The window is shelf-split (NFR-SEC-40): off on the
+	// minimal shelf, ≤15 min on the full shelf. validate() already refused a negative
+	// or above-ceiling window pre-bind, so this resolve cannot fail here; a defensive
+	// error still aborts fail-closed rather than serving with an unbounded window. When
+	// the window is off, startIdleReaper launches no goroutine. The reaper shares the
+	// process context, so the shutdown signal cancels it alongside the listeners.
+	idleTTL, err := resolveIdleTTL(cfg)
+	if err != nil {
+		_ = opListener.Close()
+		_ = gwListener.Close()
+		return fmt.Errorf("boot: resolve idle-reaper window: %w", err)
+	}
+	startIdleReaper(ctx, mgr, idleTTL)
+
 	// Both listeners are bound. Serve them until the process context is cancelled;
 	// the first serve error (or a clean ctx shutdown returning nil) ends the daemon.
 	return serveListeners(ctx, opListener, gwListener)

@@ -856,11 +856,26 @@ func (m *Manager) ReapIdle(ctx context.Context, idleTTL time.Duration) (int, err
 }
 
 // reapOne reclaims one idle ACTIVE row. It is AUDIT-FIRST and fail-closed: the
-// reconcile-reclaim record (idle-reap cause) is emitted BEFORE the row is released,
-// so the returned slot is never returned un-recorded (NFR-SEC-72). It then releases
-// the row to the tombstone and returns the concurrency slot through the SAME single
-// decrement the destroy and boot-reconcile paths use. Release and ReleaseConcurrency
-// are idempotent, so a re-run never double-credits.
+// reconcile-reclaim record (idle-reap cause) is emitted BEFORE any teardown or
+// release, so a slot returned to the tier cap is never returned un-recorded
+// (NFR-SEC-72). It then FORCE-KILLS the substrate, then releases the row to the
+// tombstone and returns the concurrency slot through the SAME single decrement the
+// destroy and boot-reconcile paths use.
+//
+// The teardown runs BEFORE the release, not after: a reap that returned the slot
+// first would let a fresh create claim that slot and materialize a new guest while
+// the abandoned container is still breathing — a slot-reuse-while-orphan-lives race.
+// The finalizer verb is ForceKill, not the cooperative GracefulStop the destroy path
+// uses: a reaped session is abandoned by definition (its client vanished), so there
+// is no cooperative peer to drain and no advisory control-RPC nudge to send — the
+// host-driven kill is authoritative (NFR-SEC-01). The teardown target is built PURELY
+// from the host-derived row (Name from the session key, RuntimeID from the write-once
+// bound row.ContainerName), the same construction Destroy uses; no body hint reaches
+// it (NFR-SEC-43). An already-gone container is idempotent (ErrNoSuchContainer is a
+// satisfied kill), exactly as the boot reconciler's orphan sweep treats it, so a
+// re-run of the reaper never fails on a container a prior tick already removed.
+// Release and ReleaseConcurrency are likewise idempotent, so a re-run never
+// double-credits.
 func (m *Manager) reapOne(ctx context.Context, row state.SessionRow) error {
 	rec := audit.Record{
 		Action: audit.ActionReconcileReclaim,
@@ -871,6 +886,20 @@ func (m *Manager) reapOne(ctx context.Context, row state.SessionRow) error {
 	}
 	if err := m.audit.Emit(ctx, rec); err != nil {
 		return fmt.Errorf("idle-reap audit: %w", err)
+	}
+	// Force-kill the abandoned substrate BEFORE returning the slot. The sandbox is
+	// re-derived from the host-attested row exactly as Destroy builds it — the session
+	// key names the container and the write-once bound container name is its runtime id.
+	sandbox := runtime.Sandbox{
+		Name:      runtime.SessionName(row.Key),
+		RuntimeID: row.ContainerName,
+		Egress:    runtime.EgressBinding{Name: runtime.SessionName(row.Key), FilesystemID: row.Key},
+		Tier:      m.tier,
+	}
+	if err := m.provider.Teardown().ForceKill(ctx, sandbox); err != nil {
+		if !errors.Is(err, runtime.ErrNoSuchContainer) {
+			return fmt.Errorf("idle-reap force-kill: %w", err)
+		}
 	}
 	if _, err := m.reg.ReleaseRow(ctx, row); err != nil {
 		return fmt.Errorf("release reaped row: %w", err)

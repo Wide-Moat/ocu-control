@@ -63,6 +63,14 @@ func TestReapIdle_AbandonedSessionReclaimed(t *testing.T) {
 	if got := concurrentCount(t, h.store, testCaller.Identity); got != 0 {
 		t.Fatalf("post-reap concurrency = %d, want 0 (slot returned)", got)
 	}
+	// The abandoned CONTAINER is gone from the substrate, not just the row. A reaper
+	// that only returns the slot without tearing down the guest trades a slot leak for
+	// an orphan-container leak: the in-guest agent service is a long-lived UDS server, so
+	// exec-exit never kills it — reapOne MUST force-kill the substrate. The provider
+	// holds nothing for the reaped session after the reap.
+	if got := h.provider.liveCount(); got != 0 {
+		t.Fatalf("post-reap provider live containers = %d, want 0 (the abandoned guest must be force-killed, not orphaned)", got)
+	}
 	// The reclaim is recorded: a reconcile-reclaim-class audit event names the idle-reap
 	// cause so the operator trail distinguishes it from a normal destroy.
 	var reaps int
@@ -73,6 +81,53 @@ func TestReapIdle_AbandonedSessionReclaimed(t *testing.T) {
 	}
 	if reaps != 1 {
 		t.Fatalf("idle reap emitted %d reconcile-reclaim records, want 1", reaps)
+	}
+}
+
+// TestReapIdle_SecondReapIsIdempotent is the guard on re-running the reaper against a
+// session a prior tick already reclaimed. Once reaped the row is RELEASED, so it is no
+// longer an ACTIVE reap candidate and the second tick selects it not at all — reaped=0,
+// the slot stays at zero (no double-credit), and no second reconcile-reclaim record is
+// written. This locks the invariant that overlapping or retried ticks converge rather
+// than compounding: the reaper's per-row work (force-kill, release, refund) is each
+// idempotent, and the row-state skip means an already-reaped session is never revisited.
+func TestReapIdle_SecondReapIsIdempotent(t *testing.T) {
+	t.Parallel()
+	h := newHarness(t)
+	ctx := context.Background()
+
+	if _, err := h.mgr.Create(ctx, input("abandoned-twice")); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	h.clk.Advance(testIdleTTL + time.Minute)
+
+	first, err := h.mgr.ReapIdle(ctx, testIdleTTL)
+	if err != nil {
+		t.Fatalf("first ReapIdle: %v", err)
+	}
+	if first != 1 {
+		t.Fatalf("first ReapIdle reaped %d, want 1", first)
+	}
+
+	// A second tick over the same now-RELEASED session must reclaim nothing.
+	second, err := h.mgr.ReapIdle(ctx, testIdleTTL)
+	if err != nil {
+		t.Fatalf("second ReapIdle: %v", err)
+	}
+	if second != 0 {
+		t.Fatalf("second ReapIdle reaped %d, want 0 (the session was already reclaimed)", second)
+	}
+	if got := concurrentCount(t, h.store, testCaller.Identity); got != 0 {
+		t.Fatalf("post-second-reap concurrency = %d, want 0 (no double-credit)", got)
+	}
+	var reaps int
+	for _, r := range h.audit.Records() {
+		if r.Action == audit.ActionReconcileReclaim {
+			reaps++
+		}
+	}
+	if reaps != 1 {
+		t.Fatalf("total reconcile-reclaim records after two ticks = %d, want 1 (the second tick reclaims nothing)", reaps)
 	}
 }
 

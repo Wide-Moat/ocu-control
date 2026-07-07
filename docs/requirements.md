@@ -22,8 +22,10 @@ source of truth. The full PRD lives in `.planning/` (gitignored, local-only).
 | 8 | Control holds the Storage-JWT signing key, mints the weak `filesystem_id`-scoped session JWT, and publishes a JWKS; it does not hold the real filestore credential and does not speak the filestore protocol | ADR-0013, ADR-0019, NFR-SEC-25 | unit + contract-conformance |
 | 9 | The kill-switch / revoke route holds its ≤30 s p99 SLA under saturation, on reserved capacity distinct from the create path | NFR-SEC-55 | perf (k6) |
 | 10 | Every privileged operator/SOAR action emits a chain-linked OCSF event before acknowledgement; the action is denied if the audit write fails (fail-closed) | NFR-SEC-45 | unit-test |
-| 11 | TTL and revocation windows run against a monotonic clock; a wall-clock setback neither extends a token nor defers a revoke | NFR-SEC-48 | clock-rollback harness |
+| 11 | TTL, revocation, and idle-session windows run against a monotonic clock; a wall-clock setback neither extends a token, defers a revoke, nor mass-reaps live sessions | NFR-SEC-48 | clock-rollback harness |
 | 12 | Teardown is host-driven and ordered (credential-revoke, egress-route-drop, writable-surface-scrub); a guest reply never substitutes, reorders, or marks it complete | NFR-SEC-65 | integration |
+| 13 | An idle session is terminated on expiry, its concurrency slot returned, and the next call re-authenticates; the idle window is off on the minimal/solo shelf and on (≤15 min, tunable down not up) on the full shelf, with an above-ceiling window refused, not clamped | NFR-SEC-40 | unit (shelf-split resolution) + reap keystone |
+| 14 | Every terminal session transition — operator kill, guest exit, reconcile reclaim, or idle expiry — returns the concurrency slot to the tier cap before the row goes terminal; a release leaks no orphan process and no concurrency slot | NFR-REL-09 | reap keystone + neuter-proof |
 
 ## Defaults (NFR-derived, configurable, not frozen)
 
@@ -35,6 +37,7 @@ source of truth. The full PRD lives in `.planning/` (gitignored, local-only).
 | Operator-auth substrate | host-rooted local credential (minimal shelf); customer-IdP-asserted (full shelf) | ADR-0004 |
 | Storage-JWT signer | host-local signing key (minimal shelf); customer-PKI-rooted (full shelf) | component-02 shelf delta |
 | Kill-switch p99 | ≤ 30 s, reserved capacity distinct from create | NFR-SEC-55 |
+| Session idle-TTL | off (minimal/solo shelf); ≤ 15 min, tunable down (full shelf) — unset resolves to the ceiling, above-ceiling refused | NFR-SEC-40 |
 
 ## Deliberately out of scope
 
