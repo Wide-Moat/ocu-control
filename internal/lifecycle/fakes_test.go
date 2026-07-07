@@ -21,6 +21,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/handoff"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
 	"github.com/Wide-Moat/ocu-control/internal/provisioning"
+	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
@@ -362,4 +363,40 @@ func (s *listerStore) LiveSessions(ctx context.Context) ([]state.SessionRow, err
 		}
 	}
 	return out, nil
+}
+
+// LiveSessionsEnriched, RecordActivation, and TouchActivity forward to the wrapped
+// Store so the registry's EnrichedLister / ActivationRecorder / ActivityToucher type
+// assertions see the capabilities through this wrapper. Without these the wrapper
+// would shadow the embedded interface (an optional capability is not promoted from an
+// embedded interface field) and the idle-reaper enumerate + the exec last-activity
+// touch would fail closed with ErrEnumerationUnsupported.
+func (s *listerStore) LiveSessionsEnriched(ctx context.Context) ([]state.EnrichedSessionRow, error) {
+	type enrichedLister interface {
+		LiveSessionsEnriched(context.Context) ([]state.EnrichedSessionRow, error)
+	}
+	if el, ok := s.Store.(enrichedLister); ok {
+		return el.LiveSessionsEnriched(ctx)
+	}
+	return nil, registry.ErrEnumerationUnsupported
+}
+
+func (s *listerStore) RecordActivation(ctx context.Context, key string, caps state.Caps, at time.Time) error {
+	type recorder interface {
+		RecordActivation(context.Context, string, state.Caps, time.Time) error
+	}
+	if r, ok := s.Store.(recorder); ok {
+		return r.RecordActivation(ctx, key, caps, at)
+	}
+	return registry.ErrEnumerationUnsupported
+}
+
+func (s *listerStore) TouchActivity(ctx context.Context, key string, now time.Time) error {
+	type toucher interface {
+		TouchActivity(context.Context, string, time.Time) error
+	}
+	if t, ok := s.Store.(toucher); ok {
+		return t.TouchActivity(ctx, key, now)
+	}
+	return registry.ErrEnumerationUnsupported
 }

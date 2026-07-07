@@ -11,9 +11,11 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"time"
 )
 
 type runMode int
@@ -26,29 +28,79 @@ const (
 
 // config is the parsed serving invocation — the daemon's full flag surface.
 type config struct {
-	operatorListen  string // operator/lifecycle ingress endpoint (distinct from gateway)
-	gatewayListen   string // gateway service-identity ingress endpoint
-	runtimeTier     string // deployment-wide isolation tier; never per-request
-	runtimeProvider string // container backend behind the RuntimeProvider seam
-	workloadProfile string // deployment-declared trust profile feeding the admission matrix; never per-request
-	jwtSigningKey   string // path to the Storage-JWT signing key (config/secret mount)
-	execSigningKey  string // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
-	gatewayTLSCert  string // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
-	gatewayTLSKey   string // OPTIONAL gateway mTLS server-key PEM (all-or-none)
-	gatewayClientCA string // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
-	jwtAlg          string // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
-	storageIssuer   string // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
-	storageAudience string // provisional Storage-JWT aud (PIN-PENDING)
-	execIssuer      string // provisional exec-JWT iss (PIN-PENDING)
-	execAudience    string // provisional exec-JWT aud (PIN-PENDING)
-	serviceURL      string // filestore service_url rendered into every mount-config
-	caCert          string // path to the CA certificate PEM rendered into every mount-config
-	auditSink       string // OCSF audit fan-in sink
-	stateDSN        string // Postgres DSN for durable state; empty selects the in-memory store
-	jwksPath        string // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
-	mcpKeysetPath   string // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
-	mcpKeyFile      string // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
-	create          bool   // a create request presented at startup (smoke hook)
+	operatorListen  string        // operator/lifecycle ingress endpoint (distinct from gateway)
+	gatewayListen   string        // gateway service-identity ingress endpoint
+	runtimeTier     string        // deployment-wide isolation tier; never per-request
+	runtimeProvider string        // container backend behind the RuntimeProvider seam
+	workloadProfile string        // deployment-declared trust profile feeding the admission matrix; never per-request
+	jwtSigningKey   string        // path to the Storage-JWT signing key (config/secret mount)
+	execSigningKey  string        // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
+	gatewayTLSCert  string        // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
+	gatewayTLSKey   string        // OPTIONAL gateway mTLS server-key PEM (all-or-none)
+	gatewayClientCA string        // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
+	jwtAlg          string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
+	storageIssuer   string        // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
+	storageAudience string        // provisional Storage-JWT aud (PIN-PENDING)
+	execIssuer      string        // provisional exec-JWT iss (PIN-PENDING)
+	execAudience    string        // provisional exec-JWT aud (PIN-PENDING)
+	serviceURL      string        // filestore service_url rendered into every mount-config
+	caCert          string        // path to the CA certificate PEM rendered into every mount-config
+	auditSink       string        // OCSF audit fan-in sink
+	stateDSN        string        // Postgres DSN for durable state; empty selects the in-memory store
+	jwksPath        string        // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
+	mcpKeysetPath   string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
+	mcpKeyFile      string        // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
+	sessionIdleTTL  time.Duration // OPTIONAL idle-session reaper window; 0 = unset (shelf-split resolution in resolveIdleTTL: off on the minimal shelf, ≤15 min ceiling on the full shelf per NFR-SEC-40)
+	create          bool          // a create request presented at startup (smoke hook)
+}
+
+// sessionIdleCeiling is the maximum idle-session window the full shelf permits
+// (NFR-SEC-40). An idle ACTIVE session is terminated and its concurrency slot
+// returned once it exceeds its resolved window; the full shelf may only tune the
+// window DOWN from this ceiling, never up (regulator-anchored session-timeout bound).
+const sessionIdleCeiling = 15 * time.Minute
+
+// errIdleTTLAboveCeiling is the typed refusal for a -session-idle-ttl above the
+// NFR-SEC-40 ceiling on the full shelf. The value is REFUSED, not silently clamped:
+// a silent clamp would let an operator believe a wider idle window is in force than
+// the one actually applied — a config-integrity lie. The boot aborts loud instead.
+var errIdleTTLAboveCeiling = errors.New("session idle-TTL exceeds the full-shelf ceiling (NFR-SEC-40: ≤15 min, tunable down not up)")
+
+// errIdleTTLNegative is the typed refusal for a negative -session-idle-ttl on either
+// shelf. A negative window is meaningless (it would reap every session immediately or
+// never), so it is refused rather than coerced.
+var errIdleTTLNegative = errors.New("session idle-TTL must not be negative")
+
+// resolveIdleTTL applies the NFR-SEC-40 shelf split to the raw -session-idle-ttl
+// flag and returns the effective idle window (0 meaning the reaper does not run).
+//
+// The shelf is read from -state-dsn: an empty DSN is the in-memory minimal/solo shelf,
+// a set DSN is the durable full shelf (the SAME signal openStore uses to pick the
+// backend). On the minimal shelf the idle timeout is OFF-legal — unset stays off, and
+// a positive value is an explicit opt-in that is honored. On the full shelf the idle
+// timeout is MANDATORY: an unset window resolves UP to the ≤15 min ceiling (so the
+// reaper runs — unset is not off), a value at-or-below the ceiling is honored (tunable
+// down), and a value ABOVE the ceiling is REFUSED, not clamped. A negative value is
+// refused on either shelf. Resolution is pure and side-effect-free, so it can run in
+// the pre-bind validate() gate.
+func resolveIdleTTL(cfg config) (time.Duration, error) {
+	if cfg.sessionIdleTTL < 0 {
+		return 0, fmt.Errorf("%w: %v", errIdleTTLNegative, cfg.sessionIdleTTL)
+	}
+	fullShelf := cfg.stateDSN != ""
+	if !fullShelf {
+		// Minimal/solo shelf: off is legal. Unset (0) stays off; a positive opt-in is
+		// honored as-is (a solo operator may choose any window).
+		return cfg.sessionIdleTTL, nil
+	}
+	// Full shelf: the idle timeout is mandatory and ceiling-bounded.
+	if cfg.sessionIdleTTL == 0 {
+		return sessionIdleCeiling, nil // unset resolves UP to the ceiling — the reaper runs
+	}
+	if cfg.sessionIdleTTL > sessionIdleCeiling {
+		return 0, fmt.Errorf("%w: %v > %v", errIdleTTLAboveCeiling, cfg.sessionIdleTTL, sessionIdleCeiling)
+	}
+	return cfg.sessionIdleTTL, nil
 }
 
 // parse reads argv into a config plus the run mode. Unknown -runtime-tier and
@@ -96,6 +148,11 @@ func parse(args []string) (config, runMode, error) {
 			"in-memory-only storage (the minimal shelf default). If set and the file exists on boot, "+
 			"it is loaded fail-closed (looser-than-0600 perms abort boot). Written on every "+
 			"mcp-key create/revoke via a full atomic temp+fsync+rename rewrite")
+	fs.DurationVar(&cfg.sessionIdleTTL, "session-idle-ttl", 0,
+		"OPTIONAL idle-session reaper window (NFR-SEC-40). Unset (0) is off on the minimal "+
+			"shelf (empty -state-dsn) and resolves to the ≤15 min ceiling on the full shelf; a "+
+			"full-shelf value above the ceiling is refused, not clamped. An idle ACTIVE session "+
+			"past its window is force-killed and its concurrency slot returned")
 	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	fs.BoolVar(&healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")
@@ -176,6 +233,14 @@ func validate(cfg config) error {
 	}
 	if set != 0 && set != 3 {
 		return fmt.Errorf("%w: gateway mTLS is all-or-none — set all of -gateway-tls-cert/-gateway-tls-key/-gateway-client-ca or none", errRequiredFlagMissing)
+	}
+
+	// The idle-reaper window is shelf-split validated here, pre-bind: a negative window
+	// (either shelf) or a full-shelf window above the NFR-SEC-40 ceiling is refused
+	// before any Store is built, so a misconfigured idle timeout never binds a listener.
+	// The resolved value itself is recomputed in serve() to drive the reaper tick.
+	if _, err := resolveIdleTTL(cfg); err != nil {
+		return err
 	}
 
 	return nil

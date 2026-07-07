@@ -100,3 +100,69 @@ func TestRecordActivationUnsupported(t *testing.T) {
 		t.Fatalf("RecordActivation on a non-recording Store: error %v, want ErrEnumerationUnsupported", err)
 	}
 }
+
+// TestTouchActivityRoutesToStore proves the Custodian routes TouchActivity through the
+// Store's optional ActivityToucher seam: touching a committed row advances its
+// last-activity stamp, and EnrichedLiveSessions reads the new stamp back. This is the
+// activity-tracking seam the idle reaper measures idleness against — a touch must land
+// on the enrichment, and the touched instant is the one the read surface reports (never
+// a persisted-timestamp round-trip, so the reaper compares two in-process Clock reads).
+func TestTouchActivityRoutesToStore(t *testing.T) {
+	t.Parallel()
+	c, _ := newCustodian(t)
+	ctx := context.Background()
+	owner := state.Identity{Tenant: "t", Caller: "c"}
+
+	key := registry.DeriveKey(owner, "handle-touch")
+	if _, err := c.Reserve(ctx, key, owner); err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if _, err := c.Commit(ctx, key, owner); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+	// RecordActivation seeds the initial stamp; a later TouchActivity must advance it.
+	if err := c.RecordActivation(ctx, key, state.Caps{CPUCores: 1}, regStart.Add(5)); err != nil {
+		t.Fatalf("RecordActivation: %v", err)
+	}
+	touchAt := regStart.Add(100)
+	if err := c.TouchActivity(ctx, key, touchAt); err != nil {
+		t.Fatalf("TouchActivity: %v", err)
+	}
+
+	rows, err := c.EnrichedLiveSessions(ctx)
+	if err != nil {
+		t.Fatalf("EnrichedLiveSessions: %v", err)
+	}
+	var got *state.EnrichedSessionRow
+	for i := range rows {
+		if rows[i].Key == key.String() {
+			got = &rows[i]
+			break
+		}
+	}
+	if got == nil {
+		t.Fatal("touched row not enumerated")
+	}
+	if got.LastActivity == nil {
+		t.Fatal("touched row has nil LastActivity — the touch did not route to the Store")
+	}
+	if !got.LastActivity.Equal(touchAt) {
+		t.Fatalf("LastActivity = %v, want the touched instant %v (the touch must advance the stamp)", *got.LastActivity, touchAt)
+	}
+}
+
+// TestTouchActivityUnsupported proves TouchActivity on a Store without the
+// ActivityToucher seam returns ErrEnumerationUnsupported. The exec path swallows this
+// (a touch failure is non-fatal — the session keeps its prior stamp), but the Custodian
+// still surfaces the typed error rather than silently reporting success, so a Store that
+// cannot track activity is distinguishable from one that did.
+func TestTouchActivityUnsupported(t *testing.T) {
+	t.Parallel()
+	inner := state.NewInMemory(state.NewFakeClock(regStart))
+	c := registry.NewCustodian(&nonListerStore{Store: inner})
+	owner := state.Identity{Tenant: "t", Caller: "c"}
+	key := registry.DeriveKey(owner, "h")
+	if err := c.TouchActivity(context.Background(), key, regStart); !errors.Is(err, registry.ErrEnumerationUnsupported) {
+		t.Fatalf("TouchActivity on a non-touching Store: error %v, want ErrEnumerationUnsupported", err)
+	}
+}

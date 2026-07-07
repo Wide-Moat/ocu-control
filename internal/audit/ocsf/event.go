@@ -208,6 +208,13 @@ func activityFor(a audit.Action) (uint8, string) {
 		return activityCreate, a.String()
 	case audit.ActionDestroy:
 		return activityDelete, a.String()
+	case audit.ActionReconcileReclaim:
+		// A reconcile-reclaim (boot substrate-lost sweep or the runtime idle-reaper)
+		// tears the session row down to the tombstone and returns its slot — the same
+		// resource-removal shape as a destroy, so the honest CRUD slot is Delete(4).
+		// The name stays the Action label ("reconcile_reclaim") so the record is
+		// self-describing next to the operator-driven destroy events.
+		return activityDelete, a.String()
 	case audit.ActionRevokeOne, audit.ActionRevokeAll,
 		audit.ActionEditDenylist, audit.ActionOverrideQuota, audit.ActionRetentionPolicy,
 		audit.ActionResumeGlobal,

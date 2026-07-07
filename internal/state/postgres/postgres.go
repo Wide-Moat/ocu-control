@@ -29,6 +29,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -54,9 +55,20 @@ var schemaSQL string
 // moves no window the way the seam requires. It is safe for concurrent use
 // because the pool is, and because every mutation is serialized per key by a
 // Postgres advisory lock rather than by in-process state.
+//
+// activity is the in-process last-activity index the idle reaper measures against
+// (NFR-SEC-40). It is deliberately NOT a persisted column: a TIMESTAMPTZ age column
+// would reintroduce the load-then-subtract defect the monotonic seam forbids
+// (NFR-SEC-48) and would turn a clock-jump-forward into a fleet-wide mass-reap. The
+// stamp is Clock.Now() at activation and at every exec, is boot-reseeded for every
+// surviving ACTIVE row on construction (a fresh idle window per survivor), is filled
+// into LiveSessionsEnriched for the reaper, and is dropped on release. It is guarded
+// by activityMu; it holds one small entry per live session, bounded by the tier cap.
 type store struct {
-	pool *pgxpool.Pool
-	clk  state.Clock
+	pool       *pgxpool.Pool
+	clk        state.Clock
+	activityMu sync.Mutex
+	activity   map[string]time.Time
 }
 
 // New builds a Postgres state.Store over an existing pool and runs the schema
@@ -65,11 +77,57 @@ type store struct {
 // run, so a boot against an unreachable database fails closed rather than
 // coming up half-initialized.
 func New(ctx context.Context, pool *pgxpool.Pool, clk state.Clock) (state.Store, error) {
-	s := &store{pool: pool, clk: clk}
+	s := &store{pool: pool, clk: clk, activity: make(map[string]time.Time)}
 	if err := s.Migrate(ctx); err != nil {
 		return nil, err
 	}
+	// Boot-reseed the in-process last-activity index: every ACTIVE row that survived
+	// into this fresh process gets a stamp of Clock.Now(), so the idle reaper measures
+	// it from the boot instant (a fresh idle window) rather than skipping it forever for
+	// want of a stamp. No timestamp is persisted; the durable row is the only survivor,
+	// the stamp is rebuilt. A reseed failure is fail-closed (a boot that cannot read its
+	// live rows must not come up claiming a clean reaper view).
+	if err := s.reseedActivity(ctx); err != nil {
+		return nil, err
+	}
 	return s, nil
+}
+
+// reseedActivity stamps the in-process last-activity index with Clock.Now() for every
+// currently-ACTIVE row. It runs once at construction (a control restart): a durable
+// ACTIVE row carries no in-process stamp on the fresh process, so without this the idle
+// reaper — which skips a nil-stamp row — would never reclaim a session abandoned before
+// the restart, leaking its slot on exactly the full shelf where NFR-SEC-40 mandates the
+// reaper. Granting each survivor a fresh window is the honest posture: the true
+// last-activity instant did not survive the restart, and a fresh window cannot be moved
+// by a wall-clock jump the way a persisted timestamp could.
+func (s *store) reseedActivity(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx,
+		`SELECT key FROM sessions WHERE state = $1`, int16(state.StateActive))
+	if err != nil {
+		return unavailable("reseed-activity: query", err)
+	}
+	defer rows.Close()
+
+	now := s.clk.Now()
+	keys := make([]string, 0)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return unavailable("reseed-activity: scan", err)
+		}
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		return unavailable("reseed-activity: iterate", err)
+	}
+
+	s.activityMu.Lock()
+	for _, key := range keys {
+		s.activity[key] = now
+	}
+	s.activityMu.Unlock()
+	return nil
 }
 
 // Open is the convenience constructor: it parses url, opens a pool, and hands
@@ -249,7 +307,7 @@ func (s *store) Commit(ctx context.Context, key string, owner state.Identity) (s
 // terminal row, no error, no double credit). An unknown key is
 // ErrReservationNotFound; an owner mismatch is ErrReservationConflict.
 func (s *store) Release(ctx context.Context, key string, owner state.Identity) (state.SessionRow, error) {
-	return s.transition(ctx, "release", key, owner, func(row *state.SessionRow) error {
+	row, err := s.transition(ctx, "release", key, owner, func(row *state.SessionRow) error {
 		if row.State == state.StateReleased {
 			// Already terminal: idempotent no-op, no second capacity credit.
 			return errIdempotentNoop
@@ -257,6 +315,17 @@ func (s *store) Release(ctx context.Context, key string, owner state.Identity) (
 		row.State = state.StateReleased
 		return nil
 	})
+	if err == nil {
+		// The row is terminal: drop its in-process last-activity stamp so the index
+		// holds only live sessions (bounded by the tier cap). Every release path — destroy,
+		// reconcile reclaim, idle reap, kill-switch — funnels through here, so one delete
+		// covers them all. Idempotent: deleting an absent key is a no-op, so a re-run of an
+		// already-released row does not error.
+		s.activityMu.Lock()
+		delete(s.activity, key)
+		s.activityMu.Unlock()
+	}
+	return row, err
 }
 
 // errIdempotentNoop is an internal control signal from a transition mutate
@@ -459,6 +528,19 @@ func (s *store) LiveSessionsEnriched(ctx context.Context) ([]state.EnrichedSessi
 	if err := rows.Err(); err != nil {
 		return nil, unavailable("live-sessions-enriched: iterate", err)
 	}
+	// Fill LastActivity from the in-process index for each row that has a stamp (every
+	// ACTIVE row does — seeded at activation or boot-reseed, advanced on exec). A row
+	// with no stamp (a still-RESERVED row, or one released between the query and here)
+	// keeps a nil LastActivity, which the reaper skips. The stamp is never read from a
+	// column; it is the in-process value the reaper measures Clock.Now() against.
+	s.activityMu.Lock()
+	for i := range live {
+		if at, ok := s.activity[live[i].Key]; ok {
+			la := at
+			live[i].LastActivity = &la
+		}
+	}
+	s.activityMu.Unlock()
 	return live, nil
 }
 
@@ -487,6 +569,32 @@ func (s *store) RecordActivation(ctx context.Context, key string, caps state.Cap
 	); err != nil {
 		return unavailable("record-activation: update", err)
 	}
+	// Activation is the row's first activity: seed the in-process last-activity index so
+	// the idle reaper measures idleness from here. The instant is the caller-supplied
+	// Clock stamp (`at`), never a persisted timestamp read back — the reaper compares two
+	// in-process Clock readings (NFR-SEC-48). This mirrors the in-memory leg exactly.
+	s.activityMu.Lock()
+	s.activity[key] = at
+	s.activityMu.Unlock()
+	return nil
+}
+
+// TouchActivity advances the in-process last-activity stamp for key to now — the
+// registry.ActivityToucher capability the lifecycle exec path calls after a successful
+// dispatch, so the idle reaper measures idleness from the latest exec, not from
+// activation. The caller passes Clock.Now(), so the store does NO time math and
+// persists NOTHING: the stamp lives only in the in-process index (the reaper compares
+// two in-process Clock readings, NFR-SEC-48; a persisted age column is deliberately
+// absent). A cancelled context fails closed with ErrStoreUnavailable. A missing key is
+// a harmless no-op on the read surface, mirroring the in-memory leg — the reaper only
+// reads ACTIVE rows, and a stamp for a row that is gone is dropped on release.
+func (s *store) TouchActivity(ctx context.Context, key string, now time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return unavailable("touch-activity", err)
+	}
+	s.activityMu.Lock()
+	s.activity[key] = now
+	s.activityMu.Unlock()
 	return nil
 }
 

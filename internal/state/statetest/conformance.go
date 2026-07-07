@@ -773,6 +773,64 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		}
 	})
 
+	t.Run("TouchActivity advances the last-activity stamp the enriched read surface reports", func(t *testing.T) {
+		// The idle-reaper contract, held against both legs: TouchActivity advances a
+		// committed row's last-activity stamp, and LiveSessionsEnriched reads the NEW
+		// stamp back via LastActivity. The reaper measures idleness as Clock.Now() minus
+		// this stamp (two in-process Clock readings, never a persisted-timestamp
+		// subtraction), so a session that keeps touching is never reaped.
+		s := newFixture()
+		at, ok := s.(activityToucher)
+		if !ok {
+			t.Fatalf("Store %T does not implement TouchActivity: the idle reaper cannot track last activity", s)
+		}
+		el := s.(enrichedLister)
+		ar := s.(activationRecorder)
+
+		mustReserve(ctx, t, s, "k-touch", owner)
+		mustCommit(ctx, t, s, "k-touch", owner)
+		// Activation seeds the initial stamp; a later touch must advance it.
+		seedAt := conformanceStart.Add(10 * time.Second)
+		if err := ar.RecordActivation(ctx, "k-touch", state.Caps{CPUCores: 1}, seedAt); err != nil {
+			t.Fatalf("RecordActivation(k-touch): %v", err)
+		}
+		touchAt := conformanceStart.Add(5 * time.Minute)
+		if err := at.TouchActivity(ctx, "k-touch", touchAt); err != nil {
+			t.Fatalf("TouchActivity(k-touch): %v", err)
+		}
+
+		live, err := el.LiveSessionsEnriched(ctx)
+		if err != nil {
+			t.Fatalf("LiveSessionsEnriched: %v", err)
+		}
+		var got *state.EnrichedSessionRow
+		for i := range live {
+			if live[i].Key == "k-touch" {
+				got = &live[i]
+				break
+			}
+		}
+		if got == nil {
+			t.Fatalf("touched row k-touch not enumerated")
+		}
+		if got.LastActivity == nil {
+			t.Fatalf("k-touch must carry a non-nil last-activity after a touch, got nil")
+		}
+		if !got.LastActivity.Equal(touchAt) {
+			t.Errorf("k-touch last-activity: want the touched instant %v, got %v", touchAt, *got.LastActivity)
+		}
+	})
+
+	t.Run("TouchActivity fails closed on a cancelled context", func(t *testing.T) {
+		s := newFixture()
+		at := s.(activityToucher)
+		cancelled, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := at.TouchActivity(cancelled, "k", conformanceStart); !errors.Is(err, state.ErrStoreUnavailable) {
+			t.Fatalf("TouchActivity on cancelled ctx: want ErrStoreUnavailable, got %v", err)
+		}
+	})
+
 	t.Run("LiveSessionsEnriched and RecordActivation fail closed on a cancelled context", func(t *testing.T) {
 		s := newFixture()
 		el := s.(enrichedLister)
@@ -857,6 +915,15 @@ type enrichedLister interface {
 // already-committed row, the read-surface complement of the frozen Commit.
 type activationRecorder interface {
 	RecordActivation(ctx context.Context, key string, caps state.Caps, at time.Time) error
+}
+
+// activityToucher is the optional last-activity write the idle reaper measures
+// idleness against (mirroring registry.ActivityToucher). It advances the row's
+// in-process last-activity stamp; the stamp is read back through the LastActivity
+// field of LiveSessionsEnriched. The signature MUST match the production method so a
+// leg that drifts stops satisfying the assertion and the suite fails loudly.
+type activityToucher interface {
+	TouchActivity(ctx context.Context, key string, now time.Time) error
 }
 
 // mustReserve reserves key for owner and fails the test on any error.

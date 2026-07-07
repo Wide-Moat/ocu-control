@@ -331,3 +331,29 @@ func (c *Custodian) RecordActivation(ctx context.Context, key Key, caps state.Ca
 	}
 	return recorder.RecordActivation(ctx, key.k, caps, at)
 }
+
+// ActivityToucher is the optional write capability that advances a row's
+// last-activity stamp. The lifecycle exec path calls it after a successful dispatch
+// so the idle-reaper measures idleness from the LAST activity, not from creation. It
+// takes now (Clock.Now()) from the caller so the store does no time math — the idle
+// window is Clock.Now() minus this stamp, two in-process Clock readings, never a
+// persisted-timestamp subtraction (NFR-SEC-48). A Store without it yields
+// ErrEnumerationUnsupported; the caller treats a touch failure as non-fatal (the exec
+// already succeeded; the row simply keeps its prior stamp and may be reaped a tick
+// early — never a create/exec failure).
+type ActivityToucher interface {
+	TouchActivity(ctx context.Context, key string, now time.Time) error
+}
+
+// TouchActivity routes the last-activity advance through the sole custodian, keyed on
+// the registry Key (host-derived, never a raw request string). It is NON-FATAL: a
+// Store without the optional ActivityToucher yields ErrEnumerationUnsupported, which
+// the caller swallows — the reaper falls back to the activation stamp and may reap a
+// still-busy session one idle window late at worst, never a data-safety issue.
+func (c *Custodian) TouchActivity(ctx context.Context, key Key, now time.Time) error {
+	toucher, ok := c.store.(ActivityToucher)
+	if !ok {
+		return ErrEnumerationUnsupported
+	}
+	return toucher.TouchActivity(ctx, key.k, now)
+}

@@ -275,6 +275,102 @@ func TestPostgres_ClockRollbackMovesNoWindow(t *testing.T) {
 	}
 }
 
+// TestPostgres_IdleReaperReseedsActiveRowOnBoot is the boot-reseed keystone that
+// closes the full-shelf idle-reaper hole. The last-activity stamp the idle reaper
+// measures against is held IN PROCESS in no persisted column (a persisted age column
+// would reintroduce the NFR-SEC-48 load-then-subtract defect AND turn a clock-jump
+// into a fleet-wide mass-reap). So an ACTIVE row that survives a control RESTART has
+// no in-process stamp on the fresh process, and without a reseed the reaper — which
+// skips a nil-stamp row — would never reclaim it: the slot leaks across every restart,
+// exactly on the full shelf where NFR-SEC-40 makes the reaper mandatory.
+//
+// The fix is a boot-reseed: on construction the store stamps every loaded ACTIVE row's
+// in-process last-activity to Clock.Now(), granting each survivor one fresh idle window
+// (the honest posture — the true last-activity instant did not survive — and one a
+// wall-clock jump cannot move). This activates a session on store A, "restarts" to a
+// fresh store B on the same durable schema, and asserts B's enriched enumeration
+// carries a NON-NIL LastActivity for the survivor set to the boot instant, so an
+// advance past the idle window makes it reapable. Without the reseed the enriched row's
+// LastActivity is nil and the survivor is never reaped — this reds.
+func TestPostgres_IdleReaperReseedsActiveRowOnBoot(t *testing.T) {
+	url := databaseURL(t)
+	schema := newSchema(t, url)
+	ctx := context.Background()
+	bootA := time.Date(2025, time.January, 2, 3, 4, 5, 0, time.UTC)
+	clk := state.NewFakeClock(bootA)
+
+	// Store A: create and activate an ACTIVE session, then advance well past an idle
+	// window WHILE A is running (A's in-process stamp is live, but it is about to be
+	// discarded by the "restart").
+	a := openOnSchema(t, url, schema, clk)
+	if _, err := a.Reserve(ctx, "k-idle", durOwner); err != nil {
+		t.Fatalf("A Reserve: %v", err)
+	}
+	if _, err := a.Commit(ctx, "k-idle", durOwner); err != nil {
+		t.Fatalf("A Commit: %v", err)
+	}
+	if _, err := a.BindContainerName(ctx, "k-idle", durOwner, "ctr-idle"); err != nil {
+		t.Fatalf("A BindContainerName: %v", err)
+	}
+	// RecordActivation is an optional capability (registry.ActivationRecorder), reached
+	// through a type assertion exactly as the lifecycle layer reaches it.
+	recorder, ok := a.(interface {
+		RecordActivation(context.Context, string, state.Caps, time.Time) error
+	})
+	if !ok {
+		t.Fatal("store A does not satisfy the ActivationRecorder capability")
+	}
+	if err := recorder.RecordActivation(ctx, "k-idle", state.Caps{CPUCores: 1}, clk.Now()); err != nil {
+		t.Fatalf("A RecordActivation: %v", err)
+	}
+
+	// The control plane restarts: a fresh store B boots on the SAME durable schema,
+	// carrying no in-process activity stamp — only what survived in Postgres (the row,
+	// not the stamp). The boot instant advances to bootB.
+	bootB := bootA.Add(time.Hour)
+	clk.SetWallClock(bootB)
+	b := openOnSchema(t, url, schema, clk)
+
+	// B enumerates the enriched live rows: the survivor MUST carry a reseeded
+	// LastActivity at the boot instant, not a nil stamp. A nil stamp is the hole —
+	// the reaper would skip it forever.
+	enriched, err := b.(interface {
+		LiveSessionsEnriched(context.Context) ([]state.EnrichedSessionRow, error)
+	}).LiveSessionsEnriched(ctx)
+	if err != nil {
+		t.Fatalf("B LiveSessionsEnriched: %v", err)
+	}
+	var survivor *state.EnrichedSessionRow
+	for i := range enriched {
+		if enriched[i].Key == "k-idle" {
+			survivor = &enriched[i]
+			break
+		}
+	}
+	if survivor == nil {
+		t.Fatal("B did not enumerate the surviving ACTIVE row k-idle")
+	}
+	if survivor.State != state.StateActive {
+		t.Fatalf("survivor state = %v, want ACTIVE", survivor.State)
+	}
+	if survivor.LastActivity == nil {
+		t.Fatal("survivor LastActivity is nil after restart — the boot-reseed did not stamp it, so the reaper would skip it forever (slot leaks across restart)")
+	}
+	if !survivor.LastActivity.Equal(bootB) {
+		t.Fatalf("survivor LastActivity = %v, want the boot instant %v (reseeded to Clock.Now() at boot, a fresh window)", *survivor.LastActivity, bootB)
+	}
+
+	// The reseeded stamp behaves like a real activity stamp: an advance past the idle
+	// window makes the survivor idle by the two-in-process-Clock-reads measure the
+	// reaper uses (Clock.Now() minus the stamp), so it becomes reapable — proving the
+	// reseed did not merely set a field but restored the row to the reaper's view.
+	const idleTTL = 15 * time.Minute
+	clk.SetWallClock(bootB.Add(idleTTL + time.Minute))
+	if clk.Now().Sub(*survivor.LastActivity) <= idleTTL {
+		t.Fatalf("after advancing past the window the reseeded survivor is not idle: now-stamp = %v, want > %v", clk.Now().Sub(*survivor.LastActivity), idleTTL)
+	}
+}
+
 // hasScope reports whether a loaded deny set contains an entry with the given
 // scope and key, so a durability case can assert membership without depending on
 // slice order.
