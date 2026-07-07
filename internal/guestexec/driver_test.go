@@ -87,7 +87,8 @@ func (g *fakeGuest) lastHandshake() (string, wire.ProcessConnection) {
 	return g.gotJWT, g.gotConn
 }
 
-// startFakeGuest serves the fake guest on sockDir/exec.sock.
+// startFakeGuest serves the fake guest on sockDir/exec.sock, binding the socket
+// immediately (the warm case).
 func startFakeGuest(t *testing.T, sockDir string, g *fakeGuest) {
 	t.Helper()
 	sockPath := filepath.Join(sockDir, "exec.sock")
@@ -95,6 +96,55 @@ func startFakeGuest(t *testing.T, sockDir string, g *fakeGuest) {
 	if err != nil {
 		t.Fatalf("listen unix %s: %v", sockPath, err)
 	}
+	serveFakeGuest(t, ln, g)
+}
+
+// startFakeGuestDelayed models the COLD window: the sock leaf directory already
+// exists (the handoff staged it), but the guest does not bind exec.sock until
+// delay has elapsed — so a dial in that window gets connect(2) ENOENT, exactly the
+// live cold-exec race (guest materialized, exec.sock not yet dial-able while the
+// FUSE mount + boot-child load). The bind happens on a background goroutine so
+// Exec can start racing it immediately.
+func startFakeGuestDelayed(t *testing.T, sockDir string, g *fakeGuest, delay time.Duration) {
+	t.Helper()
+	sockPath := filepath.Join(sockDir, "exec.sock")
+	ready := make(chan net.Listener, 1)
+	go func() {
+		time.Sleep(delay)
+		ln, err := net.Listen("unix", sockPath)
+		if err != nil {
+			ready <- nil
+			return
+		}
+		ready <- ln
+	}()
+	t.Cleanup(func() {
+		// Drain the listener if the test finished before/around the bind so the
+		// background goroutine never leaks a live socket past the test.
+		select {
+		case ln := <-ready:
+			if ln != nil {
+				_ = ln.Close()
+			}
+		default:
+		}
+	})
+	// Serve as soon as the delayed bind lands, on its own goroutine, so the driver's
+	// re-dial poll finds a live guest the instant it comes up.
+	go func() {
+		ln := <-ready
+		if ln == nil {
+			return
+		}
+		serveFakeGuest(t, ln, g)
+	}()
+}
+
+// serveFakeGuest runs the scripted exec-channel server over an already-bound
+// listener. It is shared by the warm and delayed starters so the handshake+drive
+// script is written once.
+func serveFakeGuest(t *testing.T, ln net.Listener, g *fakeGuest) {
+	t.Helper()
 	g.srv = &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
@@ -344,5 +394,100 @@ func TestEffectiveTimeoutClampsToTotalCap(t *testing.T) {
 		if got := effectiveTimeout(tc.in); got != tc.want {
 			t.Fatalf("effectiveTimeout(%d) = %v; want %v", tc.in, got, tc.want)
 		}
+	}
+}
+
+// TestDriverExecWaitsForColdSocket is the cold-exec keystone: the sock leaf exists
+// but the guest binds exec.sock only AFTER a cold delay, so an immediate dial gets
+// connect(2) ENOENT — the exact live race where create returns 201 and the very
+// next exec hop would otherwise be refused. The driver must re-dial across the
+// provably-transient window and complete the exec once the guest comes up, so a
+// create-then-immediate-exec returns the guest's output, not a dial refusal.
+//
+// This test RED-proves the fix: without the bounded re-dial poll, the first dial's
+// ENOENT is returned verbatim and the exec fails.
+func TestDriverExecWaitsForColdSocket(t *testing.T) {
+	t.Parallel()
+	signer, _ := newTestSigner(t)
+	sockDir := shortSockDir(t)
+	guest := &fakeGuest{exitCode: 0, stdout: []byte("cold-then-warm")}
+	// The guest binds ~350ms after Exec starts — comfortably inside the ~0.5s live
+	// window, and well under the 5s dial-wait budget.
+	startFakeGuestDelayed(t, sockDir, guest, 350*time.Millisecond)
+
+	d := NewDriver(signer)
+	start := time.Now()
+	res, err := d.Exec(context.Background(), sockDir, "ocu-session-cold", Request{
+		Argv:     []string{"echo", "hi"},
+		TimeoutS: 30,
+	})
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Exec against a cold socket = %v; want the bounded re-dial to bridge the window", err)
+	}
+	if got := string(res.Stdout); got != "cold-then-warm" {
+		t.Fatalf("Stdout = %q; want the guest payload after the cold wait", got)
+	}
+	// The exec must complete only AFTER the guest bound (proving it actually waited),
+	// and comfortably before the dial-wait budget (proving the wait is bounded, not
+	// a hang that happened to succeed).
+	if elapsed < 300*time.Millisecond {
+		t.Fatalf("Exec returned in %v; want it to have waited for the ~350ms cold bind", elapsed)
+	}
+	if elapsed > 3*time.Second {
+		t.Fatalf("Exec took %v; the bounded wait should have completed shortly after the cold bind", elapsed)
+	}
+}
+
+// TestDriverExecBoundsColdWait pins the OTHER half of the bound: when the guest
+// NEVER comes up, the re-dial poll does not hang and does not run to the multi-
+// minute exec cap — it fails at or near the dial-wait budget with a dial error
+// (which the gateway layer maps to the same refusal). A dead guest must not pin a
+// connection for minutes.
+func TestDriverExecBoundsColdWait(t *testing.T) {
+	t.Parallel()
+	signer, _ := newTestSigner(t)
+	sockDir := shortSockDir(t) // leaf exists, but no guest ever binds exec.sock
+
+	d := NewDriver(signer)
+	start := time.Now()
+	_, err := d.Exec(context.Background(), sockDir, "ocu-session-dead", Request{
+		Argv:     []string{"true"},
+		TimeoutS: 0, // zero => the 5-minute exec cap; the dial wait must bound WELL under it
+	})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Exec against a never-arriving guest = nil error; want a bounded dial refusal")
+	}
+	// The dial wait is bounded to a few seconds regardless of the exec cap: the
+	// failure must land near the dial-wait budget, not at the 5-minute exec cap.
+	if elapsed > 30*time.Second {
+		t.Fatalf("Exec waited %v for a dead guest; the dial wait must bound well under the exec cap", elapsed)
+	}
+}
+
+// TestDriverExecFastFailsOnTerminalDialError pins that a NON-transient dial failure
+// is NOT retried: it returns promptly rather than burning the whole dial-wait
+// budget re-dialling a condition that will never clear. A caller cancelling the
+// context is such a terminal signal.
+func TestDriverExecFastFailsOnTerminalDialError(t *testing.T) {
+	t.Parallel()
+	signer, _ := newTestSigner(t)
+	sockDir := shortSockDir(t) // no guest; dial would get ENOENT
+
+	// A context already cancelled before the dial: the re-dial poll must observe the
+	// cancellation and return at once, not spin to the dial-wait budget.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	d := NewDriver(signer)
+	start := time.Now()
+	_, err := d.Exec(ctx, sockDir, "ocu-session-cancelled", Request{Argv: []string{"true"}, TimeoutS: 30})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Exec with a cancelled context = nil error; want a prompt refusal")
+	}
+	if elapsed > time.Second {
+		t.Fatalf("Exec on a cancelled context took %v; want a prompt return, not a spin to the budget", elapsed)
 	}
 }

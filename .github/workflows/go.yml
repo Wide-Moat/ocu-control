@@ -116,6 +116,14 @@ jobs:
         env:
           OCU_TEST_DATABASE_URL: postgres://test:test@127.0.0.1:5432/ocu_control_test?sslmode=disable
         run: go test ./...
+      # RED-when-neutered proof for the cold-exec bounded-wait keystone: a warm-
+      # guest false-green is exactly what hid this race, so the keystone must be
+      # shown to fail when the fix it guards is reverted. The probe neuters the
+      # bounded re-dial back to the plain single dial, asserts the keystone goes
+      # RED, restores from git, and asserts it goes green — it needs the fix
+      # committed (a checkout restores it), which holds on the PR branch.
+      - name: cold-exec keystone RED-when-neutered proof
+        run: bash scripts/coldexec-redprobe.sh
 
   # race runs the whole suite under the race detector (T1-14): the daemon is
   # concurrency-heavy (admission gate, per-session supervisor, host-dialled

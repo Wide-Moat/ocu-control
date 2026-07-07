@@ -8,6 +8,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
@@ -172,5 +173,34 @@ func TestExecForeignSessionNotFound(t *testing.T) {
 		if r.Action == audit.ActionExec {
 			t.Fatal("an exec record was written for a foreign-session refusal")
 		}
+	}
+}
+
+// TestExecNotFoundBurnsNoDialWait is the negative twin of the cold-exec wait: a
+// not-owned/not-found session is refused ABOVE the driver — the row lookup fails
+// audience-scoped and the driver (where the bounded cold-start re-dial poll lives)
+// is never reached. So the refusal is IMMEDIATE, never spending the multi-second
+// dial-wait budget. This pins that the cold-start wait cannot become a timing
+// oracle: a foreign or absent session cannot be distinguished from a real-but-cold
+// one by how long the refusal takes, because it never enters the wait at all.
+func TestExecNotFoundBurnsNoDialWait(t *testing.T) {
+	t.Parallel()
+	driver := &recordingExecDriver{}
+	h, hint := newExecHarness(t, driver)
+
+	start := time.Now()
+	_, err := h.mgr.Exec(context.Background(), execAttacker, hint, lifecycle.ExecRequest{Argv: []string{"true"}})
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Exec for a foreign session = nil error; want a not-owned refusal")
+	}
+	if _, ok := driver.last(); ok {
+		t.Fatal("driver ran for a foreign session; the not-found path must never reach the cold-wait")
+	}
+	// The refusal is a synchronous lookup miss, not a dial wait: it returns in well
+	// under the driver's seconds-long dial-wait budget. A generous ceiling keeps the
+	// assertion non-flaky while still proving no backoff is burned.
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("not-found exec refusal took %v; a not-owned session must refuse fast, never entering the cold-wait", elapsed)
 	}
 }
