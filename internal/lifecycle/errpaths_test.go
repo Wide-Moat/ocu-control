@@ -133,6 +133,7 @@ func newErrManager(t *testing.T) *lcDeps {
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 	})
 	return &lcDeps{mgr: mgr, store: store, provider: provider, audit: sink}
@@ -321,16 +322,66 @@ func TestReconcileSkipsActiveRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Create: %v", err)
 	}
+	// Model the running session: its container IS in the live substrate snapshot
+	// provider.Reconcile returns AND is running (Alive true). The reconciler must then
+	// leave the ACTIVE row alone — a RUNNING container matched to an active row is never
+	// killed and the row is not reclaimed. (An exited-but-present container is instead
+	// substrate-lost and reclaimed; that is the F-2 keystone.)
+	d.provider.orphans = []runtime.Sandbox{{Name: runtime.SessionName(created.Key), Alive: true}}
 	if err := d.mgr.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	// The ACTIVE row is untouched (still ACTIVE, not released).
+	// The ACTIVE row is untouched (still ACTIVE, not released) because its container
+	// is live.
 	row, err := d.store.LookupSession(ctx, created.Key)
 	if err != nil {
 		t.Fatalf("LookupSession: %v", err)
 	}
 	if row.State != state.StateActive {
-		t.Fatalf("ACTIVE row state after reconcile = %v; want ACTIVE (left alone)", row.State)
+		t.Fatalf("ACTIVE row state after reconcile = %v; want ACTIVE (container live, left alone)", row.State)
+	}
+}
+
+// TestReconcileReclaimsActiveRowWithNoLiveContainer is the #93 keystone: an ACTIVE
+// row whose substrate container has vanished out-of-band (host crash, OOM-kill,
+// external docker rm) is reclaimed to the released tombstone and its concurrency
+// slot returned — it does NOT leak the slot and wedge the tier cap. The reclaim
+// emits a system-initiated reconcile-reclaim audit event. Red-probe: revert
+// Reconcile's direction-2 to skip non-RESERVED rows (`if row.State != Reserved
+// { continue }`) → the ACTIVE row stays ACTIVE, no audit, and this reds.
+func TestReconcileReclaimsActiveRowWithNoLiveContainer(t *testing.T) {
+	t.Parallel()
+	d := newErrManager(t)
+	ctx := context.Background()
+	created, err := d.mgr.Create(ctx, input("orphaned-active"))
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	// The container is GONE: provider.Reconcile returns an empty live snapshot, so the
+	// ACTIVE row has no matching substrate — the exact out-of-band-removal condition.
+	d.provider.orphans = nil
+	before := len(d.audit.Records())
+
+	if err := d.mgr.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	row, err := d.store.LookupSession(ctx, created.Key)
+	if err != nil {
+		t.Fatalf("LookupSession: %v", err)
+	}
+	if row.State != state.StateReleased {
+		t.Fatalf("container-less ACTIVE row after reconcile = %v; want RELEASED (reclaimed, slot returned)", row.State)
+	}
+	// A system-initiated reconcile-reclaim audit event was emitted for the reclaim.
+	var sawReclaim bool
+	for _, r := range d.audit.Records()[before:] {
+		if r.Action == audit.ActionReconcileReclaim && r.Key == created.Key {
+			sawReclaim = true
+		}
+	}
+	if !sawReclaim {
+		t.Fatalf("no reconcile-reclaim audit record for the reclaimed row %q; the reclaim must be attributable (NFR-SEC-72)", created.Key)
 	}
 }
 
@@ -403,6 +454,10 @@ func TestCreateBindFallbackOnEmptyRuntimeID(t *testing.T) {
 	if row.ContainerName == "" {
 		t.Fatal("bind fallback produced an empty container name; want the deterministic host-derived name")
 	}
+	// The fallback must be the DETERMINISTIC container name "ocu-sess-<key>" — the
+	// same value docker.containerName, the handoff container_info, and the exec-JWT
+	// sub use. A bare key here would reintroduce the "sub does not match container
+	// name" exec rejection.
 	if want := "ocu-sess-" + row.Key; row.ContainerName != want {
 		t.Fatalf("bind fallback container name = %q; want the deterministic host-derived name %q", row.ContainerName, want)
 	}
@@ -510,6 +565,7 @@ func TestUnwindCompensatorErrorsAreSwallowed(t *testing.T) {
 		Audit:         audit.NewRecordingFake(),
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 	})
 

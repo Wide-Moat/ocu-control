@@ -63,6 +63,7 @@ func validArgs() []string {
 		"-runtime-tier", "runc",
 		"-runtime-provider", "docker",
 		"-workload-profile", "trusted_operator",
+		"-guest-image", "img", // the deployment default; test create bodies naming "img" hit the implicitly-allowed default
 		"-jwt-signing-key", "/tmp/ocu-test-jwt.key",
 		"-audit-sink", "/tmp/ocu-test-audit.jsonl",
 	}
@@ -234,6 +235,7 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 		runtimeTier:     "runc",
 		runtimeProvider: "docker",
 		workloadProfile: "trusted_operator",
+		guestImage:      "img", // the deployment default; create bodies naming "img" pass the implicitly-allowed image gate
 		jwtSigningKey:   keyPath,
 		jwtAlg:          "eddsa",
 		auditSink:       filepath.Join(dir, "audit.jsonl"),
@@ -271,7 +273,7 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 	// exercise that evidence, but it passes the real sink so the wiring path is the
 	// production one.
 	sink := ocsf.NewChainSink(clk, nullCloser{}, "control")
-	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, sink)
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, "", "", sink)
 	if err != nil {
 		t.Fatalf("providerOf: %v", err)
 	}

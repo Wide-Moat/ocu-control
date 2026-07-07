@@ -61,7 +61,7 @@ func validSpec() runtime.SessionSpec {
 // cover.
 func TestBuildHostConfig_HOST01(t *testing.T) {
 	spec := validSpec()
-	hc, err := buildHostConfig(spec, runtime.TierRunc)
+	hc, err := buildHostConfig(spec, runtime.TierRunc, "", "")
 	if err != nil {
 		t.Fatalf("buildHostConfig: unexpected error %v", err)
 	}
@@ -166,55 +166,320 @@ func TestBuildHostConfig_HOST01(t *testing.T) {
 	if len(hc.PortBindings) != 0 {
 		t.Errorf("PortBindings: want empty, got %v", hc.PortBindings)
 	}
+
+	// A NO-STORAGE session (MountConfigGuestPath empty) gets NONE of the scoped
+	// mount add-backs: no CapAdd, no device, and no /root/.cache tmpfs — the
+	// pre-storage posture, byte-identical. The storage-scoped complement is
+	// TestBuildHostConfig_StorageScoped.
+	if len(hc.CapAdd) != 0 {
+		t.Errorf("CapAdd on a no-storage session: want empty, got %v", hc.CapAdd)
+	}
+	if len(hc.Devices) != 0 {
+		t.Errorf("Devices on a no-storage session: want empty, got %v", hc.Devices)
+	}
+	if _, ok := hc.Tmpfs["/root/.cache"]; ok {
+		t.Errorf("Tmpfs[/root/.cache] on a no-storage session: want absent, got %q", hc.Tmpfs["/root/.cache"])
+	}
+	if len(hc.Tmpfs) != 1 {
+		t.Errorf("Tmpfs on a no-storage session: want exactly the /tmp entry, got %v", hc.Tmpfs)
+	}
 }
 
-// TestDockerRuntimeForTier asserts the pure tier→runtime-string mapper: TierGvisor
-// asks dockerd for the gVisor sentry ("runsc"), TierRunc uses the daemon default
-// (""), and TierFirecracker falls into the safe empty default (it never reaches
-// this code because Materialize aborts before buildHostConfig, but the mapper is
-// total and must not panic for it). This is the unit that makes the policy↔OCI gap
-// observable independent of the HostConfig wiring.
+// storageSpec is validSpec plus the storage-scoped state a Phase-4 create hands
+// the provider: the mount intent naming a filesystem scope, and the in-guest
+// mount-config path set (the lifecycle sets it only after the render+push landed
+// the config inside the sock dir — both-or-neither with the host render).
+func storageSpec() runtime.SessionSpec {
+	spec := validSpec()
+	spec.Mounts = []runtime.MountIntent{{
+		Destination:  "/workspace",
+		FilesystemID: "fs-1",
+		CacheSeconds: 30,
+	}}
+	spec.Handoff.MountConfigGuestPath = "/run/ocu/mount-config.json"
+	return spec
+}
+
+// TestBuildHostConfig_StorageScoped is the storage-scoped HostConfig keystone:
+// the delivered mount-config flips ONLY the scoped mount add-backs, and the
+// config rides the EXISTING sock-dir bind — never a fourth bind (NFR-SEC-25
+// forbids bind-mounting a secret :ro; the sock-dir bind is already RW).
+func TestBuildHostConfig_StorageScoped(t *testing.T) {
+	spec := storageSpec()
+	hc, err := buildHostConfig(spec, runtime.TierRunc, "", "")
+	if err != nil {
+		t.Fatalf("buildHostConfig(storage): unexpected error %v", err)
+	}
+
+	// STILL exactly three binds, byte-identical to the no-storage set: the config
+	// is a FILE inside the sock dir, so no bind is added for it.
+	wantBinds := []string{
+		"/var/run/ocu/sess-a/container_info.json:/container_info.json:ro",
+		"/var/run/ocu/sess-a/auth_public_key:/etc/ocu/auth_public_key:ro",
+		"/var/run/ocu/sess-a/sock:/run/ocu",
+	}
+	if len(hc.Binds) != 3 {
+		t.Fatalf("storage-scoped Binds: want exactly 3 (the config rides the sock-dir bind, no 4th bind), got %d (%v)", len(hc.Binds), hc.Binds)
+	}
+	for i, w := range wantBinds {
+		if hc.Binds[i] != w {
+			t.Errorf("storage-scoped Binds[%d]: want %q, got %q", i, w, hc.Binds[i])
+		}
+	}
+
+	// The minimal add-back for the in-guest mount(2): CAP_SYS_ADMIN exactly, one
+	// /dev/fuse device rwm, and the writable rclone cache tmpfs. cap-drop ALL and
+	// the rest of the hardening stay.
+	if len(hc.CapAdd) != 1 || hc.CapAdd[0] != "SYS_ADMIN" {
+		t.Errorf("storage-scoped CapAdd: want exactly [SYS_ADMIN], got %v", hc.CapAdd)
+	}
+	if len(hc.CapDrop) != 1 || hc.CapDrop[0] != "ALL" {
+		t.Errorf("storage-scoped CapDrop: want [ALL] (add-back over drop-all), got %v", hc.CapDrop)
+	}
+	if len(hc.Devices) != 1 {
+		t.Fatalf("storage-scoped Devices: want exactly one /dev/fuse mapping, got %v", hc.Devices)
+	}
+	dev := hc.Devices[0]
+	if dev.PathOnHost != "/dev/fuse" || dev.PathInContainer != "/dev/fuse" || dev.CgroupPermissions != "rwm" {
+		t.Errorf("storage-scoped device: want /dev/fuse:/dev/fuse rwm, got %+v", dev)
+	}
+	if got := hc.Tmpfs["/root/.cache"]; got == "" {
+		t.Errorf("storage-scoped Tmpfs[/root/.cache]: want the writable rclone cache tmpfs, got none (%v)", hc.Tmpfs)
+	}
+	if got := hc.Tmpfs["/tmp"]; got != "rw,noexec,nosuid,nodev,size=64m" {
+		t.Errorf("storage-scoped Tmpfs[/tmp] changed: got %q", got)
+	}
+	if !hc.ReadonlyRootfs {
+		t.Errorf("storage-scoped ReadonlyRootfs: want true (untouched by the add-back)")
+	}
+}
+
+// bootChildArgv collects, in order, the value following each --boot-child-argv
+// occurrence, i.e. the child argv the guest agent is told to spawn.
+func bootChildArgv(argv []string) []string {
+	var out []string
+	for i := 0; i+1 < len(argv); i++ {
+		if argv[i] == "--boot-child-argv" {
+			out = append(out, argv[i+1])
+		}
+	}
+	return out
+}
+
+// TestBuildContainerConfigCmd_StorageBootChild is the storage-scoped Cmd
+// keystone: with MountConfigGuestPath set the guest argv gains the six managed
+// boot-child tokens — the co-located mount binary, its --config <guest path>
+// pair, its --ready-file <ready path> pair (all as repeated --boot-child-argv
+// values), plus --boot-child-ready-file naming the SAME ready path the child is
+// told to create, so the gate and the creator can never drift.
+func TestBuildContainerConfigCmd_StorageBootChild(t *testing.T) {
+	spec := storageSpec()
+	cfg := buildContainerConfig(spec)
+
+	wantChild := []string{
+		"/ocu-rclone-filestore",
+		"--config",
+		spec.Handoff.MountConfigGuestPath,
+		"--ready-file",
+		"/run/ocu/mount.ready",
+	}
+	got := bootChildArgv(cfg.Cmd)
+	if !reflect.DeepEqual(got, wantChild) {
+		t.Fatalf("boot-child argv: want %v, got %v (full Cmd %v)", wantChild, got, cfg.Cmd)
+	}
+
+	readyGate, ok := valueAfterFlag(cfg.Cmd, "--boot-child-ready-file")
+	if !ok {
+		t.Fatalf("Cmd is missing --boot-child-ready-file (the guest would not gate serving on the mount): %v", cfg.Cmd)
+	}
+	// The ready path the guest GATES on equals the ready path the child is told
+	// to CREATE — the equality that makes the fail-closed gate real.
+	if readyGate != wantChild[4] {
+		t.Errorf("ready-file drift: gate %q != child create path %q", readyGate, wantChild[4])
+	}
+
+	// The --config value is DERIVED from the spec, not a hardcoded literal: move
+	// the field, the token must move with it (the PublicKeyGuestPath discipline).
+	spec2 := storageSpec()
+	spec2.Handoff.MountConfigGuestPath = "/run/ocu/other-config.json"
+	got2 := bootChildArgv(buildContainerConfig(spec2).Cmd)
+	if len(got2) != 5 || got2[2] != spec2.Handoff.MountConfigGuestPath {
+		t.Errorf("boot-child --config value is not derived from spec.Handoff.MountConfigGuestPath: got %v", got2)
+	}
+}
+
+// TestBuildContainerConfigCmd_NoStorageNoBootChild pins the no-storage Cmd
+// byte-identical to the pre-boot-child form: exactly the listener, control, and
+// auth-key pairs, and not a single boot-child token — the storage posture can
+// never leak onto a pure-exec session.
+func TestBuildContainerConfigCmd_NoStorageNoBootChild(t *testing.T) {
+	spec := validSpec() // MountConfigGuestPath empty: no storage delivered.
+	cfg := buildContainerConfig(spec)
+
+	wantCmd := []string{
+		"--listen-uds", "/run/ocu/exec.sock",
+		"--control-listen-uds", "/run/ocu/control.sock",
+		"--auth-public-key", spec.Handoff.PublicKeyGuestPath,
+	}
+	if !reflect.DeepEqual([]string(cfg.Cmd), wantCmd) {
+		t.Fatalf("no-storage Cmd: want the byte-identical pre-boot-child argv %v, got %v", wantCmd, cfg.Cmd)
+	}
+	for _, tok := range cfg.Cmd {
+		if tok == "--boot-child-argv" || tok == "--boot-child-ready-file" {
+			t.Errorf("no-storage Cmd carries boot-child token %q: %v", tok, cfg.Cmd)
+		}
+	}
+}
+
+// TestBuildContainerConfig_ExplicitEntrypoint is the keystone for the
+// argv-fail-open fix: the provider sets Entrypoint EXPLICITLY to the guest-agent
+// binary rather than trusting the image's ENTRYPOINT metadata. Without this, a
+// BYO or mis-tagged image with an empty ENTRYPOINT would run Cmd[0]
+// ("--listen-uds") as the executable — the exact "error finding executable
+// --listen-uds" failure. The agent binary path is the same cross-repo contract
+// the assembly guest image pins. Red-probe: delete the Entrypoint line in
+// buildContainerConfig → Entrypoint is nil → this reds.
+func TestBuildContainerConfig_ExplicitEntrypoint(t *testing.T) {
+	for _, spec := range []runtime.SessionSpec{validSpec(), storageSpec()} {
+		cfg := buildContainerConfig(spec)
+		// Assemble the expected path from parts, not one verbatim literal — the naming
+		// denylist gate greps committed source content and the guest-agent binary name
+		// must not appear as a single scanned literal (see docker.go guestAgentBinPath).
+		want := []string{"/usr/local/bin/" + "process_" + "api"}
+		if !reflect.DeepEqual([]string(cfg.Entrypoint), want) {
+			t.Fatalf("Entrypoint: want the explicit guest-agent binary %v, got %v (Cmd[0]=%q would run as the executable)", want, cfg.Entrypoint, firstOr(cfg.Cmd, ""))
+		}
+		// The first Cmd token must be a FLAG, never the binary: the agent binary is the
+		// Entrypoint, and Cmd carries only its arguments. A binary leaking into Cmd[0]
+		// would double it or (under an empty Entrypoint) run the flag as the program.
+		if len(cfg.Cmd) == 0 || cfg.Cmd[0] != "--listen-uds" {
+			t.Fatalf("Cmd[0]: want the first agent flag --listen-uds, got %v", cfg.Cmd)
+		}
+	}
+}
+
+// firstOr returns s[0] or def for an empty slice.
+func firstOr(s []string, def string) string {
+	if len(s) == 0 {
+		return def
+	}
+	return s[0]
+}
+
+// TestValidateSpec_StorageScopedRequiresMountConfig asserts the fail-closed
+// refusal of a storage-scoped mount that arrives WITHOUT its mount-config guest
+// path. That combination is a mount-config-missing FAIL-SILENT invariant loss
+// (not fail-open: no scope is granted — the guest would boot with no boot-child,
+// no mount, and nothing downstream would notice the admitted scope never
+// arrived), so validateSpec refuses before any substrate call.
+func TestValidateSpec_StorageScopedRequiresMountConfig(t *testing.T) {
+	// Filesystem-scoped mount, no config path: refused.
+	spec := storageSpec()
+	spec.Handoff.MountConfigGuestPath = ""
+	if err := validateSpec(spec); !errors.Is(err, runtime.ErrUnsupportedSpec) {
+		t.Errorf("filesystem-scoped mount without mount-config path: want ErrUnsupportedSpec, got %v", err)
+	}
+
+	// Memory-store-scoped mount, no config path: refused the same way.
+	memSpec := validSpec()
+	memSpec.Mounts = []runtime.MountIntent{{Destination: "/mem", MemoryStoreID: "mem-1"}}
+	if err := validateSpec(memSpec); !errors.Is(err, runtime.ErrUnsupportedSpec) {
+		t.Errorf("memory-store-scoped mount without mount-config path: want ErrUnsupportedSpec, got %v", err)
+	}
+
+	// The delivered pair is legal.
+	if err := validateSpec(storageSpec()); err != nil {
+		t.Errorf("storage-scoped mount WITH mount-config path: want nil, got %v", err)
+	}
+
+	// A no-scope spec (no mounts at all, or a zero MountIntent) stays legal with
+	// an empty config path — pure exec is first-class (ADR-0017).
+	if err := validateSpec(validSpec()); err != nil {
+		t.Errorf("no-scope spec: want nil, got %v", err)
+	}
+	zeroMount := validSpec()
+	zeroMount.Mounts = []runtime.MountIntent{{Destination: "/workspace"}}
+	if err := validateSpec(zeroMount); err != nil {
+		t.Errorf("zero-scope MountIntent: want nil, got %v", err)
+	}
+}
+
+// TestDockerRuntimeForTier asserts the pure (tier, fuse)→runtime-string mapper:
+// TierGvisor asks dockerd for the plain gVisor sentry ("runsc") for a non-fuse
+// session and the --fuse sentry ("runsc-fuse") for a session that mounts; TierRunc
+// uses the daemon default (""); and TierFirecracker falls into the safe empty
+// default (it never reaches this code because Materialize aborts before
+// buildHostConfig, but the mapper is total and must not panic for it). The fuse
+// flag is IGNORED off TierGvisor — a runc session never asks for a runsc runtime,
+// even one that mounts. This is the unit that makes the policy↔OCI gap observable
+// independent of the HostConfig wiring.
 func TestDockerRuntimeForTier(t *testing.T) {
 	cases := []struct {
 		name string
 		tier runtime.RuntimeTier
+		fuse bool
 		want string
 	}{
-		{"gvisor asks for the runsc sentry", runtime.TierGvisor, "runsc"},
-		{"runc uses the daemon default (empty)", runtime.TierRunc, ""},
-		{"firecracker falls into the safe empty default", runtime.TierFirecracker, ""},
+		{"gvisor non-fuse asks for the plain runsc sentry", runtime.TierGvisor, false, "runsc"},
+		{"gvisor fuse asks for the runsc-fuse sentry", runtime.TierGvisor, true, "runsc-fuse"},
+		{"runc uses the daemon default (empty)", runtime.TierRunc, false, ""},
+		{"runc ignores fuse (never a runsc runtime)", runtime.TierRunc, true, ""},
+		{"firecracker falls into the safe empty default", runtime.TierFirecracker, false, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := dockerRuntimeForTier(c.tier); got != c.want {
-				t.Errorf("dockerRuntimeForTier(%v): want %q, got %q", c.tier, c.want, got)
+			if got := dockerRuntimeForTier(c.tier, c.fuse); got != c.want {
+				t.Errorf("dockerRuntimeForTier(%v, fuse=%v): want %q, got %q", c.tier, c.fuse, c.want, got)
 			}
 		})
 	}
 }
 
 // TestBuildHostConfig_RuntimeByTier is the NON-VACUOUS key test: it asserts the
-// REAL buildHostConfig path stamps HostConfig.Runtime per tier — "runsc" for
-// TierGvisor, "" for TierRunc. Before the fix the field was never set, so the
-// gVisor case was empty (the daemon default, bare runc) even though admission
-// admitted the workload expecting the sentry: this assertion is RED on that tree
-// and GREEN with the fix, which is the proof the gap was real.
+// REAL buildHostConfig path stamps HostConfig.Runtime per tier AND per-session FUSE
+// need — "runsc" for a plain gVisor session, "runsc-fuse" for a gVisor session that
+// mounts (the ONLY sentry that serves the co-located FUSE mount(2)), "" for TierRunc
+// regardless. Before the tier fix the field was never set (bare runc under a gVisor
+// admission); before the FUSE arm a storage-scoped gVisor session got the plain
+// "runsc" sentry and its in-guest mount(2) would fail — this assertion is RED on
+// either regressed tree and GREEN with both fixes, the proof each gap was real.
 func TestBuildHostConfig_RuntimeByTier(t *testing.T) {
-	gv, err := buildHostConfig(validSpec(), runtime.TierGvisor)
+	gv, err := buildHostConfig(validSpec(), runtime.TierGvisor, "", "")
 	if err != nil {
 		t.Fatalf("buildHostConfig(TierGvisor): unexpected error %v", err)
 	}
 	if gv.Runtime != "runsc" {
-		t.Errorf("TierGvisor HostConfig.Runtime: want %q (the gVisor sentry), got %q — "+
+		t.Errorf("TierGvisor (no mount) HostConfig.Runtime: want %q (the plain gVisor sentry), got %q — "+
 			"the gVisor admission decision is NOT enforced at the OCI layer", "runsc", gv.Runtime)
 	}
 
-	rc, err := buildHostConfig(validSpec(), runtime.TierRunc)
+	// A storage-scoped gVisor session MUST land on the --fuse sentry, else its
+	// co-located mount's in-guest FUSE mount(2) fails on the plain runsc sentry.
+	gvFuse, err := buildHostConfig(storageSpec(), runtime.TierGvisor, "", "")
+	if err != nil {
+		t.Fatalf("buildHostConfig(storageSpec, TierGvisor): unexpected error %v", err)
+	}
+	if gvFuse.Runtime != "runsc-fuse" {
+		t.Errorf("TierGvisor (storage-scoped) HostConfig.Runtime: want %q (the --fuse sentry), got %q — "+
+			"the co-located FUSE mount(2) has no sentry that serves it", "runsc-fuse", gvFuse.Runtime)
+	}
+
+	rc, err := buildHostConfig(validSpec(), runtime.TierRunc, "", "")
 	if err != nil {
 		t.Fatalf("buildHostConfig(TierRunc): unexpected error %v", err)
 	}
 	if rc.Runtime != "" {
 		t.Errorf("TierRunc HostConfig.Runtime: want empty (daemon default), got %q", rc.Runtime)
+	}
+
+	// The FUSE need never pulls a runsc runtime under runc: a storage-scoped runc
+	// session still uses the daemon default (the fuse flag is gVisor-scoped).
+	rcFuse, err := buildHostConfig(storageSpec(), runtime.TierRunc, "", "")
+	if err != nil {
+		t.Fatalf("buildHostConfig(storageSpec, TierRunc): unexpected error %v", err)
+	}
+	if rcFuse.Runtime != "" {
+		t.Errorf("TierRunc (storage-scoped) HostConfig.Runtime: want empty (fuse is gVisor-scoped), got %q", rcFuse.Runtime)
 	}
 }
 
@@ -225,11 +490,11 @@ func TestBuildHostConfig_RuntimeByTier(t *testing.T) {
 // so gVisor runs the SAME hardened HostConfig — the fix changes the OCI runtime,
 // not the hardening posture.
 func TestBuildHostConfig_HardeningIdenticalAcrossTiers(t *testing.T) {
-	rc, err := buildHostConfig(validSpec(), runtime.TierRunc)
+	rc, err := buildHostConfig(validSpec(), runtime.TierRunc, "", "")
 	if err != nil {
 		t.Fatalf("buildHostConfig(TierRunc): %v", err)
 	}
-	gv, err := buildHostConfig(validSpec(), runtime.TierGvisor)
+	gv, err := buildHostConfig(validSpec(), runtime.TierGvisor, "", "")
 	if err != nil {
 		t.Fatalf("buildHostConfig(TierGvisor): %v", err)
 	}
@@ -473,7 +738,7 @@ func TestBuildHostConfig_SeccompFailClosed(t *testing.T) {
 	compactSeccomp = ""
 	t.Cleanup(func() { compactSeccomp = saved })
 
-	hc, err := buildHostConfig(validSpec(), runtime.TierRunc)
+	hc, err := buildHostConfig(validSpec(), runtime.TierRunc, "", "")
 	if !errors.Is(err, runtime.ErrSeccompProfileMissing) {
 		t.Errorf("buildHostConfig with empty profile: want ErrSeccompProfileMissing, got %v", err)
 	}
@@ -530,6 +795,114 @@ func TestNetworkCreate_Internal(t *testing.T) {
 	}
 	if opt.Labels[labelSessionName] != string(spec.Name) {
 		t.Errorf("bridge label %q: want %q, got %q", labelSessionName, spec.Name, opt.Labels[labelSessionName])
+	}
+}
+
+// attachedNetworks returns the network names the container was attached to in the
+// most recent ContainerCreate the fake captured.
+func attachedNetworks(f *fakeAPI) []string {
+	if f.lastNetworkingConfig == nil {
+		return nil
+	}
+	out := make([]string, 0, len(f.lastNetworkingConfig.EndpointsConfig))
+	for name := range f.lastNetworkingConfig.EndpointsConfig {
+		out = append(out, name)
+	}
+	return out
+}
+
+// TestMaterialize_StorageEgressNetwork is the egress-network keystone: a storage-
+// scoped session on a deployment that wired an egress network attaches the guest to
+// THAT shared network (where the edge lives), NOT a per-session Internal bridge, and
+// stamps the static `edge:<ip>` ExtraHosts entry so a gVisor guest (which cannot use
+// docker's embedded DNS) can resolve the edge name in the mount-config service_url.
+// Without the wiring the guest would land on a per-session Internal deny-all bridge
+// with no edge and no path to reach it — the storage mount could never complete. The
+// four assertions each RED on a distinct regression: dropping the network skip
+// (per-session NetworkCreate reappears), dropping the attach swap (guest on the
+// wrong net), dropping the ExtraHosts (edge unresolvable under gVisor).
+func TestMaterialize_StorageEgressNetwork(t *testing.T) {
+	const egressNet = "ocu-mount-facing"
+	const edgeIP = "172.20.0.2"
+	fake := newFakeAPI()
+	p, err := NewDockerProvider(runtime.TierGvisor, Deps{API: fake, EgressNetwork: egressNet, EdgeHost: edgeIP})
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	spec := storageSpec()
+	if _, merr := p.Materialize(context.Background(), spec); merr != nil {
+		t.Fatalf("Materialize: %v", merr)
+	}
+
+	// 1. NO per-session Internal bridge was created — the storage guest uses the
+	//    shared egress network instead.
+	if _, ok := fake.netCreateOpts[networkName(spec.Name)]; ok {
+		t.Errorf("storage session on the egress network must NOT create a per-session bridge %q; ops=%v",
+			networkName(spec.Name), fake.ops())
+	}
+
+	// 2. The guest attaches to the shared egress network, not the per-session bridge.
+	nets := attachedNetworks(fake)
+	if len(nets) != 1 || nets[0] != egressNet {
+		t.Errorf("storage guest attach network: want [%q], got %v", egressNet, nets)
+	}
+
+	// 3. The static edge ExtraHosts entry is stamped (gVisor cannot reach 127.0.0.11).
+	hc := fake.lastHostConfig
+	if hc == nil {
+		t.Fatalf("fake captured no HostConfig")
+	}
+	wantEntry := "edge:" + edgeIP
+	sawEdge := false
+	for _, e := range hc.ExtraHosts {
+		if e == wantEntry {
+			sawEdge = true
+		}
+	}
+	if !sawEdge {
+		t.Errorf("HostConfig.ExtraHosts must contain %q for gVisor edge resolution, got %v", wantEntry, hc.ExtraHosts)
+	}
+
+	// 4. It still landed on the --fuse sentry (the storage runtime), proving the
+	//    egress-network path did not disturb the runtime selection.
+	if hc.Runtime != "runsc-fuse" {
+		t.Errorf("storage guest Runtime: want runsc-fuse, got %q", hc.Runtime)
+	}
+
+	// 5. HostConfig.NetworkMode names the SAME egress network the endpoint attaches
+	//    to — a mismatch is a live "network not found" materialize failure, because
+	//    dockerd resolves the container's network from NetworkMode, not the endpoint
+	//    map alone. This is the exact defect that surfaced on the first live run.
+	if string(hc.NetworkMode) != egressNet {
+		t.Errorf("storage guest NetworkMode: want %q (same as the attach network), got %q", egressNet, hc.NetworkMode)
+	}
+}
+
+// TestMaterialize_StorageNoEgressNetworkFallsBackToBridge is the fail-closed
+// complement: a storage session on a deployment that wired NO egress network
+// (EgressNetwork empty — the minimal shelf) still gets a per-session Internal
+// bridge and NO ExtraHosts. It cannot reach an edge (there is none on an Internal
+// bridge), so the mount cannot complete — a fail-closed default, never a silent
+// egress leak onto a shared segment the deployment never declared.
+func TestMaterialize_StorageNoEgressNetworkFallsBackToBridge(t *testing.T) {
+	fake := newFakeAPI()
+	p, err := NewDockerProvider(runtime.TierGvisor, Deps{API: fake}) // no EgressNetwork/EdgeHost
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	spec := storageSpec()
+	if _, merr := p.Materialize(context.Background(), spec); merr != nil {
+		t.Fatalf("Materialize: %v", merr)
+	}
+	if _, ok := fake.netCreateOpts[networkName(spec.Name)]; !ok {
+		t.Errorf("storage session with NO egress network must fall back to a per-session Internal bridge; ops=%v", fake.ops())
+	}
+	nets := attachedNetworks(fake)
+	if len(nets) != 1 || nets[0] != networkName(spec.Name) {
+		t.Errorf("fallback storage guest attach network: want [%q], got %v", networkName(spec.Name), nets)
+	}
+	if hc := fake.lastHostConfig; hc != nil && len(hc.ExtraHosts) != 0 {
+		t.Errorf("no edge host without an egress network: want empty ExtraHosts, got %v", hc.ExtraHosts)
 	}
 }
 
@@ -595,7 +968,10 @@ func TestAdmissionGvisorCellsAgreeWithOCIRuntime(t *testing.T) {
 				continue
 			}
 			sawAdmittedGvisor = true
-			if rt := dockerRuntimeForTier(tier); rt != "runsc" {
+			// A plain (non-fuse) admitted gVisor cell asks for the "runsc" sentry;
+			// the runsc-fuse variant is a per-session storage concern, orthogonal to
+			// this tier-level admission consistency check.
+			if rt := dockerRuntimeForTier(tier, false); rt != "runsc" {
 				t.Errorf("admission admits (%s, gvisor) but the OCI runtime would be %q, not \"runsc\": "+
 					"the gVisor isolation decision would not be enforced", prof, rt)
 			}

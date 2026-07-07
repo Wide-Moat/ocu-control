@@ -176,6 +176,10 @@ type recordingProvider struct {
 	nextRuntimeID int
 	// reconcileOrphans is the slice Reconcile returns (substrate orphans to sweep).
 	reconcileOrphans []runtime.Sandbox
+	// lastSpec is the most recent SessionSpec Materialize received, so a test can
+	// assert what the lifecycle actually handed across the provider seam (e.g. the
+	// storage-scoped MountConfigGuestPath wiring).
+	lastSpec runtime.SessionSpec
 }
 
 func newRecordingProvider() *recordingProvider {
@@ -186,6 +190,7 @@ func (p *recordingProvider) Materialize(ctx context.Context, spec runtime.Sessio
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.materializeCalls++
+	p.lastSpec = spec
 	if err := ctx.Err(); err != nil {
 		return runtime.Sandbox{}, fmt.Errorf("%w: %w", runtime.ErrMaterialize, err)
 	}
@@ -224,6 +229,13 @@ func (p *recordingProvider) liveCount() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.live)
+}
+
+// materializedSpec returns the most recent SessionSpec Materialize received.
+func (p *recordingProvider) materializedSpec() runtime.SessionSpec {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastSpec
 }
 
 // gracefulStops returns how many GracefulStop calls the finalizer has made, so an

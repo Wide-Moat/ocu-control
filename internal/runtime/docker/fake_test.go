@@ -82,6 +82,12 @@ type fakeAPI struct {
 	// would send to the daemon (e.g. the tier-derived Runtime string). It is an
 	// additive observation field — it changes no recorded-call behavior.
 	lastHostConfig *container.HostConfig
+
+	// lastNetworkingConfig captures the *network.NetworkingConfig of the MOST RECENT
+	// ContainerCreate, so a test can assert which network the guest was attached to
+	// (the per-session Internal bridge vs the shared egress network). Additive
+	// observation only.
+	lastNetworkingConfig *network.NetworkingConfig
 }
 
 func newFakeAPI() *fakeAPI {
@@ -163,11 +169,12 @@ func (f *fakeAPI) NetworkRemove(_ context.Context, networkID string) error {
 	return nil
 }
 
-func (f *fakeAPI) ContainerCreate(_ context.Context, _ *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig, _ *ocispecPlatform, name string) (container.CreateResponse, error) {
+func (f *fakeAPI) ContainerCreate(_ context.Context, _ *container.Config, hostConfig *container.HostConfig, netConfig *network.NetworkingConfig, _ *ocispecPlatform, name string) (container.CreateResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("ContainerCreate", name)
 	f.lastHostConfig = hostConfig
+	f.lastNetworkingConfig = netConfig
 	if err := f.errOn["ContainerCreate"]; err != nil {
 		return container.CreateResponse{}, err
 	}

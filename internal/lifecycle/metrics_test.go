@@ -54,6 +54,7 @@ func newManagerWithRecorder(t *testing.T, rec lifecycle.Recorder) *lifecycle.Man
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 		Metrics:       rec,
 	})

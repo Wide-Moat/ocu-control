@@ -73,6 +73,17 @@ const destroyGrace runtime.Duration = 5
 // can never seed a Key or touch host state.
 var ErrUnattested = errors.New("lifecycle: caller identity unattested, refused (fail-closed)")
 
+// ErrInvalidArgument marks a create refused because the REQUEST itself (body +
+// deployment-wide config, never per-tenant or store state) does not resolve to a
+// runnable session. The gateway maps it to HTTP 400: it is the same
+// request-derived, client-error class as the ingress toRequest() decode refusal,
+// evaluated after image resolution. It is SAFE to surface (unlike the 409/404
+// collapse that hides cross-tenant existence) precisely because it consults no
+// tenant state — so it can never be an existence oracle. Contract: the Manager
+// wraps ONLY request-derivable failures in this sentinel; an error that touched
+// the store or another tenant's row must NEVER be wrapped here.
+var ErrInvalidArgument = errors.New("lifecycle: invalid create argument")
+
 // CreateInput is what an ingress hands the Manager. It carries NO trusted identity:
 // the authority is the host-derived AuthenticatedCaller the ingress resolved, and
 // SessionHint is explicitly a HINT — it seeds the human-readable host-minted handle,
@@ -118,6 +129,24 @@ type ManagerDeps struct {
 	Profile admission.WorkloadProfile
 	// Tier is the deployment-wide isolation tier (fixed).
 	Tier runtime.RuntimeTier
+	// DefaultImage is the deployment-declared guest image a create runs when the
+	// body names none — the inject-at-materialize default of the ADR-0020
+	// provisioning ladder (image is deployment configuration, never caller data).
+	// The body image, when set, is an override. Create resolves the effective image
+	// from this default BEFORE admission, so admission validates the resolved value
+	// and an empty result is refused as a clean invalid-argument, never a cryptic
+	// rolled-back materialize. Empty here is a valid minimal-shelf posture: a create
+	// that also names no body image is then refused (fail-closed, no silent "").
+	DefaultImage string
+	// AllowedImages is the deployment-declared allow-list of guest images a create
+	// BODY may override the default with (ADR-0020 BYO rung). Membership is EXACT
+	// string match — no glob or prefix (image refs carry tags/digests a prefix rule
+	// would foot-gun). The DefaultImage is IMPLICITLY allowed (the operator already
+	// trusted it), so a body naming the default is always equivalent to an empty
+	// body. Empty here is deny-by-default: only the default is allowed, so a body
+	// override is refused unless the operator explicitly lists it. The solo
+	// one-command path names no body image, so it never touches this gate.
+	AllowedImages []string
 
 	// Signer is the SOLE Storage-JWT custodian the mint stage calls. It mints the
 	// weak, edge-only Storage-JWT and records its jti against the host-derived
@@ -245,6 +274,16 @@ type Manager struct {
 	profile  admission.WorkloadProfile
 	tier     runtime.RuntimeTier
 
+	// defaultImage is the deployment-declared guest image a create falls back to
+	// when the body names none (ADR-0020 inject-at-materialize). Resolved in Create
+	// before admission; empty + no body image is a fail-closed refusal.
+	defaultImage string
+	// allowedImages is the exact-match allow-list a create BODY may override the
+	// default with (deny-by-default: a body image not here AND not equal to
+	// defaultImage is refused). Built as a set at construction so the Create check is
+	// O(1); the defaultImage is added implicitly.
+	allowedImages map[string]bool
+
 	// Storage-JWT custody + mount-config provisioning (Phase 4). signer/push are nil
 	// on the Phase-3 minimal shelf, which the mint+render stages skip cleanly.
 	signer        *cred.Signer
@@ -290,6 +329,8 @@ func NewManager(deps ManagerDeps) *Manager {
 		profile:  deps.Profile,
 		tier:     deps.Tier,
 
+		defaultImage: deps.DefaultImage,
+
 		signer:        deps.Signer,
 		push:          deps.Push,
 		serviceURL:    deps.ServiceURL,
@@ -301,6 +342,20 @@ func NewManager(deps ManagerDeps) *Manager {
 		execVerifyKey: deps.ExecVerifyKey,
 		metrics:       deps.Metrics,
 		events:        deps.Events,
+	}
+	// Build the body-image override allow-set: the explicitly listed images plus the
+	// deployment default (implicitly allowed — the operator already trusted it by
+	// setting -guest-image; requiring it to be re-listed would 400 a body that names
+	// the same ref as the empty-body default). An empty list yields a set holding only
+	// the default: deny-by-default for overrides.
+	m.allowedImages = make(map[string]bool, len(deps.AllowedImages)+1)
+	if deps.DefaultImage != "" {
+		m.allowedImages[deps.DefaultImage] = true
+	}
+	for _, img := range deps.AllowedImages {
+		if img != "" {
+			m.allowedImages[img] = true
+		}
 	}
 	// The mint + render/push stages slot AFTER stageHandoff and BEFORE
 	// stageMaterialize: the host-owned bind must carry the mount-config before
@@ -380,6 +435,30 @@ type createState struct {
 // orphan — then returns the typed stage error, leaving no row, counter, container,
 // or sockdir.
 func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow, error) {
+	// Resolve the effective guest image BEFORE admission, so admission and every
+	// later stage see the deployment-injected default, and a request that resolves
+	// to no image is refused as a request-derived invalid argument (clean 400) here
+	// — never as a cryptic rolled-back materialize below the runtime seam. The body
+	// image (in.Image) is the override; the deployment default fills an empty body.
+	// This is request-derived only (body + fixed config), so wrapping it in
+	// ErrInvalidArgument leaks no tenant state.
+	if in.Image == "" {
+		in.Image = m.defaultImage
+	}
+	if in.Image == "" {
+		return state.SessionRow{}, fmt.Errorf("%w: no guest image (body named none and no deployment default is configured)", ErrInvalidArgument)
+	}
+	// Gate the resolved image against the deployment allow-set (ADR-0020 BYO rung):
+	// the default is implicitly a member (resolved above), so an empty body always
+	// passes; a body override that is not listed is refused as a request-derived
+	// invalid argument (clean 400) HERE, before admission — an untrusted MCP caller
+	// cannot name an arbitrary image. Deny-by-default: an empty allow-list admits only
+	// the default. This consults only the request image and fixed config, so wrapping
+	// it in ErrInvalidArgument leaks no tenant state.
+	if !m.allowedImages[in.Image] {
+		return state.SessionRow{}, fmt.Errorf("%w: guest image %q is not in the deployment allow-list", ErrInvalidArgument, in.Image)
+	}
+
 	st := &createState{in: in}
 
 	// Idempotent-create guard: a gateway that reuses a stable per-chat session hint
@@ -724,87 +803,126 @@ func (m *Manager) ReleaseConcurrency(ctx context.Context, tenant state.Identity)
 // registry.ErrEnumerationUnsupported, which is fail-closed (the sweep refuses to
 // claim it reconciled rows it could not even list).
 func (m *Manager) Reconcile(ctx context.Context) error {
-	// Step 1: force-kill every substrate orphan the provider still holds. The
-	// finalizer is detached and bounded internally; an already-gone container is
-	// idempotent.
-	orphans, err := m.provider.Reconcile(ctx)
+	// ONE pre-sweep snapshot of the live substrate. Both diff-sets below evaluate
+	// against THIS listing, taken BEFORE any kill: snapshotting after the kills would
+	// make every row's container look gone and self-inflict a Lost reclaim on every
+	// session (the wedge in disguise). Session rows are durable, containers ephemeral —
+	// the reconciler restores the two-way agreement between them.
+	live, err := m.provider.Reconcile(ctx)
 	if err != nil {
-		return fmt.Errorf("lifecycle: reconcile list orphans: %w", err)
+		return fmt.Errorf("lifecycle: reconcile list substrate: %w", err)
 	}
-	finalizer := m.provider.Teardown()
-	for i := range orphans {
-		if err := finalizer.ForceKill(ctx, orphans[i]); err != nil {
-			if !errors.Is(err, runtime.ErrNoSuchContainer) {
-				return fmt.Errorf("lifecycle: reconcile force-kill orphan %q: %w", orphans[i].Name, err)
-			}
-		}
+	liveByName := make(map[runtime.SessionName]runtime.Sandbox, len(live))
+	for i := range live {
+		liveByName[live[i].Name] = live[i]
 	}
 
-	// Step 2: reclaim crashed RESERVED rows so the level counter is corrected. A
-	// RESERVED row whose create crashed before Commit must be Released and its
-	// concurrent slot returned; an ACTIVE row is a live session and is left alone.
 	rows, err := m.reg.ReservedAndActiveKeys(ctx)
 	if err != nil {
 		return fmt.Errorf("lifecycle: reconcile list rows: %w", err)
 	}
+	rowKeys := make(map[runtime.SessionName]bool, len(rows))
 	for i := range rows {
-		if rows[i].State != state.StateReserved {
-			continue
+		rowKeys[runtime.SessionName(rows[i].Key)] = true
+	}
+
+	// Direction 1 — substrate without a LIVE row-backed session → destroy. A container
+	// whose row is absent (or already terminal) is a true orphan: crashed-mid-create
+	// residue, or a container whose row this same sweep reclaims below. A container
+	// that IS matched to a row but has EXITED (Alive false) is ALSO swept: its row is
+	// reclaimed in Direction 2, so leaving the dead container behind would trade the
+	// slot leak for a container-garbage leak. Only a RUNNING container matched to a row
+	// is a live session and is never killed. Force-kill is idempotent; an already-gone
+	// container is a satisfied kill.
+	finalizer := m.provider.Teardown()
+	for i := range live {
+		if rowKeys[live[i].Name] && live[i].Alive {
+			continue // matched to a row AND running: a live session, never killed
 		}
-		owner := rows[i].Owner
-		// ReservedAndActiveKeys returns the raw Store row; re-address it through the
-		// Custodian by re-deriving nothing — the row carries its own opaque key, so the
-		// reconciler releases by the row's owner identity via the Custodian's
-		// row-addressed release path.
-		if err := m.releaseReclaimed(ctx, rows[i]); err != nil {
-			return fmt.Errorf("lifecycle: reconcile release reclaimed %q: %w", rows[i].Key, err)
-		}
-		if err := m.ReleaseConcurrency(ctx, owner); err != nil {
-			return fmt.Errorf("lifecycle: reconcile release concurrency %q: %w", rows[i].Key, err)
+		if err := finalizer.ForceKill(ctx, live[i]); err != nil {
+			if !errors.Is(err, runtime.ErrNoSuchContainer) {
+				return fmt.Errorf("lifecycle: reconcile force-kill orphan %q: %w", live[i].Name, err)
+			}
 		}
 	}
 
-	// Step 3: heal any DimConcurrentSessions cell drift. The cell is a separate lock
-	// domain from the rows, moved only by +1 charge / -1 refund; a refund lost to a
-	// swallowed unwind error (an aborted create whose Receipt.Apply failed) leaves the
-	// cell ABOVE the true live count with no row to reclaim, so Step 2 cannot correct
-	// it — the counter over-counts until it wedges the tier cap with zero live rows.
-	// Recompute the truth from the rows that SURVIVE Step 2 (the ACTIVE rows; every
-	// RESERVED one was just reclaimed) and correct each tenant's cell down to that
-	// count. This makes a restart restore cell-truth regardless of past refund
-	// reliability — the cell equivalent of the row-based reclaim above. It only
-	// corrects DOWN (ReconcileConcurrent never inflates), so a genuine live session
-	// keeps its charge.
-	liveByTenant := make(map[state.Identity]int64)
+	// Direction 2 — non-terminal row without a LIVE backing container → reclaim. A
+	// RESERVED row whose create crashed before Commit, an ACTIVE row whose container
+	// vanished out-of-band (host crash, OOM-kill, external removal), OR a row whose
+	// container is still PRESENT but has EXITED, has lost its live backing resource
+	// while still holding a concurrency slot. A present-but-!Alive container is
+	// substrate-lost exactly like an absent one: the boot sweep lists exited containers
+	// too, and one must not wedge its row's slot. Reclaim: emit the system-initiated
+	// reconcile-reclaim audit event (fail-closed, NFR-SEC-72), release the row to the
+	// tombstone, and return the slot so the leak cannot wedge the tier cap. Only an
+	// ACTIVE row WITH a RUNNING container is a live session, left untouched (slot stays
+	// charged); Direction 1 above force-killed the exited container, so no garbage is
+	// left behind for the row this reclaims.
 	for i := range rows {
-		if rows[i].State == state.StateActive {
-			liveByTenant[rows[i].Owner]++
+		sb := liveByName[runtime.SessionName(rows[i].Key)]
+		if sb.Name != "" && sb.Alive {
+			continue // substrate present AND running: a live session, keep its slot
+		}
+		if err := m.reclaimOrphanRow(ctx, rows[i]); err != nil {
+			return fmt.Errorf("lifecycle: reconcile reclaim orphan row %q: %w", rows[i].Key, err)
 		}
 	}
-	// Include tenants whose only rows were reclaimed RESERVED ones (now zero live) so a
-	// cell they leaked is still healed to zero: seed each row owner at its ACTIVE count
-	// (0 for a tenant with no surviving ACTIVE row).
+
+	// Direction 3 — heal any DimConcurrentSessions cell drift. The cell is a separate
+	// lock domain from the rows, moved only by +1 charge / -1 refund; a refund lost to a
+	// swallowed unwind error (an aborted create whose Receipt.Apply failed) leaves the
+	// cell ABOVE the true live count with no row to reclaim, so Direction 2 cannot
+	// correct it — the counter over-counts until it wedges the tier cap with zero live
+	// rows. Recompute the truth from the rows that SURVIVE the sweep — an ACTIVE row
+	// WITH a live, running container — and correct each tenant's cell down to that count.
+	// A row Direction 2 just reclaimed, or an ACTIVE row whose container is gone, is NOT
+	// live and does not count. This makes a restart restore cell-truth regardless of past
+	// refund reliability. It only corrects DOWN (ReconcileConcurrent never inflates), so
+	// a genuine live session keeps its charge.
+	liveByTenant := make(map[state.Identity]int64)
 	for i := range rows {
+		sb := liveByName[runtime.SessionName(rows[i].Key)]
+		isLive := rows[i].State == state.StateActive && sb.Name != "" && sb.Alive
 		if _, seen := liveByTenant[rows[i].Owner]; !seen {
 			liveByTenant[rows[i].Owner] = 0
 		}
+		if isLive {
+			liveByTenant[rows[i].Owner]++
+		}
 	}
-	for owner, live := range liveByTenant {
-		if _, err := m.quota.ReconcileConcurrent(ctx, owner, live); err != nil {
+	for owner, liveCount := range liveByTenant {
+		if _, err := m.quota.ReconcileConcurrent(ctx, owner, liveCount); err != nil {
 			return fmt.Errorf("lifecycle: reconcile concurrency cell for %q: %w", owner.Tenant, err)
 		}
 	}
 	return nil
 }
 
-// releaseReclaimed releases one reclaimed RESERVED row through the Custodian. The
-// row carries its own opaque Store key and host-derived owner; the reconciler is not
-// audience-scoped (only the boot path and the operator kill-switch reach this), so
-// it releases by the row's own identity. Release is idempotent against an
-// already-released row, so a re-run of the reconciler never double-credits.
-func (m *Manager) releaseReclaimed(ctx context.Context, row state.SessionRow) error {
+// reclaimOrphanRow reclaims one non-terminal row whose live backing container the boot
+// sweep found absent or exited (substrate-lost). It is AUDIT-FIRST and fail-closed: the
+// system-initiated reconcile-reclaim record is emitted BEFORE the row is released, so a
+// slot returned to the tier cap is never returned un-recorded (NFR-SEC-72). It then
+// releases the row to the tombstone and returns the concurrency slot through the SAME
+// single decrement the destroy path uses. The row carries its own opaque Store key and
+// host-derived owner; the reconciler is not audience-scoped (only the boot path reaches
+// this), so it acts by the row's own identity. Release and ReleaseConcurrency are
+// idempotent, so a re-run of the reconciler never double-credits.
+func (m *Manager) reclaimOrphanRow(ctx context.Context, row state.SessionRow) error {
+	rec := audit.Record{
+		Action: audit.ActionReconcileReclaim,
+		Key:    row.Key,
+		Caller: row.Owner.Caller,
+		Tenant: row.Owner.Tenant,
+		Reason: "substrate-lost: boot reconciler found no live container for a non-terminal session row",
+	}
+	if err := m.audit.Emit(ctx, rec); err != nil {
+		return fmt.Errorf("reconcile-reclaim audit: %w", err)
+	}
 	if _, err := m.reg.ReleaseRow(ctx, row); err != nil {
-		return err
+		return fmt.Errorf("release reclaimed row: %w", err)
+	}
+	if err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {
+		return fmt.Errorf("release reclaimed concurrency: %w", err)
 	}
 	return nil
 }

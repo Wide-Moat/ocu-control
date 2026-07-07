@@ -64,6 +64,7 @@ func boundGatewayWithExec(t *testing.T, pair mtlsPair, driver lifecycle.ExecDriv
 		Audit:         audit.NewRecordingFake(),
 		Profile:       0,
 		Tier:          ocuruntime.TierRunc,
+		AllowedImages: []string{"img", "ocu/sandbox:test", "registry.example/ocu-sandbox:v1"},
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 		ExecDriver:    driver,
 	})

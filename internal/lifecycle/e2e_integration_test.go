@@ -136,11 +136,17 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 		Provider:  provider,
 		Clock:     clk,
 		// generousLimits is shared with manager_test.go in this package.
-		Quota:         quota.NewGate(store, clk, generousLimits()),
-		Handoff:       handoff.NewStager(e2eStageDir(t)),
-		Audit:         auditSink,
-		Profile:       admission.ProfileTrustedOperator,
-		Tier:          runtime.TierRunc,
+		Quota:   quota.NewGate(store, clk, generousLimits()),
+		Handoff: handoff.NewStager(e2eStageDir(t)),
+		Audit:   auditSink,
+		Profile: admission.ProfileTrustedOperator,
+		Tier:    runtime.TierRunc,
+		// The allow-list must name the image the e2e actually creates — itImage(),
+		// which honours OCU_RUNTIME_IT_IMAGE (the CI runner pins a pullable tag) and
+		// falls back to busybox — not the unit harness's fixed testGuestImage, which
+		// this create never names. Mismatched, the mount-config image gate rejects the
+		// create as ErrInvalidArgument before any backend runs.
+		AllowedImages: []string{itImage()},
 		Signer:        signer,
 		Push:          pusher,
 		ServiceURL:    testServiceURL,

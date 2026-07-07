@@ -307,7 +307,7 @@ func serve(ctx context.Context, cfg config) error {
 	// credential tree is reclaimed on teardown. The base is a deployment-fixed host
 	// config value, never a per-request body field. The revokeOutcomeAuditor wires
 	// the finalizer step-1 revoke outcome onto the durable spine as destroy evidence.
-	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, sink)
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, cfg.egressNetwork, cfg.edgeHost, sink)
 	if err != nil {
 		return err
 	}
@@ -514,6 +514,16 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		execDriver = execDriverAdapter{driver: guestexec.NewDriver(execSigner)}
 	}
 
+	// Parse the comma-separated body-image override allow-list into exact-match
+	// entries; blank fields (a trailing comma, whitespace) are dropped. The Manager
+	// adds the default implicitly, so an empty list is default-only (deny-by-default).
+	var allowedImages []string
+	for _, img := range strings.Split(cfg.guestImageAllow, ",") {
+		if trimmed := strings.TrimSpace(img); trimmed != "" {
+			allowedImages = append(allowedImages, trimmed)
+		}
+	}
+
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
 		Custodian: custodian,
 		Provider:  provider,
@@ -523,6 +533,9 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		Audit:     sink,
 		Profile:   profile,
 		Tier:      tier,
+
+		DefaultImage:  cfg.guestImage,
+		AllowedImages: allowedImages,
 
 		// Storage-JWT custody + mount-config provisioning. The Signer mints the weak
 		// Storage-JWT (recording its jti on the shared Revoker); Push delivers the
@@ -1161,7 +1174,7 @@ func (a revokeOutcomeAuditor) RecordRevokeOutcome(ctx context.Context, sess runt
 	}
 }
 
-func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, stagerBase string, sink audit.AuditSink) (runtime.RuntimeProvider, error) {
+func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, stagerBase, egressNetwork, edgeHost string, sink audit.AuditSink) (runtime.RuntimeProvider, error) {
 	switch name {
 	case "docker":
 		// The shared Revoker is the below-seam finalizer step-1 (revoke session JWT)
@@ -1171,8 +1184,13 @@ func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, s
 		// RevokeAuditor records the step-1 revoke outcome as destroy evidence; it is
 		// built HERE from the durable sink (never passed pre-wrapped) so the call site
 		// cannot hand the provider a nil auditor — the sink is fail-closed at boot, so
-		// it is always live by the time this runs.
-		p, err := docker.NewDockerProvider(tier, docker.Deps{Revoker: revoker, StagerBase: stagerBase, RevokeAuditor: revokeOutcomeAuditor{sink: sink}})
+		// it is always live by the time this runs. EgressNetwork/EdgeHost are the
+		// deployment-fixed storage-egress wiring: the network a storage-scoped guest
+		// joins to reach the edge, and the static `edge` IP a gVisor guest resolves it
+		// by (embedded DNS is unreachable from the sentry). Both empty on a non-storage
+		// or minimal-shelf deployment — every session then stays on its per-session
+		// Internal deny-all bridge.
+		p, err := docker.NewDockerProvider(tier, docker.Deps{Revoker: revoker, StagerBase: stagerBase, RevokeAuditor: revokeOutcomeAuditor{sink: sink}, EgressNetwork: egressNetwork, EdgeHost: edgeHost})
 		if err != nil {
 			return nil, fmt.Errorf("boot: construct docker provider: %w", err)
 		}

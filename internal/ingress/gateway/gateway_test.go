@@ -55,6 +55,7 @@ func newTestHandlers(t *testing.T, resolver ingress.IdentityResolver) (*gateway.
 		Audit:         audit.NewRecordingFake(),
 		Profile:       0, // ProfileTrustedOperator
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{"img", "ocu/sandbox:test", "registry.example/ocu-sandbox:v1"},
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
 	h := gateway.NewHandlers(gateway.Deps{Manager: mgr, Resolver: resolver})

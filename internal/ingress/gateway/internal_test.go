@@ -9,13 +9,17 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/registry"
 )
 
 // errUnclassified is a refusal that is neither unattested nor not-owned, so
@@ -101,6 +105,49 @@ func TestWriteServiceErrorDefaultIs409(t *testing.T) {
 	writeServiceError(rec, errUnclassified)
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("writeServiceError(unclassified) = %d; want 409", rec.Code)
+	}
+}
+
+// TestWriteServiceErrorInvalidArgumentIs400 is the keystone for the request-derived
+// invalid-argument arm: a lifecycle.ErrInvalidArgument (e.g. no resolvable guest
+// image) maps to 400, NOT the 409 default. This is the client-error class — the
+// refusal is a pure function of the request + fixed config, consults no tenant
+// state, and so is safe to surface (unlike the 409/404 collapse that hides
+// cross-tenant existence). Red-probe: delete the ErrInvalidArgument arm in
+// writeServiceError → this falls through to 409 and reds.
+func TestWriteServiceErrorInvalidArgumentIs400(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	writeServiceError(rec, lifecycle.ErrInvalidArgument)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("writeServiceError(ErrInvalidArgument) = %d; want 400", rec.Code)
+	}
+	// A not-owned refusal must STILL be 404, never collapsed into the new 400 arm —
+	// the arm is narrow (request-derived only), so it must not swallow the
+	// existence-hiding 404.
+	rec404 := httptest.NewRecorder()
+	writeServiceError(rec404, registry.ErrNotOwned)
+	if rec404.Code != http.StatusNotFound {
+		t.Fatalf("writeServiceError(ErrNotOwned) = %d; want 404 (the 400 arm must not swallow it)", rec404.Code)
+	}
+
+	// The 400 body must NOT reflect the request-derived detail the Manager wraps
+	// into the sentinel (e.g. the rejected image name, a caller-supplied value). The
+	// Manager wraps user input — `fmt.Errorf("%w: guest image %q is not in the
+	// allow-list", ErrInvalidArgument, in.Image)` — so echoing err.Error() back into
+	// the response body reflects attacker-controlled bytes to the client (a taint
+	// flow gosec flags as G705). The arm surfaces a fixed client-error string; the
+	// status code carries the class, not the raw internal detail. Red-probe: change
+	// the arm to write err.Error() → this reds on the reflected marker.
+	const attackerMarker = "reflected-injection-marker-9f3a2b"
+	wrapped := fmt.Errorf("%w: guest image %q is not in the allow-list", lifecycle.ErrInvalidArgument, attackerMarker)
+	recEcho := httptest.NewRecorder()
+	writeServiceError(recEcho, wrapped)
+	if recEcho.Code != http.StatusBadRequest {
+		t.Fatalf("writeServiceError(wrapped ErrInvalidArgument) = %d; want 400", recEcho.Code)
+	}
+	if strings.Contains(recEcho.Body.String(), attackerMarker) {
+		t.Fatalf("400 body reflects request-derived detail %q (body=%q); it must surface a fixed string, never echo caller input", attackerMarker, recEcho.Body.String())
 	}
 }
 

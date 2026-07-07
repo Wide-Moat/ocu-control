@@ -23,6 +23,12 @@ import (
 // reproducible across runs.
 var lifeStart = time.Date(2025, time.March, 4, 5, 6, 7, 0, time.UTC)
 
+// testGuestImage is the image every test create names. Harnesses put it on their
+// ManagerDeps.AllowedImages so the body-image override gate admits it — the tests
+// exercise the create pipeline, not the allow-list (TestCreateResolvesGuestImage
+// covers the gate itself).
+const testGuestImage = "registry.example/ocu-sandbox:v1"
+
 // testCaller is the host-derived caller every test create runs under (the operator
 // channel admits trusted_operator on runc/gVisor).
 var testCaller = ingress.AuthenticatedCaller{
@@ -90,6 +96,7 @@ func newHarnessWithExec(t *testing.T, execDriver lifecycle.ExecDriver) *harness 
 		Audit:         sink,
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecDriver:    execDriver,
 		ExecVerifyKey: pub32(),
 	})
@@ -109,7 +116,7 @@ func input(hint string) lifecycle.CreateInput {
 	return lifecycle.CreateInput{
 		Caller:      testCaller,
 		SessionHint: hint,
-		Image:       "registry.example/ocu-sandbox:v1",
+		Image:       testGuestImage,
 		Mount:       runtime.MountIntent{Destination: "/workspace", FilesystemID: "fs-1", ReadOnly: false, CacheSeconds: 5},
 		Egress:      runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store", FilesystemID: "fs-1"},
 		Resources:   runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
@@ -143,6 +150,154 @@ func TestCreateHappyPathBindsActiveRow(t *testing.T) {
 	if recs[0].Tenant != "tenant-a" || recs[0].Caller != "caller-1" {
 		t.Fatalf("audit identity = %q/%q, want host-derived tenant-a/caller-1", recs[0].Tenant, recs[0].Caller)
 	}
+}
+
+// TestCreateResolvesGuestImage is the keystone for the guest-image resolution fix:
+// a create whose body names NO image runs the deployment-declared DefaultImage
+// (inject-at-materialize, ADR-0020), a body image OVERRIDES the default, and a
+// create that resolves to NO image (empty body AND no default) is refused as a
+// request-derived ErrInvalidArgument BEFORE any materialize — never a cryptic
+// rolled-back container start with an empty Entrypoint. Red-probe: delete the
+// `if in.Image == "" { in.Image = m.defaultImage }` block → the no-body-image
+// subtest materializes an empty image (or the whole thing 400s), reddening here.
+func TestCreateResolvesGuestImage(t *testing.T) {
+	const deploymentDefault = "registry.example/ocu-guest:deployment-default"
+
+	newMgr := func(defaultImage string, allowed ...string) (*lifecycle.Manager, *recordingProvider) {
+		clk := state.NewFakeClock(lifeStart)
+		store := newListerStore(state.NewInMemory(clk))
+		provider := newRecordingProvider()
+		mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+			Custodian:     registry.NewCustodian(store),
+			Provider:      provider,
+			Clock:         clk,
+			Quota:         quota.NewGate(store, clk, generousLimits()),
+			Handoff:       newFaultStager(t.TempDir()),
+			Audit:         audit.NewRecordingFake(),
+			Profile:       admission.ProfileTrustedOperator,
+			Tier:          runtime.TierRunc,
+			DefaultImage:  defaultImage,
+			AllowedImages: allowed,
+			ExecVerifyKey: pub32(),
+		})
+		return mgr, provider
+	}
+
+	t.Run("empty body image runs the deployment default", func(t *testing.T) {
+		mgr, provider := newMgr(deploymentDefault)
+		in := input("no-image")
+		in.Image = "" // body names none
+		if _, err := mgr.Create(context.Background(), in); err != nil {
+			t.Fatalf("Create with empty body image + a default: %v", err)
+		}
+		if provider.materializedSpec().Image != deploymentDefault {
+			t.Fatalf("materialized image = %q, want the deployment default %q", provider.materializedSpec().Image, deploymentDefault)
+		}
+	})
+
+	t.Run("body image overrides the default", func(t *testing.T) {
+		// The override image is on the allow-list (the operator opted this BYO image in).
+		mgr, provider := newMgr(deploymentDefault, "registry.example/byo:custom")
+		in := input("byo-image")
+		in.Image = "registry.example/byo:custom"
+		if _, err := mgr.Create(context.Background(), in); err != nil {
+			t.Fatalf("Create with a body image override: %v", err)
+		}
+		if provider.materializedSpec().Image != "registry.example/byo:custom" {
+			t.Fatalf("materialized image = %q, want the body override, not the default", provider.materializedSpec().Image)
+		}
+	})
+
+	t.Run("no body image AND no default is refused ErrInvalidArgument before materialize", func(t *testing.T) {
+		mgr, provider := newMgr("") // no deployment default
+		in := input("unresolvable")
+		in.Image = ""
+		_, err := mgr.Create(context.Background(), in)
+		if !errors.Is(err, lifecycle.ErrInvalidArgument) {
+			t.Fatalf("Create with no resolvable image: want ErrInvalidArgument, got %v", err)
+		}
+		if provider.materializeCalls != 0 {
+			t.Fatalf("materialize ran %d times; want 0 — the refusal must precede any substrate call", provider.materializeCalls)
+		}
+	})
+}
+
+// TestCreateEnforcesImageAllowList is the #94b keystone: a body image override is
+// admitted only if it is on the deployment allow-list (or equal to the default,
+// which is implicitly allowed); a non-allow-listed override is refused as a
+// request-derived ErrInvalidArgument BEFORE admission, so an untrusted MCP caller
+// cannot run an arbitrary image. Deny-by-default: an empty allow-list admits only
+// the default. Red-probe: delete the `if !m.allowedImages[in.Image]` block →
+// the non-allowed override is accepted and materializes, reddening the deny subtest.
+func TestCreateEnforcesImageAllowList(t *testing.T) {
+	const deploymentDefault = "registry.example/ocu-guest:default"
+	const allowedBYO = "registry.example/ocu-guest:blessed-byo"
+
+	newMgr := func(defaultImage string, allowed ...string) (*lifecycle.Manager, *recordingProvider) {
+		clk := state.NewFakeClock(lifeStart)
+		store := newListerStore(state.NewInMemory(clk))
+		provider := newRecordingProvider()
+		mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+			Custodian:     registry.NewCustodian(store),
+			Provider:      provider,
+			Clock:         clk,
+			Quota:         quota.NewGate(store, clk, generousLimits()),
+			Handoff:       newFaultStager(t.TempDir()),
+			Audit:         audit.NewRecordingFake(),
+			Profile:       admission.ProfileTrustedOperator,
+			Tier:          runtime.TierRunc,
+			DefaultImage:  defaultImage,
+			AllowedImages: allowed,
+			ExecVerifyKey: pub32(),
+		})
+		return mgr, provider
+	}
+
+	t.Run("an allow-listed override is admitted and materialized", func(t *testing.T) {
+		mgr, provider := newMgr(deploymentDefault, allowedBYO)
+		in := input("byo-ok")
+		in.Image = allowedBYO
+		if _, err := mgr.Create(context.Background(), in); err != nil {
+			t.Fatalf("Create with an allow-listed override: %v", err)
+		}
+		if provider.materializedSpec().Image != allowedBYO {
+			t.Fatalf("materialized image = %q, want the allow-listed override %q", provider.materializedSpec().Image, allowedBYO)
+		}
+	})
+
+	t.Run("the default is implicitly allowed even when the allow-list omits it", func(t *testing.T) {
+		mgr, provider := newMgr(deploymentDefault) // empty allow-list
+		in := input("default-as-body")
+		in.Image = deploymentDefault // body names the default explicitly
+		if _, err := mgr.Create(context.Background(), in); err != nil {
+			t.Fatalf("Create naming the default image: %v (the default must be implicitly allowed)", err)
+		}
+		if provider.materializedSpec().Image != deploymentDefault {
+			t.Fatalf("materialized image = %q, want the default %q", provider.materializedSpec().Image, deploymentDefault)
+		}
+	})
+
+	t.Run("a non-allow-listed override is refused ErrInvalidArgument before materialize", func(t *testing.T) {
+		mgr, provider := newMgr(deploymentDefault, allowedBYO) // allow-list does NOT contain the evil image
+		in := input("evil-byo")
+		in.Image = "registry.evil/backdoor:latest"
+		_, err := mgr.Create(context.Background(), in)
+		if !errors.Is(err, lifecycle.ErrInvalidArgument) {
+			t.Fatalf("Create with a non-allow-listed override: want ErrInvalidArgument, got %v", err)
+		}
+		if provider.materializeCalls != 0 {
+			t.Fatalf("materialize ran %d times on a disallowed image; want 0 — the refusal must precede any substrate call", provider.materializeCalls)
+		}
+	})
+
+	t.Run("deny-by-default: empty allow-list refuses any override that is not the default", func(t *testing.T) {
+		mgr, _ := newMgr(deploymentDefault) // empty allow-list
+		in := input("override-with-empty-list")
+		in.Image = allowedBYO // a real image, but not listed and not the default
+		if _, err := mgr.Create(context.Background(), in); !errors.Is(err, lifecycle.ErrInvalidArgument) {
+			t.Fatalf("Create with an override under an empty allow-list: want ErrInvalidArgument (deny-by-default), got %v", err)
+		}
+	})
 }
 
 // TestCreateThenDestroyReleasesAndDecrements proves Destroy tears down a created
@@ -273,6 +428,7 @@ func TestCreateAdmissionRejected(t *testing.T) {
 		Audit:         audit.NewRecordingFake(),
 		Profile:       admission.ProfileUntrusted, // untrusted × runc = pairing-rejected
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage}, // pass the image gate so admission is the thing under test
 		ExecVerifyKey: pub32(),
 	})
 
@@ -311,6 +467,7 @@ func TestCreateQuotaRefusedNoCounter(t *testing.T) {
 		Audit:         audit.NewRecordingFake(),
 		Profile:       admission.ProfileTrustedOperator,
 		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
 		ExecVerifyKey: pub32(),
 	})
 	ctx := context.Background()
@@ -416,6 +573,7 @@ func newRejectHarness(t *testing.T, profile admission.WorkloadProfile, tier runt
 		Audit:         sink,
 		Profile:       profile,
 		Tier:          tier,
+		AllowedImages: []string{testGuestImage}, // pass the image gate so the deny under test is admission/quota/kill-switch, not the image
 		ExecVerifyKey: pub32(),
 	})
 	return &rejectHarness{mgr: mgr, store: store, provider: provider, audit: sink}
