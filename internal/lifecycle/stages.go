@@ -217,6 +217,20 @@ func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (comp
 		return nil, nil
 	}
 	scope := m.storageScope
+	// Derive the mint intent from THIS session's mount posture, not the static
+	// deployment scope (ADR-0029): a read-only mount is the uploads input leg (read),
+	// a read-write mount is the outputs sink (write). The posture is host-enforced
+	// (runtime.MountIntent.ReadOnly, the agent cannot flip it), so the derived intent
+	// is host-authoritative, never a body hint (NFR-SEC-43).
+	intent := deriveMountIntent(st.in.Mount.ReadOnly)
+	// The -granted-intents ceiling names the intents the deployment serves; it never
+	// grants. A derived intent the ceiling does not admit refuses the create closed
+	// HERE, before any token is minted or any mount-config reaches the bind — the same
+	// fail-closed shape as the mint's own ErrMintScope refusal below (nothing external
+	// was effected, so no compensator is owed).
+	if !m.grantedIntents.Admits(intent) {
+		return nil, fmt.Errorf("%w: %q", ErrIntentOutsideCeiling, intent)
+	}
 	tok, err := m.signer.MintStorageJWT(ctx, cred.StorageMintReq{
 		// SessionKey is the host-derived registry key; it seeds the jti and is the
 		// value the Revoker indexes the binding under, so a teardown re-deriving the
@@ -226,8 +240,10 @@ func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (comp
 		Workspace:    scope.Workspace,
 		Org:          scope.Org,
 		Authz: cred.AuthorizationMetadata{
-			Scope:        scope.Scope,
-			Intent:       scope.Intent,
+			Scope: scope.Scope,
+			// Intent is the per-mount-derived claim (ADR-0029), NOT scope.Intent — the
+			// deployment scope no longer decides the access axis; the mount posture does.
+			Intent:       intent,
 			Downloadable: scope.Downloadable,
 		},
 	})

@@ -78,6 +78,7 @@ var (
 	errUnknownProvider        = errors.New("unknown runtime provider")
 	errUnknownWorkloadProfile = errors.New("unknown workload profile")
 	errUnknownJWTAlg          = errors.New("unknown jwt signing algorithm")
+	errUnknownIntent          = errors.New("unknown storage intent in -granted-intents")
 	errKillSwitchFirst        = errors.New("kill-switch-first: create before deny posture loaded refused (NFR-SEC-01)")
 	// errCACertUnreadable is the fail-closed boot abort when -ca-cert names a path
 	// that cannot be read. A configured-but-unreadable CA must abort boot exactly as a
@@ -105,6 +106,15 @@ var (
 	// deployment matching the mount-config schema example. An unknown alg is refused,
 	// never coerced (the alg is written per-key in the keyring, not silently picked).
 	knownJWTAlgs = map[string]bool{"eddsa": true, "es256": true}
+	// knownIntents is the closed enumeration of Storage-JWT intents the
+	// -granted-intents ceiling may name (ADR-0029). An unknown token in the flag
+	// aborts boot rather than being silently dropped — a typo must never silently
+	// narrow or widen the served set (the enum discipline mirroring -runtime-tier).
+	knownIntents = map[string]cred.Intent{
+		"read":    cred.IntentRead,
+		"write":   cred.IntentWrite,
+		"preview": cred.IntentPreview,
+	}
 )
 
 func main() {
@@ -524,6 +534,17 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		}
 	}
 
+	// The -granted-intents ceiling was already enum-validated in the pre-bind
+	// validate() gate, so an error here is impossible on the boot path (compose runs
+	// only after validate passed). Re-resolving keeps compose the single Manager-build
+	// point without threading the ceiling through the signature; a non-nil error would
+	// mean validate() and this call disagreed — a programming error, not a runtime
+	// condition — so we panic rather than silently latch a wrong (e.g. default) ceiling.
+	grantedIntents, err := resolveGrantedIntents(cfg)
+	if err != nil {
+		panic(fmt.Sprintf("ocu-controld: -granted-intents passed validate() but failed to resolve in compose(): %v", err))
+	}
+
 	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
 		Custodian: custodian,
 		Provider:  provider,
@@ -542,16 +563,17 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		// rendered mount-config to the host-owned handoff bind before the mount client
 		// boots. ServiceURL/CACertPEM and the host-chosen mount defaults are
 		// deployment-fixed; the storage scope is host-derived, never a body hint.
-		Signer:        signer,
-		Push:          provisioning.NewPusher(),
-		ServiceURL:    cfg.serviceURL,
-		CACertPEM:     caCertPEM,
-		MountDefaults: defaultMountDefaults(),
-		StorageScope:  defaultStorageScope(),
-		ControlDialer: controlDialer,
-		ExecDriver:    execDriver,
-		ExecVerifyKey: execVerifyKeyOf(execSigner),
-		Metrics:       collector,
+		Signer:         signer,
+		Push:           provisioning.NewPusher(),
+		ServiceURL:     cfg.serviceURL,
+		CACertPEM:      caCertPEM,
+		MountDefaults:  defaultMountDefaults(),
+		StorageScope:   defaultStorageScope(),
+		GrantedIntents: grantedIntents,
+		ControlDialer:  controlDialer,
+		ExecDriver:     execDriver,
+		ExecVerifyKey:  execVerifyKeyOf(execSigner),
+		Metrics:        collector,
 	})
 	// The kill-switch refunds the per-tenant concurrency slot through the SAME
 	// quota.Gate that charged it on create, so a force-kill returns the level counter
@@ -1096,6 +1118,38 @@ func defaultStorageScope() lifecycle.StorageScope {
 		Intent:       cred.IntentWrite,
 		Downloadable: false,
 	}
+}
+
+// resolveGrantedIntents parses the -granted-intents flag into the deployment
+// IntentCeiling (ADR-0029). An empty flag resolves to the pinned default ceiling
+// (read,write) so the minimal shelf runs zero-config; a non-empty flag is a
+// comma-separated set of intents the deployment serves, each validated against the
+// closed known-intent enum. An unknown intent is REFUSED (errUnknownIntent), never
+// silently dropped — a typo must not silently narrow the served set. Blank fields (a
+// trailing comma, whitespace) are dropped; a flag that reduces to no valid intent
+// after trimming refuses (a deployment that serves nothing is a misconfiguration,
+// not a silent full-deny). The parse is pure and side-effect-free so it runs in the
+// pre-bind validate() gate.
+func resolveGrantedIntents(cfg config) (lifecycle.IntentCeiling, error) {
+	if strings.TrimSpace(cfg.grantedIntents) == "" {
+		return lifecycle.DefaultIntentCeiling(), nil
+	}
+	var intents []cred.Intent
+	for _, field := range strings.Split(cfg.grantedIntents, ",") {
+		name := strings.TrimSpace(field)
+		if name == "" {
+			continue
+		}
+		intent, ok := knownIntents[name]
+		if !ok {
+			return lifecycle.IntentCeiling{}, fmt.Errorf("%w: %q (choose read|write|preview)", errUnknownIntent, name)
+		}
+		intents = append(intents, intent)
+	}
+	if len(intents) == 0 {
+		return lifecycle.IntentCeiling{}, fmt.Errorf("%w: -granted-intents named no valid intent", errUnknownIntent)
+	}
+	return lifecycle.NewIntentCeiling(intents...), nil
 }
 
 // runtimeTierOf maps the validated -runtime-tier string to the runtime.RuntimeTier

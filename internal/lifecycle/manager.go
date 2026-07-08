@@ -169,9 +169,17 @@ type ManagerDeps struct {
 	// bits). Host-chosen posture, never a request-body hint.
 	MountDefaults mountcfg.MountDefaults
 	// StorageScope is the deployment-fixed, host-derived scope the Storage-JWT is
-	// minted under (workspace/org/intent/downloadable). It is NEVER sourced from a
-	// request body (NFR-SEC-43).
+	// minted under (workspace/org/downloadable). The mint INTENT is no longer taken
+	// from here — it is derived per-session from the mount's read-only posture
+	// (ADR-0029); StorageScope.Intent is retained for the no-signer minimal shelf and
+	// as the provisional default. It is NEVER sourced from a request body (NFR-SEC-43).
 	StorageScope StorageScope
+	// GrantedIntents is the deployment -granted-intents ceiling: the set of intents
+	// the deployment serves. It never grants — a per-mount-derived intent outside it
+	// refuses the mint fail-closed (ADR-0029 §Decision). A zero IntentCeiling admits
+	// nothing (every storage-scoped create then refuses), so the daemon wires
+	// DefaultIntentCeiling on the minimal shelf; the flag only ever narrows it.
+	GrantedIntents IntentCeiling
 
 	// ControlDialer is the ADVISORY host-dialled control-RPC surface (ADR-0018). On
 	// Destroy the Manager dials it BEFORE the host-driven finalizer to advance the
@@ -286,12 +294,13 @@ type Manager struct {
 
 	// Storage-JWT custody + mount-config provisioning (Phase 4). signer/push are nil
 	// on the Phase-3 minimal shelf, which the mint+render stages skip cleanly.
-	signer        *cred.Signer
-	push          provisioning.Pusher
-	serviceURL    string
-	caCertPEM     string
-	mountDefaults mountcfg.MountDefaults
-	storageScope  StorageScope
+	signer         *cred.Signer
+	push           provisioning.Pusher
+	serviceURL     string
+	caCertPEM      string
+	mountDefaults  mountcfg.MountDefaults
+	storageScope   StorageScope
+	grantedIntents IntentCeiling
 
 	// controlDialer is the advisory host-dialled control-RPC surface Destroy nudges
 	// before the authoritative finalizer. nil is a clean no-op.
@@ -331,17 +340,18 @@ func NewManager(deps ManagerDeps) *Manager {
 
 		defaultImage: deps.DefaultImage,
 
-		signer:        deps.Signer,
-		push:          deps.Push,
-		serviceURL:    deps.ServiceURL,
-		caCertPEM:     deps.CACertPEM,
-		mountDefaults: deps.MountDefaults,
-		storageScope:  deps.StorageScope,
-		controlDialer: deps.ControlDialer,
-		execDriver:    deps.ExecDriver,
-		execVerifyKey: deps.ExecVerifyKey,
-		metrics:       deps.Metrics,
-		events:        deps.Events,
+		signer:         deps.Signer,
+		push:           deps.Push,
+		serviceURL:     deps.ServiceURL,
+		caCertPEM:      deps.CACertPEM,
+		mountDefaults:  deps.MountDefaults,
+		storageScope:   deps.StorageScope,
+		grantedIntents: deps.GrantedIntents,
+		controlDialer:  deps.ControlDialer,
+		execDriver:     deps.ExecDriver,
+		execVerifyKey:  deps.ExecVerifyKey,
+		metrics:        deps.Metrics,
+		events:         deps.Events,
 	}
 	// Build the body-image override allow-set: the explicitly listed images plus the
 	// deployment default (implicitly allowed — the operator already trusted it by
