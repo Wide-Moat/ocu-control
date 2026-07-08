@@ -259,6 +259,51 @@ func TestOperatorTransportCreateThenDestroy(t *testing.T) {
 	}
 }
 
+// TestOperatorTransportCreateBadImageIs400 pins the operator wire contract for a
+// request-derived invalid argument: a create body naming a guest image OUTSIDE the
+// deployment allow-list is refused with 400 (client error), NOT 409. The manager
+// refuses it as lifecycle.ErrInvalidArgument BEFORE any host state (no admission,
+// quota, or reserve), so it is a bad request, not a conflict — and it must mirror
+// the gateway listener, which already maps ErrInvalidArgument to 400. Red-probe:
+// drop the ErrInvalidArgument arm from writeCreateError and the refusal collapses
+// back to the 409 default, reddening this test.
+func TestOperatorTransportCreateBadImageIs400(t *testing.T) {
+	t.Parallel()
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+
+	// "not-allowed:v1" is absent from the harness AllowedImages set, so the image
+	// gate refuses it as a request-derived invalid argument.
+	code, _ := postJSON(t, client, "/v1alpha/sessions", map[string]any{
+		"session_hint": "bad-image",
+		"image":        "not-allowed:v1",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("create with a non-allow-listed image = %d; want 400 (request-derived invalid argument, mirroring the gateway)", code)
+	}
+}
+
+// TestOperatorTransportCreateNoImageIs400 pins the OTHER ErrInvalidArgument source
+// on the operator wire: a create whose body names no image, against a deployment
+// with no configured default (the harness sets none), resolves to no image and is
+// refused 400 — the same request-derived-invalid-argument contract, not a 409
+// conflict. This is the second arm the writeCreateError ErrInvalidArgument case
+// must cover; together with the bad-image test it proves both invalid-argument
+// sources map to 400.
+func TestOperatorTransportCreateNoImageIs400(t *testing.T) {
+	t.Parallel()
+	resolver := fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}
+	_, client, _ := boundOperator(t, resolver, nil)
+
+	// No "image" field and no deployment default → resolves to no image.
+	code, _ := postJSON(t, client, "/v1alpha/sessions", map[string]any{
+		"session_hint": "no-image",
+	})
+	if code != http.StatusBadRequest {
+		t.Fatalf("create naming no image with no deployment default = %d; want 400 (request-derived invalid argument)", code)
+	}
+}
+
 // TestOperatorTransportRevokeOneAndAll drives the kill-switch verbs over the wire:
 // a create, then a RevokeOne of its key (200), then a RevokeAll DENY-ALL (200). It
 // proves the operator-only routes are reachable on the operator socket and that the
