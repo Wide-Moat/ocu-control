@@ -35,6 +35,7 @@ type config struct {
 	workloadProfile string        // deployment-declared trust profile feeding the admission matrix; never per-request
 	guestImage      string        // deployment-declared default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); the body image is an override; unset + no body image is a fail-closed 400
 	guestImageAllow string        // comma-separated exact-match allow-list of guest images a create BODY may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only (deny-by-default)
+	grantedIntents  string        // comma-separated Storage-JWT intent ceiling (read|write|preview) the deployment serves (ADR-0029); empty = the pinned default (read,write); a claim outside it is refused fail-closed. The flag never grants, only narrows.
 	jwtSigningKey   string        // path to the Storage-JWT signing key (config/secret mount)
 	execSigningKey  string        // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
 	gatewayTLSCert  string        // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
@@ -126,6 +127,7 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.guestImage, "guest-image", "", "default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); a body image overrides it; unset + no body image is refused 400")
 	fs.StringVar(&cfg.guestImageAllow, "guest-image-allow", "", "comma-separated exact-match allow-list of images a create body may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only, a non-allowed override is refused 400")
+	fs.StringVar(&cfg.grantedIntents, "granted-intents", "", "comma-separated Storage-JWT intent ceiling the deployment serves: read|write|preview (ADR-0029). Empty = the pinned default (read,write) for the zero-config minimal shelf; the flag NEVER grants, only narrows — a per-mount-derived intent outside the ceiling refuses the create fail-closed. An unknown intent aborts boot")
 	fs.StringVar(&cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
 	fs.StringVar(&cfg.execSigningKey, "exec-signing-key", "", "path to the SEPARATE exec-channel Ed25519 signing key mount (ADR-0013 key separation); unset disables the exec channel")
 	fs.StringVar(&cfg.gatewayTLSCert, "gateway-tls-cert", "", "gateway mTLS server-cert PEM (all-or-none with -gateway-tls-key/-gateway-client-ca); unset keeps the stubbed plain-TCP fail-closed posture")
@@ -248,6 +250,15 @@ func validate(cfg config) error {
 	// before any Store is built, so a misconfigured idle timeout never binds a listener.
 	// The resolved value itself is recomputed in serve() to drive the reaper tick.
 	if _, err := resolveIdleTTL(cfg); err != nil {
+		return err
+	}
+
+	// The -granted-intents ceiling is parsed and enum-checked here, pre-bind: an
+	// unknown intent aborts boot before any Store is built, so a typo never binds a
+	// listener while silently serving a narrower set than the operator named. The
+	// resolved ceiling itself is recomputed in the Manager build (serve()); this call
+	// is purely the fail-closed enum gate.
+	if _, err := resolveGrantedIntents(cfg); err != nil {
 		return err
 	}
 

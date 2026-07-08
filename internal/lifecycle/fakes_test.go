@@ -103,6 +103,7 @@ type recordingPusher struct {
 	scrubCalls int
 	failPush   bool
 	lastPath   string
+	lastCfg    []byte
 }
 
 func newRecordingPusher() *recordingPusher {
@@ -121,9 +122,19 @@ func (p *recordingPusher) Push(ctx context.Context, staged handoff.Staged, cfgBy
 	if err == nil {
 		p.mu.Lock()
 		p.lastPath = pushed.Path
+		p.lastCfg = append([]byte(nil), cfgBytes...)
 		p.mu.Unlock()
 	}
 	return pushed, err
+}
+
+// pushedConfig returns the marshalled mount-config bytes the last successful Push
+// landed, so a keystone can decode the minted auth_token's authz.intent claim and
+// prove the Storage-JWT carried the per-mount-derived intent.
+func (p *recordingPusher) pushedConfig() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lastCfg
 }
 
 func (p *recordingPusher) Scrub(ctx context.Context, pushed provisioning.Pushed) error {

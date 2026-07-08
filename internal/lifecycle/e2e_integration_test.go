@@ -146,14 +146,15 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 		// falls back to busybox — not the unit harness's fixed testGuestImage, which
 		// this create never names. Mismatched, the mount-config image gate rejects the
 		// create as ErrInvalidArgument before any backend runs.
-		AllowedImages: []string{itImage()},
-		Signer:        signer,
-		Push:          pusher,
-		ServiceURL:    testServiceURL,
-		CACertPEM:     testCACert,
-		MountDefaults: testMountDefaults(t),
-		StorageScope:  lifecycle.StorageScope{Workspace: "ws", Org: "org", Intent: cred.IntentWrite},
-		ExecVerifyKey: execPub,
+		AllowedImages:  []string{itImage()},
+		Signer:         signer,
+		Push:           pusher,
+		ServiceURL:     testServiceURL,
+		CACertPEM:      testCACert,
+		MountDefaults:  testMountDefaults(t),
+		StorageScope:   lifecycle.StorageScope{Workspace: "ws", Org: "org", Intent: cred.IntentWrite},
+		GrantedIntents: lifecycle.DefaultIntentCeiling(),
+		ExecVerifyKey:  execPub,
 	})
 
 	caller := ingress.AuthenticatedCaller{
