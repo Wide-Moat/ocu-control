@@ -493,12 +493,17 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 }
 
 // writeCreateError maps a lifecycle create error onto an HTTP status. An
-// unattested caller is 401 (the host could not attest identity); any other stage
-// failure is 409/refused. The body never discloses cross-tenant existence.
+// unattested caller is 401 (the host could not attest identity); a request-derived
+// invalid argument (a body that resolves to no image, or names an image outside the
+// deployment allow-list) is 400, mirroring the gateway listener so both ingresses
+// agree on the same wire contract for the same error; any other stage failure is
+// 409/refused. The body never discloses cross-tenant existence.
 func writeCreateError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ingress.ErrUnattested) || errors.Is(err, lifecycle.ErrUnattested):
 		writeStatus(w, http.StatusUnauthorized, "caller identity unattested")
+	case errors.Is(err, lifecycle.ErrInvalidArgument):
+		writeStatus(w, http.StatusBadRequest, "invalid request argument")
 	default:
 		writeStatus(w, http.StatusConflict, "create refused")
 	}
