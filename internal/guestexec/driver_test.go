@@ -144,6 +144,32 @@ func startFakeGuestDelayed(t *testing.T, sockDir string, g *fakeGuest, delay tim
 	}()
 }
 
+// wireFrameLimit is the exec-channel inbound read limit (dial.ReadLimitBytes,
+// NFR-SEC-46): a real guest never sends a single binary frame larger than this, so
+// the fake guest chunks a large payload to match.
+const wireFrameLimit = 32 << 10
+
+// writeChunked delivers a payload as one or more binary frames each bounded by the
+// wire read limit, mirroring how a real guest streams output past a single frame.
+// The wire requires each binary frame to be immediately preceded by its own
+// announce (the announce is consumed by exactly one frame), so announce is called
+// before every chunk.
+func writeChunked(ctx context.Context, conn *websocket.Conn, payload []byte, announce func() bool) bool {
+	for off := 0; off < len(payload); off += wireFrameLimit {
+		end := off + wireFrameLimit
+		if end > len(payload) {
+			end = len(payload)
+		}
+		if !announce() {
+			return false
+		}
+		if conn.Write(ctx, websocket.MessageBinary, payload[off:end]) != nil {
+			return false
+		}
+	}
+	return true
+}
+
 // serveFakeGuest runs the scripted exec-channel server over an already-bound
 // listener. It is shared by the warm and delayed starters so the handshake+drive
 // script is written once.
@@ -211,10 +237,14 @@ func serveFakeGuest(t *testing.T, ln net.Listener, g *fakeGuest) {
 			time.Sleep(g.holdOpen)
 		}
 		if len(g.stdout) > 0 {
-			if !write(wire.ServerMessage{ExpectStdOut: &wire.Null{}}) {
-				return
-			}
-			if conn.Write(ctx, websocket.MessageBinary, g.stdout) != nil {
+			// A real guest streams output in frames bounded by the wire read limit
+			// (ReadLimitBytes, 32 KiB); a payload larger than one frame arrives as
+			// several ExpectStdOut+binary frame pairs the host accumulates. Chunk here
+			// so a >32 KiB fixture is delivered legally rather than as one over-limit
+			// frame (or one announce for many frames, which the wire rejects).
+			if !writeChunked(ctx, conn, g.stdout, func() bool {
+				return write(wire.ServerMessage{ExpectStdOut: &wire.Null{}})
+			}) {
 				return
 			}
 			if !write(wire.ServerMessage{StdOutEOF: &wire.Null{}}) {
@@ -222,10 +252,9 @@ func serveFakeGuest(t *testing.T, ln net.Listener, g *fakeGuest) {
 			}
 		}
 		if len(g.stderr) > 0 {
-			if !write(wire.ServerMessage{ExpectStdErr: &wire.Null{}}) {
-				return
-			}
-			if conn.Write(ctx, websocket.MessageBinary, g.stderr) != nil {
+			if !writeChunked(ctx, conn, g.stderr, func() bool {
+				return write(wire.ServerMessage{ExpectStdErr: &wire.Null{}})
+			}) {
 				return
 			}
 			if !write(wire.ServerMessage{StdErrEOF: &wire.Null{}}) {
@@ -441,6 +470,86 @@ func TestDriverExecCapsStdout(t *testing.T) {
 	}
 	if res.ExitCode != 0 {
 		t.Fatalf("ExitCode = %d; want 0 (truncation must not fail the exec)", res.ExitCode)
+	}
+}
+
+// TestDefaultStdioCapIsReplyCeiling pins the #128 caller-facing content ceiling:
+// the production capture cap is 64 KiB, so each stream in the buffered F5 exec
+// reply is bounded to 64 KiB AT THE SOURCE — no reply can exceed the gateway's
+// read-cap, which removes the large-output 502 class. The 64 KiB cap is BOTH the
+// 05-SS host-memory bound and the caller-facing F5 content ceiling (one producer,
+// one consumer, one truncation path). Red before #128: the default was 8 MiB.
+func TestDefaultStdioCapIsReplyCeiling(t *testing.T) {
+	t.Parallel()
+	if defaultStdioCap != 64<<10 {
+		t.Fatalf("defaultStdioCap = %d; want 65536 (64 KiB — the F5 reply-stream content ceiling)", defaultStdioCap)
+	}
+}
+
+// TestDriverExecReplyCeilingBoundary pins the exact truncation boundary of the
+// PRODUCTION driver (no test-tightening): a stream of exactly the ceiling is NOT
+// truncated (the flag means "bytes were discarded", so the boundary byte itself is
+// kept), and one byte past it IS truncated, both bounded to the ceiling length.
+// Red before #128 on the over-cap leg: at the old 8 MiB default, 64 KiB+1 was well
+// under the cap, so it came back untruncated at full length.
+func TestDriverExecReplyCeilingBoundary(t *testing.T) {
+	t.Parallel()
+	const ceiling = 64 << 10
+	cases := []struct {
+		name          string
+		payload       int
+		wantLen       int
+		wantTruncated bool
+	}{
+		{"exactly-ceiling", ceiling, ceiling, false},
+		{"ceiling-plus-one", ceiling + 1, ceiling, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			signer, _ := newTestSigner(t)
+			sockDir := shortSockDir(t)
+			guest := &fakeGuest{exitCode: 0, stdout: []byte(strings.Repeat("A", tc.payload))}
+			startFakeGuest(t, sockDir, guest)
+
+			d := NewDriver(signer) // production stdioCap (the 64 KiB default), NOT test-tightened
+			res, err := d.Exec(context.Background(), sockDir, "ctr-ceiling", Request{
+				Argv:     []string{"true"},
+				TimeoutS: 10,
+			})
+			if err != nil {
+				t.Fatalf("Exec: %v", err)
+			}
+			if len(res.Stdout) != tc.wantLen {
+				t.Fatalf("len(Stdout) = %d; want %d", len(res.Stdout), tc.wantLen)
+			}
+			if res.StdoutTruncated != tc.wantTruncated {
+				t.Fatalf("StdoutTruncated = %v; want %v (flag set iff >=1 byte discarded)", res.StdoutTruncated, tc.wantTruncated)
+			}
+		})
+	}
+}
+
+// gatewayMaxReplyBytes MIRRORS the ocu-mcp-gateway maxReplyBytes read-cap (24 MiB
+// as of gateway step 1). A cross-repo constant cannot be imported, so it is named
+// and cited here; the assertion below proves the control-side 64 KiB source
+// ceiling keeps every possible F5 exec reply well under it — the two independently
+// owned layers (control source ceiling + gateway read-cap) that together retire
+// the large-output 502 class. If the gateway cap changes, update this mirror.
+const gatewayMaxReplyBytes = 24 << 20
+
+// TestExecReplyFitsUnderGatewayReadCap pins the cross-component invariant: the
+// worst-case F5 exec reply — both streams truncated to the 64 KiB ceiling, base64
+// encoded, plus the JSON envelope — is far below the gateway read-cap, so no reply
+// control can emit is ever refused as over-cap.
+func TestExecReplyFitsUnderGatewayReadCap(t *testing.T) {
+	t.Parallel()
+	// base64 encodes 3 bytes into 4, rounded up to a 4-char block.
+	b64Len := func(n int) int { return ((n + 2) / 3) * 4 }
+	const envelopeOverhead = 512 // exit_code + JSON keys/quotes/braces + truncation flags
+	worstCase := b64Len(defaultStdioCap) + b64Len(defaultStdioCap) + envelopeOverhead
+	if worstCase >= gatewayMaxReplyBytes {
+		t.Fatalf("worst-case F5 reply = %d bytes; must stay under the gateway read-cap %d", worstCase, gatewayMaxReplyBytes)
 	}
 }
 

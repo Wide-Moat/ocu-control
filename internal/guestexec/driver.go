@@ -49,10 +49,21 @@ const dialWaitBudget = 5 * time.Second
 // sub-second), long enough not to busy-spin connect(2).
 const redialInterval = 75 * time.Millisecond
 
-// defaultStdioCap bounds each captured output stream (05-SS): bytes past the cap
-// are discarded with the truncated flag set, so a flooding guest cannot balloon
-// host memory through an exec result.
-const defaultStdioCap = 8 << 20
+// defaultStdioCap bounds each captured output stream: bytes past the cap are
+// discarded with the truncated flag set (prefix-preserving), so a flooding guest
+// cannot balloon host memory through an exec result. At 64 KiB it is BOTH the
+// 05-SS host-memory bound AND the caller-facing F5 exec-reply content ceiling,
+// enforced AT THE SOURCE on one producer→consumer pipe (the buffered exec reply is
+// the sole consumer of these bytes). This is the FIRST of two independently-owned
+// layers that retire the large-output 502 class: control caps each stream to
+// 64 KiB here, and the ocu-mcp-gateway read-cap bounds the whole reply on the far
+// side. Worst-case reply = 2 streams × base64(64 KiB) + envelope ≈ 176 KiB, far
+// under that gateway read-cap. Lowering this is the caller-facing content ceiling,
+// not merely a memory guard; it is a const (not a deployment flag) precisely so no
+// deployment can silently raise it past the gateway cap and recreate the 502 class.
+// SCOPE: this is the BUFFERED exec-reply capture only — it does NOT govern any
+// interactive streaming path.
+const defaultStdioCap = 64 << 10
 
 // Request is one exec request against a session's guest: the command vector and
 // its optional environment, working directory, stdin bytes, and timeout. It
