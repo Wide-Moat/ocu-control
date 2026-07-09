@@ -210,6 +210,38 @@ func (d *Driver) Exec(ctx context.Context, sockDir, containerName string, req Re
 	}
 	code, err := ch.DriveExec(ctx, stdin, stdout, stderr)
 	if err != nil {
+		// A command that outlives the host exec deadline is NOT a transport failure:
+		// the ingress would map an error here to a 409 (→ gateway 502), losing the
+		// whole result AND the output captured before the kill. Shape it as a VALID
+		// exec reply instead — exit code 124 (the timeout(1)/bash convention; exit!=0
+		// makes it an isError tool result downstream) with the partial stdout/stderr
+		// already streamed into the capture buffers before the deadline, plus a
+		// timeout notice. Everything else (protocol, dial, read breaches) stays a
+		// genuine error → 409. Only ctx.DeadlineExceeded — the host-side exec timeout
+		// (effectiveTimeout above) — takes this reply path; a guest-returned natural
+		// exit already flows through the success return below.
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == context.DeadlineExceeded {
+			notice := fmt.Sprintf("\n[Command timed out after %ds]\n", int(timeout/time.Second))
+			// The notice rides the SAME stream that carries the partial output. The
+			// downstream relay shows stderr and DROPS stdout on an isError result, so
+			// a notice placed only in stderr would hide the partial stdout from the
+			// caller — the load-bearing output #129 exists to preserve. Appending to
+			// stdout keeps the partial stdout + notice together; also appending to a
+			// non-empty stderr means the notice survives whichever stream the relay
+			// picks (stderr, when the child wrote to it).
+			outBytes := append(stdout.buf.Bytes(), []byte(notice)...)
+			errBytes := stderr.buf.Bytes()
+			if len(errBytes) > 0 {
+				errBytes = append(errBytes, []byte(notice)...)
+			}
+			return Result{
+				ExitCode:        124,
+				Stdout:          outBytes,
+				Stderr:          errBytes,
+				StdoutTruncated: stdout.truncated,
+				StderrTruncated: stderr.truncated,
+			}, nil
+		}
 		return Result{}, fmt.Errorf("guestexec: drive exec: %w", err)
 	}
 	return Result{

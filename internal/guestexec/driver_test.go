@@ -55,9 +55,13 @@ func shortSockDir(t *testing.T) string {
 // exits with the configured code. It counts concurrent connections so the
 // per-session serialization test can assert the peak.
 type fakeGuest struct {
-	exitCode   uint8
-	stdout     []byte
-	holdOpen   time.Duration // delay between capabilities and stdout, to overlap execs
+	exitCode    uint8
+	stdout      []byte
+	stderr      []byte        // optional payload streamed on the stderr channel before exit
+	holdOpen    time.Duration // delay between capabilities and stdout, to overlap execs
+	hangForever bool          // after streaming stdout/stderr, never send ProcessExited: the
+	//                          child "runs" past the host exec deadline so DriveExec's
+	//                          readFrame(ctx) trips ctx.DeadlineExceeded — the timeout path.
 	srv        *http.Server
 	mu         sync.Mutex
 	gotJWT     string
@@ -217,6 +221,25 @@ func serveFakeGuest(t *testing.T, ln net.Listener, g *fakeGuest) {
 				return
 			}
 		}
+		if len(g.stderr) > 0 {
+			if !write(wire.ServerMessage{ExpectStdErr: &wire.Null{}}) {
+				return
+			}
+			if conn.Write(ctx, websocket.MessageBinary, g.stderr) != nil {
+				return
+			}
+			if !write(wire.ServerMessage{StdErrEOF: &wire.Null{}}) {
+				return
+			}
+		}
+		// A hanging child never emits ProcessExited: it "runs" until the host exec
+		// deadline fires. The stdout/stderr streamed above are already in the driver's
+		// capture buffers, so this exercises the partial-output-on-timeout path.
+		if g.hangForever {
+			<-drainDone
+			g.inFlight.Add(-1)
+			return
+		}
 		_ = write(wire.ServerMessage{ProcessExited: &wire.ProcessExited{Code: g.exitCode}})
 		g.inFlight.Add(-1)
 		// Hold the socket open until the client closes (the drain errors out), so
@@ -274,6 +297,51 @@ func TestDriverExecRunsOneProcessEndToEnd(t *testing.T) {
 	}
 	if pc.ProcessId == "" {
 		t.Fatal("msg2 process_id is empty")
+	}
+}
+
+// TestDriverExecTimeoutIsExitCodeReplyWithPartialOutput pins the #129 contract: a
+// command that outlives the host exec deadline is NOT a transport error (which the
+// ingress would map to a 409 → gateway 502, losing the whole result and the partial
+// output). It is a VALID exec reply — exit code 124, the partial stdout captured
+// before the kill, and a timeout notice. The notice is appended to the SAME stream
+// that carries the partial output (stdout), because the gateway relay drops stdout
+// and shows stderr on an isError result: putting the notice only in stderr would
+// hide the partial stdout from the caller. The partial output preservation is the
+// load-bearing half — the fleet loses it today.
+//
+// Red-first: against the current driver, a timed-out DriveExec returns (0, err) and
+// Exec returns an empty Result{} + that error, so ALL of err==nil, ExitCode==124,
+// the partial marker, and the notice fail.
+func TestDriverExecTimeoutIsExitCodeReplyWithPartialOutput(t *testing.T) {
+	t.Parallel()
+	signer, _ := newTestSigner(t)
+	sockDir := shortSockDir(t)
+	// The guest streams a partial stdout marker, then hangs (never exits) — so the
+	// host 1s exec deadline fires while DriveExec waits for the next frame.
+	guest := &fakeGuest{stdout: []byte("PARTIAL-MARKER"), hangForever: true}
+	startFakeGuest(t, sockDir, guest)
+
+	d := NewDriver(signer)
+	res, err := d.Exec(context.Background(), sockDir, "ocu-session-timeout-1", Request{
+		Argv:     []string{"sh", "-c", "echo PARTIAL-MARKER; sleep 600"},
+		TimeoutS: 1,
+	})
+	// (a) A timeout is a RESULT, not an error.
+	if err != nil {
+		t.Fatalf("timed-out exec returned err=%v; want nil (a timeout is a valid exec reply, not a transport error)", err)
+	}
+	// (b) Exit code is the timeout sentinel.
+	if res.ExitCode != 124 {
+		t.Fatalf("timed-out exec ExitCode=%d; want 124 (timeout sentinel; exit!=0 → isError at the gateway)", res.ExitCode)
+	}
+	// (c) The partial stdout captured before the kill is preserved (the load-bearing half).
+	if !strings.Contains(string(res.Stdout), "PARTIAL-MARKER") {
+		t.Fatalf("timed-out exec Stdout=%q; want it to preserve the pre-kill partial output (PARTIAL-MARKER)", res.Stdout)
+	}
+	// (d) A timeout notice reaches the caller in the SAME (relayed) stream as the partial output.
+	if !strings.Contains(string(res.Stdout), "timed out") {
+		t.Fatalf("timed-out exec Stdout=%q; want a timeout notice appended to the partial-output stream", res.Stdout)
 	}
 }
 
