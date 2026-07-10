@@ -166,7 +166,7 @@ func emitCreateRejected(ctx context.Context, m *Manager, st *createState, cause 
 // here. On success it pushes Unstage as the compensator.
 func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	name := runtime.SessionName(st.key.String())
-	mounts := []runtime.MountIntent{st.in.Mount}
+	mounts := st.in.Mounts
 	// The guest's verify key is the DEPLOYMENT-FIXED exec verify key (host-derived,
 	// never a body hint — NFR-SEC-43), so the caller cannot supply the key that
 	// decides who counts as the host. When the exec channel is disabled the key is
@@ -186,13 +186,24 @@ func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compen
 	}, nil
 }
 
-// hasStorageScope reports whether the create requested a storage scope at all. A
-// pure compute/exec session sets neither FilesystemID nor MemoryStoreID (a zero
-// MountIntent), and that is a legitimate first-class case (ADR-0017): the exec
-// lifecycle must not be coupled to the storage leg. The two storage stages share
-// this one predicate so the skip condition has a single source of truth.
+// hasStorageScope reports whether one mount names a storage scope. A pure
+// compute/exec session provisions no scoped mounts, and that is a legitimate
+// first-class case (ADR-0017): the exec lifecycle must not be coupled to the
+// storage leg.
 func hasStorageScope(m runtime.MountIntent) bool {
 	return m.FilesystemID != "" || m.MemoryStoreID != ""
+}
+
+// hasAnyStorageScope is the list form of hasStorageScope: the storage stages
+// run when ANY provisioned mount names a scope. The two storage stages share
+// this one predicate so the skip condition has a single source of truth.
+func hasAnyStorageScope(mounts []runtime.MountIntent) bool {
+	for _, m := range mounts {
+		if hasStorageScope(m) {
+			return true
+		}
+	}
+	return false
 }
 
 // stageMintStorageJWT (S6) mints the weak, edge-only Storage-JWT for the session's
@@ -210,50 +221,57 @@ func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (comp
 	if m.signer == nil {
 		return nil, nil
 	}
-	if !hasStorageScope(st.in.Mount) {
+	if !hasAnyStorageScope(st.in.Mounts) {
 		// A no-scope (pure compute/exec) session legitimately mints no Storage-JWT;
 		// failing closed here would couple exec to storage (ADR-0017). Leave
-		// st.storageToken the zero value and let the create boot without a mount.
+		// st.storageTokens empty and let the create boot without a mount.
 		return nil, nil
 	}
 	scope := m.storageScope
-	// Derive the mint intent from THIS session's mount posture, not the static
-	// deployment scope (ADR-0029): a read-only mount is the uploads input leg (read),
-	// a read-write mount is the outputs sink (write). The posture is host-enforced
-	// (runtime.MountIntent.ReadOnly, the agent cannot flip it), so the derived intent
-	// is host-authoritative, never a body hint (NFR-SEC-43).
-	intent := deriveMountIntent(st.in.Mount.ReadOnly)
-	// The -granted-intents ceiling names the intents the deployment serves; it never
-	// grants. A derived intent the ceiling does not admit refuses the create closed
-	// HERE, before any token is minted or any mount-config reaches the bind — the same
-	// fail-closed shape as the mint's own ErrMintScope refusal below (nothing external
-	// was effected, so no compensator is owed).
-	if !m.grantedIntents.Admits(intent) {
-		return nil, fmt.Errorf("%w: %q", ErrIntentOutsideCeiling, intent)
+	tokens := make([]cred.Token, 0, len(st.in.Mounts))
+	for _, mount := range st.in.Mounts {
+		// Derive the mint intent from THIS mount's posture, not the static
+		// deployment scope (ADR-0029): a read-only mount is the uploads input leg
+		// (read), a read-write mount is the outputs sink (write). The posture is
+		// host-enforced (runtime.MountIntent.ReadOnly, the agent cannot flip it), so
+		// the derived intent is host-authoritative, never a body hint (NFR-SEC-43).
+		intent := deriveMountIntent(mount.ReadOnly)
+		// The -granted-intents ceiling names the intents the deployment serves; it
+		// never grants. A derived intent the ceiling does not admit refuses the create
+		// closed HERE, before any token is minted or any mount-config reaches the
+		// bind — the same fail-closed shape as the mint's own ErrMintScope refusal
+		// below (nothing external was effected, so no compensator is owed).
+		if !m.grantedIntents.Admits(intent) {
+			return nil, fmt.Errorf("%w: %q", ErrIntentOutsideCeiling, intent)
+		}
+		tok, err := m.signer.MintStorageJWT(ctx, cred.StorageMintReq{
+			// SessionKey is the host-derived registry key; it seeds the jti and is the
+			// value the Revoker indexes the binding under (one jti PER MOUNT accumulates
+			// on the same key), so a teardown re-deriving the same key from the session
+			// row revokes every mount's mint. It is NEVER a body hint.
+			SessionKey:   st.key.String(),
+			FilesystemID: mount.FilesystemID,
+			Workspace:    scope.Workspace,
+			Org:          scope.Org,
+			Authz: cred.AuthorizationMetadata{
+				Scope: scope.Scope,
+				// Intent is the per-mount-derived claim (ADR-0029), NOT scope.Intent —
+				// the deployment scope no longer decides the access axis; the mount
+				// posture does.
+				Intent:       intent,
+				Downloadable: scope.Downloadable,
+			},
+		})
+		if err != nil {
+			// A refused mint (missing/invalid scope) fails the create closed before any
+			// mount-config reaches the bind; nothing external was effected, so no
+			// compensator is owed. Earlier tokens from this loop expire unused; the
+			// finalizer's revoke covers any that were already Recorded.
+			return nil, err
+		}
+		tokens = append(tokens, tok)
 	}
-	tok, err := m.signer.MintStorageJWT(ctx, cred.StorageMintReq{
-		// SessionKey is the host-derived registry key; it seeds the jti and is the
-		// value the Revoker indexes the binding under, so a teardown re-deriving the
-		// same key from the session row finds the jti. It is NEVER a body hint.
-		SessionKey:   st.key.String(),
-		FilesystemID: st.in.Mount.FilesystemID,
-		Workspace:    scope.Workspace,
-		Org:          scope.Org,
-		Authz: cred.AuthorizationMetadata{
-			Scope: scope.Scope,
-			// Intent is the per-mount-derived claim (ADR-0029), NOT scope.Intent — the
-			// deployment scope no longer decides the access axis; the mount posture does.
-			Intent:       intent,
-			Downloadable: scope.Downloadable,
-		},
-	})
-	if err != nil {
-		// A refused mint (missing/invalid scope) fails the create closed before any
-		// mount-config reaches the bind; nothing external was effected, so no
-		// compensator is owed.
-		return nil, err
-	}
-	st.storageToken = tok
+	st.storageTokens = tokens
 	return nil, nil
 }
 
@@ -271,14 +289,14 @@ func stageRenderPushMount(ctx context.Context, m *Manager, st *createState) (com
 	if m.signer == nil || m.push == nil {
 		return nil, nil
 	}
-	if !hasStorageScope(st.in.Mount) {
+	if !hasAnyStorageScope(st.in.Mounts) {
 		// No storage scope was requested, so there is no mount-config to render and
 		// nothing to push onto the bind — the matching skip for the no-mint case
 		// above (ADR-0017). The sandbox boots from the handoff binds alone.
 		return nil, nil
 	}
-	mounts := []runtime.MountIntent{st.in.Mount}
-	tokens := []cred.Token{st.storageToken}
+	mounts := st.in.Mounts
+	tokens := st.storageTokens
 	cfg, err := mountcfg.Render(m.serviceURL, m.caCertPEM, mounts, tokens, m.mountDefaults)
 	if err != nil {
 		// A render refusal (bad scope, missing token, malformed service_url/ca_cert)
@@ -317,7 +335,7 @@ func stageMaterialize(ctx context.Context, m *Manager, st *createState) (compens
 		Name:          runtime.SessionName(st.key.String()),
 		Owner:         runtimemap.IdentityFromState(st.owner),
 		Image:         st.in.Image,
-		Mounts:        []runtime.MountIntent{st.in.Mount},
+		Mounts:        st.in.Mounts,
 		Egress:        st.in.Egress,
 		Resources:     st.in.Resources,
 		Handoff:       st.staged.Material,

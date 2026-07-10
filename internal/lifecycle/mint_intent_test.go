@@ -102,7 +102,7 @@ func intentCreateInput(hint string, readOnly bool) lifecycle.CreateInput {
 		Caller:      testCaller,
 		SessionHint: hint,
 		Image:       testGuestImage,
-		Mount:       runtime.MountIntent{Destination: "/workspace", FilesystemID: "fs-1", ReadOnly: readOnly, CacheSeconds: 5},
+		Mounts:      []runtime.MountIntent{{Destination: "/workspace", FilesystemID: "fs-1", ReadOnly: readOnly, CacheSeconds: 5}},
 		Egress:      runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store", FilesystemID: "fs-1"},
 		Resources:   runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
 	}
@@ -177,5 +177,82 @@ func TestMintIntentOutsideCeilingRefused(t *testing.T) {
 	// Fail-closed: nothing was pushed onto the bind before the refusal.
 	if push, _ := pusher.counts(); push != 0 {
 		t.Fatalf("Push called %d times on a ceiling-refused create, want 0 — the mint must refuse before render/push", push)
+	}
+}
+
+// mintedIntents decodes EVERY mount entry's auth_token intent from the pushed
+// mount-config, positionally - the two-mount keystone reads both claims.
+func mintedIntents(t *testing.T, cfgBytes []byte) []string {
+	t.Helper()
+	var cfg struct {
+		Mounts []struct {
+			Destination string `json:"destination"`
+			AuthToken   string `json:"auth_token"`
+		} `json:"mounts"`
+	}
+	if err := json.Unmarshal(cfgBytes, &cfg); err != nil {
+		t.Fatalf("decode mount-config JSON: %v", err)
+	}
+	intents := make([]string, 0, len(cfg.Mounts))
+	for _, m := range cfg.Mounts {
+		parts := strings.Split(m.AuthToken, ".")
+		if len(parts) != 3 {
+			t.Fatalf("auth_token for %s is not a compact JWT (%d segments)", m.Destination, len(parts))
+		}
+		payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+		if err != nil {
+			t.Fatalf("decode JWT payload for %s: %v", m.Destination, err)
+		}
+		var claims struct {
+			Authz struct {
+				Intent string `json:"intent"`
+			} `json:"authz"`
+		}
+		if err := json.Unmarshal(payload, &claims); err != nil {
+			t.Fatalf("decode JWT claims for %s: %v", m.Destination, err)
+		}
+		intents = append(intents, claims.Authz.Intent)
+	}
+	return intents
+}
+
+// TestCreateTwoMountsMintsPerMountIntents is the two-mount keystone (ADR-0029):
+// ONE create provisioning the uploads-RO + outputs-RW pair renders a mount-config
+// with TWO entries, each carrying its own weak Storage-JWT whose intent claim is
+// derived from THAT mount's posture - read for the RO uploads view, write for the
+// RW outputs sink. Under the old single-mount wrap the second mount was silently
+// impossible, so this test cannot pass against it.
+func TestCreateTwoMountsMintsPerMountIntents(t *testing.T) {
+	t.Parallel()
+	pusher := newRecordingPusher()
+	mgr := newIntentManager(t, pusher, lifecycle.NewIntentCeiling(cred.IntentRead, cred.IntentWrite))
+
+	in := lifecycle.CreateInput{
+		Caller:      testCaller,
+		SessionHint: "two-mount-session",
+		Image:       testGuestImage,
+		Mounts: []runtime.MountIntent{
+			{Destination: "/mnt/user-data/uploads", FilesystemID: "fs-1", ReadOnly: true, CacheSeconds: 5},
+			{Destination: "/mnt/user-data/outputs", FilesystemID: "fs-1", ReadOnly: false, CacheSeconds: 5},
+		},
+		Egress:    runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store", FilesystemID: "fs-1"},
+		Resources: runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
+	}
+	if _, err := mgr.Create(context.Background(), in); err != nil {
+		t.Fatalf("two-mount create: %v", err)
+	}
+	cfgBytes := pusher.pushedConfig()
+	if len(cfgBytes) == 0 {
+		t.Fatal("no mount-config was pushed")
+	}
+	intents := mintedIntents(t, cfgBytes)
+	if len(intents) != 2 {
+		t.Fatalf("mount-config carries %d mounts, want 2 (uploads + outputs)", len(intents))
+	}
+	if intents[0] != "read" {
+		t.Errorf("uploads (RO) mount minted intent %q, want read", intents[0])
+	}
+	if intents[1] != "write" {
+		t.Errorf("outputs (RW) mount minted intent %q, want write", intents[1])
 	}
 }

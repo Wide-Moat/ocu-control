@@ -335,10 +335,7 @@ func TestOperatorTransportCreateBareBodyStaysNoScope(t *testing.T) {
 		t.Fatalf("bare create = %d (%s); want 201", code, body)
 	}
 	specs := spy.captured()
-	if len(specs) != 1 || len(specs[0].Mounts) != 1 {
-		t.Fatalf("bare create specs = %+v; want 1 spec with 1 mount slot", specs)
-	}
-	if got := specs[0].Mounts[0]; got != (ocuruntime.MountIntent{}) {
-		t.Fatalf("bare create spec.Mounts[0] = %+v; want the zero MountIntent", got)
+	if len(specs) != 1 || len(specs[0].Mounts) != 0 {
+		t.Fatalf("bare create specs = %+v; want 1 spec with ZERO mount entries (a no-scope create provisions no mounts; the old zero-MountIntent slot was a wrap artifact)", specs)
 	}
 }

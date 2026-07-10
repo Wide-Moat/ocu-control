@@ -100,7 +100,7 @@ type CreateInput struct {
 	Image string
 	// Mount is the per-session storage mount intent. Its AuthToken is a later-phase
 	// placeholder on this path.
-	Mount runtime.MountIntent
+	Mounts []runtime.MountIntent
 	// Egress is the per-session egress trust-edge policy.
 	Egress runtime.EgressPolicy
 	// Resources are the hard caps the provider stamps onto the runtime.
@@ -427,11 +427,11 @@ type createState struct {
 	// reserved->active start-duration metric — a monotonic interval, so a wall-clock
 	// setback between reserve and commit cannot skew the start histogram.
 	reservedMark time.Time
-	// storageToken is the freshly minted weak Storage-JWT the render stage carries
+	// storageTokens are the freshly minted weak Storage-JWTs the render stage carries
 	// into the mount-config. It stays a secret cred.Token on the create state — it
 	// never widens the frozen runtime.MountIntent.AuthToken string seam — and is
 	// revealed only at the single mountcfg.Marshal boundary.
-	storageToken cred.Token
+	storageTokens []cred.Token
 	// pushed is the host-side handle to the pushed mount-config; its Scrub is the
 	// render stage's compensator and (later) the finalizer's scrub-trigger.
 	pushed provisioning.Pushed
