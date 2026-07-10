@@ -132,6 +132,28 @@ func (d *Driver) sessionLock(sockDir string) *sync.Mutex {
 	return l
 }
 
+// shouldShapeTimeout reports whether a DriveExec error is a host-side exec TIMEOUT
+// that must be shaped into a valid exit-124 reply (preserving partial output),
+// rather than surfaced as a genuine transport error (→ 409 → the whole result and
+// partial output lost). err is the DriveExec error; ctxErr is the exec ctx's Err()
+// at return.
+//
+// It shapes when the error is a deadline (errors.Is DeadlineExceeded) AND the
+// exec ctx was NOT cancelled by the caller. The deadline can fire at two layers:
+// the PARENT exec ctx (effectiveTimeout — ctxErr == DeadlineExceeded) OR a CHILD
+// read/idle ctx inside the channel while the parent is still live (ctxErr == nil).
+// The earlier predicate keyed on ctxErr == DeadlineExceeded and so missed the
+// child-ctx case, letting an idle-window timeout fall through to a 409 that lost
+// the result. Keying on "not caller-cancelled" catches both timeout layers and
+// still EXCLUDES a caller cancellation (ctxErr == context.Canceled): a cancel is
+// the caller withdrawing, not a command that ran out of time, so it stays a
+// genuine error. control disables the child idle window (dial.WithIdleWindow(0)),
+// keeping the parent deadline the single authority; this predicate is the
+// defense-in-depth that closes the 409 hole regardless.
+func shouldShapeTimeout(err error, ctxErr error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && !errors.Is(ctxErr, context.Canceled)
+}
+
 // effectiveTimeout maps the wire timeout to the bounded exec deadline: zero
 // means the total cap, anything above the cap clamps to it (D-03).
 func effectiveTimeout(timeoutS uint32) time.Duration {
@@ -219,6 +241,12 @@ func (d *Driver) Exec(ctx context.Context, sockDir, containerName string, req Re
 	if len(req.Stdin) > 0 {
 		stdin = bytes.NewReader(req.Stdin)
 	}
+	// Mark the drive start so a timeout notice can report the ACTUAL elapsed time,
+	// not the nominal configured cap. The timeout may fire at a deadline SHORTER
+	// than the cap (a child idle-window inside the channel), so printing the cap
+	// would lie about when the command was actually killed. Rounded to whole
+	// seconds to match the human-facing notice.
+	driveStart := time.Now()
 	code, err := ch.DriveExec(ctx, stdin, stdout, stderr)
 	if err != nil {
 		// A command that outlives the host exec deadline is NOT a transport failure:
@@ -231,8 +259,12 @@ func (d *Driver) Exec(ctx context.Context, sockDir, containerName string, req Re
 		// genuine error → 409. Only ctx.DeadlineExceeded — the host-side exec timeout
 		// (effectiveTimeout above) — takes this reply path; a guest-returned natural
 		// exit already flows through the success return below.
-		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == context.DeadlineExceeded {
-			notice := fmt.Sprintf("\n[Command timed out after %ds]\n", int(timeout/time.Second))
+		if shouldShapeTimeout(err, ctx.Err()) {
+			// Report the ACTUAL elapsed time to the timeout, not the nominal cap: the
+			// deadline may fire earlier than the configured cap (a child idle-window),
+			// so printing the cap would misstate when the command was killed.
+			elapsed := int(time.Since(driveStart).Round(time.Second) / time.Second)
+			notice := fmt.Sprintf("\n[Command timed out after %ds]\n", elapsed)
 			// The notice rides the SAME stream that carries the partial output. The
 			// downstream relay shows stderr and DROPS stdout on an isError result, so
 			// a notice placed only in stderr would hide the partial stdout from the
