@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -666,5 +667,36 @@ func TestDriverExecFastFailsOnTerminalDialError(t *testing.T) {
 	}
 	if elapsed > time.Second {
 		t.Fatalf("Exec on a cancelled context took %v; want a prompt return, not a spin to the budget", elapsed)
+	}
+}
+
+// TestShouldShapeTimeout pins the #145 part-2 predicate: a DriveExec deadline is
+// shaped into an exit-124 reply for BOTH the parent exec-ctx deadline AND a child
+// read/idle-ctx deadline that fires while the parent is still live (ctx.Err()==nil)
+// — the hole the earlier ctx.Err()==DeadlineExceeded-only predicate left open — but
+// a caller cancellation (ctx.Err()==Canceled) stays a genuine error. A non-deadline
+// transport error is never shaped regardless of ctx state.
+func TestShouldShapeTimeout(t *testing.T) {
+	t.Parallel()
+	wrapped := fmt.Errorf("dial: read exec frame: %w", context.DeadlineExceeded)
+	cases := []struct {
+		name   string
+		err    error
+		ctxErr error
+		want   bool
+	}{
+		{"parent-deadline", wrapped, context.DeadlineExceeded, true},
+		{"child-deadline-parent-live", wrapped, nil, true},
+		{"caller-cancelled", wrapped, context.Canceled, false},
+		{"non-deadline-error-parent-live", errors.New("protocol breach"), nil, false},
+		{"non-deadline-error-with-deadline-ctx", errors.New("protocol breach"), context.DeadlineExceeded, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shouldShapeTimeout(tc.err, tc.ctxErr); got != tc.want {
+				t.Fatalf("shouldShapeTimeout(%v, %v) = %v; want %v", tc.err, tc.ctxErr, got, tc.want)
+			}
+		})
 	}
 }
