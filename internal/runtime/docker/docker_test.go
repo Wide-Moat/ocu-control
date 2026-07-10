@@ -121,6 +121,14 @@ func TestBuildHostConfig_HOST01(t *testing.T) {
 		t.Errorf("Tmpfs[/tmp]: want rw,noexec,nosuid,nodev,size=64m, got %q", got)
 	}
 
+	// Tmpfs["/home/assistant"] is the writable scratch home: the guest's work dir
+	// on a read-only rootfs. Unlike /tmp it is NOT noexec — the model compiles and
+	// runs scripts there — but it keeps nosuid,nodev and a size cap. It counts
+	// against the hard memory ceiling like /tmp does, so it is bounded.
+	if got := hc.Tmpfs["/home/assistant"]; got != "rw,exec,nosuid,nodev,size=512m" {
+		t.Errorf("Tmpfs[/home/assistant]: want rw,exec,nosuid,nodev,size=512m (writable exec-allowed work home; exec is EXPLICIT — tmpfs default is noexec), got %q", got)
+	}
+
 	// Exactly THREE binds, each "host-source:guest-target[:ro]": the SOURCE is the
 	// per-session host path the Stager wrote, the TARGET is the in-guest mountpoint.
 	// The info target is the guest's root default-read path; the key target is the
@@ -180,8 +188,8 @@ func TestBuildHostConfig_HOST01(t *testing.T) {
 	if _, ok := hc.Tmpfs["/root/.cache"]; ok {
 		t.Errorf("Tmpfs[/root/.cache] on a no-storage session: want absent, got %q", hc.Tmpfs["/root/.cache"])
 	}
-	if len(hc.Tmpfs) != 1 {
-		t.Errorf("Tmpfs on a no-storage session: want exactly the /tmp entry, got %v", hc.Tmpfs)
+	if len(hc.Tmpfs) != 2 {
+		t.Errorf("Tmpfs on a no-storage session: want exactly the /tmp and /home/assistant entries, got %v", hc.Tmpfs)
 	}
 }
 
