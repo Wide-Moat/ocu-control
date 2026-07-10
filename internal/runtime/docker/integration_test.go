@@ -232,6 +232,70 @@ func TestIT_MaterializeAndInspect(t *testing.T) {
 	}
 }
 
+// TestIT_WritableScratchHome asserts, on a REAL materialized container, that the
+// guest has a writable exec-allowed scratch home at /home/assistant on the
+// read-only rootfs, and that the read-only rootfs invariant still holds elsewhere
+// (no tmpfs punches a writable hole into /etc). The non-vacuous contrast is the
+// point: /home/assistant is a writable tmpfs, /etc is not — so a home write
+// succeeds while an /etc write stays refused by the RO rootfs. The behavioral leg
+// (touch /home/assistant/x rc=0 while a /etc write fails) is verified live on the
+// stand against the assembled guest; this pins the container-config half firsthand.
+func TestIT_WritableScratchHome(t *testing.T) {
+	cli := requireIT(t)
+	requireGuestImage(t)
+	ctx := context.Background()
+	pullIfNeeded(t, cli)
+
+	p, err := NewDockerProvider(runtime.TierRunc, Deps{})
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	spec := itSpec(t, runtime.SessionName("it-scratch-home"))
+
+	sb, merr := p.Materialize(ctx, spec)
+	if merr != nil {
+		t.Fatalf("Materialize: %v", merr)
+	}
+	t.Cleanup(func() { _ = p.Teardown().ForceKill(context.Background(), sb) })
+
+	ci, cerr := cli.ContainerInspect(ctx, sb.RuntimeID)
+	if cerr != nil {
+		t.Fatalf("container inspect %q: %v", sb.RuntimeID, cerr)
+	}
+	if ci.HostConfig == nil {
+		t.Fatalf("inspect returned no HostConfig")
+	}
+	// The RO rootfs invariant holds — the writable home is a tmpfs hole, not a
+	// rootfs-wide relaxation.
+	if !ci.HostConfig.ReadonlyRootfs {
+		t.Errorf("ReadonlyRootfs must hold: the writable home must be a tmpfs, not a writable rootfs")
+	}
+	// The scratch home is a writable, exec-ALLOWED tmpfs (no noexec — the guest runs
+	// scripts from it), with nosuid,nodev and a size cap.
+	home := ci.HostConfig.Tmpfs["/home/assistant"]
+	if home == "" {
+		t.Fatalf("no tmpfs at /home/assistant on the real container: a home write would EACCES on the RO rootfs (Tmpfs=%v)", ci.HostConfig.Tmpfs)
+	}
+	if strings.Contains(home, "noexec") {
+		t.Errorf("/home/assistant tmpfs must NOT be noexec (it is the work dir the model runs scripts from), got %q", home)
+	}
+	// exec must be EXPLICIT: the tmpfs default is noexec, so omitting the flag would
+	// silently block script execution from the work home.
+	if !strings.Contains(home, "exec") || strings.Contains(home, "noexec") {
+		t.Errorf("/home/assistant tmpfs must carry explicit exec (tmpfs default is noexec), got %q", home)
+	}
+	for _, want := range []string{"rw", "nosuid", "nodev", "size="} {
+		if !strings.Contains(home, want) {
+			t.Errorf("/home/assistant tmpfs must carry %q, got %q", want, home)
+		}
+	}
+	// Non-vacuous contrast: /etc is NOT a tmpfs, so it stays under the read-only
+	// rootfs — a home write succeeds where an /etc write is refused.
+	if _, ok := ci.HostConfig.Tmpfs["/etc"]; ok {
+		t.Errorf("/etc must NOT be a writable tmpfs: the RO rootfs must still refuse writes there, got %q", ci.HostConfig.Tmpfs["/etc"])
+	}
+}
+
 // TestIT_GracefulStopHonorsGrace asserts GracefulStop issues the SIGTERM-then-kill
 // drain and the container is gone afterward, and that NetworkRemove succeeds only
 // after the container is removed (the active-endpoints constraint): the bridge is

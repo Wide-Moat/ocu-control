@@ -721,9 +721,28 @@ func buildHostConfig(spec runtime.SessionSpec, tier runtime.RuntimeTier, egressN
 		CapDrop:        []string{"ALL"},
 		SecurityOpt:    []string{"no-new-privileges:true", "seccomp=" + compactSeccomp},
 		ReadonlyRootfs: true,
-		Tmpfs:          map[string]string{"/tmp": "rw,noexec,nosuid,nodev,size=64m"},
-		Binds:          binds,
-		NetworkMode:    container.NetworkMode(sessionNetwork(spec, egressNetwork)),
+		// Two tmpfs scratch mounts on the read-only rootfs, both size-capped RAM that
+		// counts against the hard Memory ceiling (Resources.Memory below):
+		//   /tmp             — the general scratch, kept noexec (nothing runs from /tmp).
+		//   /home/assistant  — the guest's WORK home: the model writes files here and
+		//                      compiles+runs scripts from it, so it is exec-ALLOWED —
+		//                      set EXPLICITLY (Docker's tmpfs default is noexec, so
+		//                      omitting the flag would silently block execution and
+		//                      defeat the work dir), unlike /tmp which keeps noexec.
+		//                      Without this mount a write to the home dir fails EACCES on
+		//                      the read-only rootfs. Both keep nosuid,nodev. 512m is the
+		//                      home cap: a quarter of a 2 GiB session ceiling, leaving the
+		//                      bulk of RAM for process working set while giving real
+		//                      headroom for build outputs.
+		// Each tmpfs is in-container and dies with the container — no teardown step
+		// scrubs it (the host-side per-session scratch that DOES need scrubbing is the
+		// handoff sock dir, handled by the zeroTmpfs finalizer, not these).
+		Tmpfs: map[string]string{
+			"/tmp":            "rw,noexec,nosuid,nodev,size=64m",
+			"/home/assistant": "rw,exec,nosuid,nodev,size=512m",
+		},
+		Binds:       binds,
+		NetworkMode: container.NetworkMode(sessionNetwork(spec, egressNetwork)),
 		Resources: container.Resources{
 			// HARD CPU ceiling, never a relative weight: NanoCPUs is set,
 			// CPUShares stays 0 (requirement 5 — caps not shares).
