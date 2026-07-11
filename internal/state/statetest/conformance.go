@@ -821,6 +821,60 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		}
 	})
 
+	t.Run("TestEffectiveScopeRoundTrips", func(t *testing.T) {
+		// The per-chat effective-scope contract (ADR-0030, D5), held against both legs:
+		// RecordEffectiveScope stamps the derived storage scope onto a committed row, and
+		// LiveSessionsEnriched reads it back via EffectiveScope; a row that never recorded
+		// a scope reads back nil. Both legs persist the scope (the in-memory index or the
+		// durable column), so the read surface reports the same value.
+		s := newFixture()
+		es, ok := s.(effectiveScopeRecorder)
+		if !ok {
+			t.Fatalf("Store %T does not implement RecordEffectiveScope: the status verb cannot surface the per-chat scope", s)
+		}
+		el := s.(enrichedLister)
+
+		// Leg 1: a recorded row reads its scope back.
+		mustReserve(ctx, t, s, "k-scoped", owner)
+		mustCommit(ctx, t, s, "k-scoped", owner)
+		const wantScope = "fs-1-0123456789abcdef"
+		if err := es.RecordEffectiveScope(ctx, "k-scoped", wantScope); err != nil {
+			t.Fatalf("RecordEffectiveScope(k-scoped): %v", err)
+		}
+
+		// Leg 2: a row that never recorded a scope reads back nil.
+		mustReserve(ctx, t, s, "k-bare", owner)
+		mustCommit(ctx, t, s, "k-bare", owner)
+
+		live, err := el.LiveSessionsEnriched(ctx)
+		if err != nil {
+			t.Fatalf("LiveSessionsEnriched: %v", err)
+		}
+		byKey := make(map[string]state.EnrichedSessionRow, len(live))
+		for _, r := range live {
+			byKey[r.Key] = r
+		}
+
+		scoped, ok := byKey["k-scoped"]
+		if !ok {
+			t.Fatalf("recorded row k-scoped not enumerated")
+		}
+		if scoped.EffectiveScope == nil {
+			t.Fatalf("k-scoped must carry a non-nil effective-scope after RecordEffectiveScope, got nil")
+		}
+		if *scoped.EffectiveScope != wantScope {
+			t.Errorf("k-scoped effective-scope: want %q, got %q", wantScope, *scoped.EffectiveScope)
+		}
+
+		bare, ok := byKey["k-bare"]
+		if !ok {
+			t.Fatalf("row k-bare not enumerated")
+		}
+		if bare.EffectiveScope != nil {
+			t.Errorf("k-bare never recorded a scope; want nil EffectiveScope, got %q", *bare.EffectiveScope)
+		}
+	})
+
 	t.Run("TouchActivity fails closed on a cancelled context", func(t *testing.T) {
 		s := newFixture()
 		at := s.(activityToucher)
@@ -924,6 +978,15 @@ type activationRecorder interface {
 // leg that drifts stops satisfying the assertion and the suite fails loudly.
 type activityToucher interface {
 	TouchActivity(ctx context.Context, key string, now time.Time) error
+}
+
+// effectiveScopeRecorder is the optional per-chat effective-scope write (mirroring
+// registry.EffectiveScopeRecorder, ADR-0030). It stamps the derived storage scope
+// onto an already-committed row; the scope is read back through the EffectiveScope
+// field of LiveSessionsEnriched. The signature MUST match the production method so a
+// leg that drifts stops satisfying the assertion and the suite fails loudly.
+type effectiveScopeRecorder interface {
+	RecordEffectiveScope(ctx context.Context, key string, scope string) error
 }
 
 // mustReserve reserves key for owner and fails the test on any error.

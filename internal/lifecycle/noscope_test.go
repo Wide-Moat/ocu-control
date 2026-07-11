@@ -75,7 +75,7 @@ func TestCreateNoStorageScopeSucceeds(t *testing.T) {
 		Caller:      testCaller,
 		SessionHint: "no-scope-session",
 		Image:       testGuestImage,
-		Mount:       runtime.MountIntent{},
+		Mounts:      nil,
 		Egress:      runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store"},
 		Resources:   runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
 	}
@@ -160,7 +160,7 @@ func TestCreateStorageScopeDeliversMountConfig(t *testing.T) {
 		Caller:      testCaller,
 		SessionHint: "storage-session",
 		Image:       testGuestImage,
-		Mount:       runtime.MountIntent{Destination: "/workspace", FilesystemID: "fs-1", CacheSeconds: 5},
+		Mounts:      []runtime.MountIntent{{Destination: "/workspace", FilesystemID: "fs-1", CacheSeconds: 5}},
 		Egress:      runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store", FilesystemID: "fs-1"},
 		Resources:   runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
 	}

@@ -239,3 +239,72 @@ func TestGatewayTransportCreateMountIntentMalformedRefused(t *testing.T) {
 		})
 	}
 }
+
+// TestGatewayTransportCreateCarriesPluralMounts pins the ADR-0029 two-mount wire:
+// a create with mount_intents (uploads RO + outputs RW) lands BOTH mounts on the
+// spec in order, and the wire rules hold - setting both shapes is a 400, a
+// duplicate destination is a 400, an over-cap list is a 400; the provider is
+// never called on a refusal.
+func TestGatewayTransportCreateCarriesPluralMounts(t *testing.T) {
+	t.Parallel()
+	pair := newMTLSPair(t, "acme", "worker-7")
+	spy := &specRecordingProvider{}
+	addr, client := boundGatewayWithProvider(t, pair, spy)
+
+	uploads := map[string]any{"destination": "/mnt/user-data/uploads", "filesystem_id": "fs-two", "read_only": true}
+	outputs := map[string]any{"destination": "/mnt/user-data/outputs", "filesystem_id": "fs-two", "read_only": false}
+
+	code, body := gwPostText(t, client, addr, "/v1alpha/sessions", map[string]any{
+		"session_hint":  "two-mounts",
+		"image":         "registry.example/ocu-sandbox:v1",
+		"mount_intents": []any{uploads, outputs},
+	})
+	if code != http.StatusCreated {
+		t.Fatalf("two-mount create = %d (%s); want 201", code, body)
+	}
+	specs := spy.captured()
+	if len(specs) != 1 || len(specs[0].Mounts) != 2 {
+		t.Fatalf("captured specs = %+v; want 1 spec with 2 mounts", specs)
+	}
+	if got := specs[0].Mounts[0]; got.Destination != "/mnt/user-data/uploads" || !got.ReadOnly {
+		t.Fatalf("Mounts[0] = %+v; want the RO uploads mount first (order preserved)", got)
+	}
+	if got := specs[0].Mounts[1]; got.Destination != "/mnt/user-data/outputs" || got.ReadOnly {
+		t.Fatalf("Mounts[1] = %+v; want the RW outputs mount second", got)
+	}
+
+	refusals := []struct {
+		name string
+		body map[string]any
+	}{
+		{"both shapes set", map[string]any{
+			"session_hint": "s", "image": "registry.example/ocu-sandbox:v1",
+			"mount_intent":  uploads,
+			"mount_intents": []any{outputs},
+		}},
+		{"duplicate destination", map[string]any{
+			"session_hint": "s", "image": "registry.example/ocu-sandbox:v1",
+			"mount_intents": []any{uploads, uploads},
+		}},
+		{"over cap", map[string]any{
+			"session_hint": "s", "image": "registry.example/ocu-sandbox:v1",
+			"mount_intents": []any{
+				map[string]any{"destination": "/m1", "filesystem_id": "fs-two"},
+				map[string]any{"destination": "/m2", "filesystem_id": "fs-two"},
+				map[string]any{"destination": "/m3", "filesystem_id": "fs-two"},
+				map[string]any{"destination": "/m4", "filesystem_id": "fs-two"},
+				map[string]any{"destination": "/m5", "filesystem_id": "fs-two"},
+			},
+		}},
+	}
+	for _, tc := range refusals {
+		before := len(spy.captured())
+		code, body := gwPostText(t, client, addr, "/v1alpha/sessions", tc.body)
+		if code != http.StatusBadRequest {
+			t.Errorf("%s: create = %d (%s); want 400", tc.name, code, body)
+		}
+		if after := len(spy.captured()); after != before {
+			t.Errorf("%s: the provider was called on a refused create", tc.name)
+		}
+	}
+}

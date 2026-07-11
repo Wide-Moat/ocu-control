@@ -277,10 +277,14 @@ func writeReadError(w http.ResponseWriter, err error) {
 // fields are HINTS; the host-attested caller is derived from the connection, never
 // the body (NFR-SEC-43).
 type createBody struct {
-	SessionHint  string            `json:"session_hint"`
-	Image        string            `json:"image"`
-	MountIntent  *mountIntentBody  `json:"mount_intent"`
-	EgressPolicy *egressPolicyBody `json:"egress_policy"`
+	SessionHint string `json:"session_hint"`
+	Image       string `json:"image"`
+	// MountIntent is the LEGACY singular mount shape; it maps to a one-element
+	// list. MountIntents supersedes it (the ADR-0029 two-mount layout); a body
+	// setting BOTH is ambiguous and refused.
+	MountIntent  *mountIntentBody   `json:"mount_intent"`
+	MountIntents []mountIntentBody  `json:"mount_intents"`
+	EgressPolicy *egressPolicyBody  `json:"egress_policy"`
 }
 
 // egressPolicyBody is the wire shape of the per-session egress trust-edge policy,
@@ -316,7 +320,10 @@ type mountIntentBody struct {
 // uses). Each is a deny -> 400 invalid argument at decode, before any host
 // state exists.
 var (
-	errMountScopeConflict = errors.New("mount_intent: exactly one of filesystem_id / memory_store_id")
+	errMountScopeConflict  = errors.New("mount_intent: exactly one of filesystem_id / memory_store_id")
+	errMountShapesConflict = errors.New("mount_intent and mount_intents are mutually exclusive; use mount_intents")
+	errMountDupDestination = errors.New("mount_intents: duplicate destination")
+	errMountListOverCap    = errors.New("mount_intents: too many mounts")
 	errMountDestRelative  = errors.New("mount_intent: destination must be an absolute guest path")
 	errMountFSIDTooLong   = errors.New("mount_intent: filesystem_id exceeds 256 characters")
 	errMountMemIDTooLong  = errors.New("mount_intent: memory_store_id exceeds 256 characters")
@@ -351,18 +358,11 @@ func (b createBody) toRequest() (CreateRequest, error) {
 		SessionHint: b.SessionHint,
 		Image:       b.Image,
 	}
-	if b.MountIntent != nil {
-		if err := b.MountIntent.validate(); err != nil {
-			return CreateRequest{}, err
-		}
-		req.Mount = runtime.MountIntent{
-			Destination:   b.MountIntent.Destination,
-			FilesystemID:  b.MountIntent.FilesystemID,
-			MemoryStoreID: b.MountIntent.MemoryStoreID,
-			ReadOnly:      b.MountIntent.ReadOnly,
-			CacheSeconds:  int(b.MountIntent.CacheDurationS),
-		}
+	mounts, err := resolveMountBodies(b.MountIntent, b.MountIntents)
+	if err != nil {
+		return CreateRequest{}, err
 	}
+	req.Mounts = mounts
 	if b.EgressPolicy != nil {
 		req.Egress = runtime.EgressPolicy{
 			DefaultDeny:     b.EgressPolicy.DefaultDeny,
@@ -561,4 +561,48 @@ func writeMCPKeyError(w http.ResponseWriter, err error) {
 	default:
 		writeStatus(w, http.StatusServiceUnavailable, "mcp-key operation refused")
 	}
+}
+
+// maxMountIntents caps the per-session mount list: two is the shipped layout
+// (uploads RO + outputs RW), four leaves additive room without letting a caller
+// provision an unbounded mount fan-out.
+const maxMountIntents = 4
+
+// resolveMountBodies folds the singular-vs-plural mount fields into one
+// validated list. The shapes are mutually exclusive (both set is ambiguous and
+// refused); the legacy singular maps to a one-element list; each entry is
+// validated like the singular always was, plus list-level rules: bounded count
+// and pairwise-distinct destinations (two mounts on one mountpoint would shadow
+// each other in the guest).
+func resolveMountBodies(single *mountIntentBody, plural []mountIntentBody) ([]runtime.MountIntent, error) {
+	if single != nil && len(plural) > 0 {
+		return nil, errMountShapesConflict
+	}
+	entries := plural
+	if single != nil {
+		entries = []mountIntentBody{*single}
+	}
+	if len(entries) > maxMountIntents {
+		return nil, errMountListOverCap
+	}
+	seen := make(map[string]struct{}, len(entries))
+	mounts := make([]runtime.MountIntent, 0, len(entries))
+	for i := range entries {
+		e := entries[i]
+		if err := e.validate(); err != nil {
+			return nil, err
+		}
+		if _, dup := seen[e.Destination]; dup {
+			return nil, errMountDupDestination
+		}
+		seen[e.Destination] = struct{}{}
+		mounts = append(mounts, runtime.MountIntent{
+			Destination:   e.Destination,
+			FilesystemID:  e.FilesystemID,
+			MemoryStoreID: e.MemoryStoreID,
+			ReadOnly:      e.ReadOnly,
+			CacheSeconds:  int(e.CacheDurationS),
+		})
+	}
+	return mounts, nil
 }

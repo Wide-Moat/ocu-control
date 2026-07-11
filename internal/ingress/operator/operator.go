@@ -163,7 +163,7 @@ func (h *Handlers) Create(ctx context.Context, conn ingress.ConnInfo, req Create
 		Caller:      caller,
 		SessionHint: req.SessionHint,
 		Image:       req.Image,
-		Mount:       req.Mount,
+		Mounts:      req.Mounts,
 		Egress:      req.Egress,
 		Resources:   req.Resources,
 	}
@@ -319,9 +319,9 @@ type CreateRequest struct {
 	SessionHint string
 	// Image is the sandbox image reference the provider runs.
 	Image string
-	// Mount is the per-session storage mount intent (AuthToken is a later-phase
-	// placeholder).
-	Mount runtime.MountIntent
+	// Mounts are the per-session storage mount intents, one per guest
+	// mountpoint (AuthToken is a later-phase placeholder).
+	Mounts []runtime.MountIntent
 	// Egress is the per-session egress trust-edge policy.
 	Egress runtime.EgressPolicy
 	// Resources are the hard caps stamped onto the runtime.

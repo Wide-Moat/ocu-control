@@ -187,6 +187,14 @@ type EnrichedSessionRow struct {
 	// idle window as Clock.Now() minus this stamp — two in-process Clock readings,
 	// never a persisted-timestamp subtraction (NFR-SEC-48).
 	LastActivity *time.Time
+	// EffectiveScope is the per-chat storage scope derived at create when the
+	// deployment runs -derive-chat-scope (ADR-0030): "<base>-<hex>". It is nil until
+	// RecordEffectiveScope runs (derivation off, a no-scope create, or a
+	// pre-enrichment row). It is recorded read-surface data the caller-scoped status
+	// verb surfaces so a chat can confirm its isolated subtree; no authority is keyed
+	// on it (NFR-SEC-43) - the guest's minted Storage-JWT claim is the load-bearing
+	// isolation, not this label.
+	EffectiveScope *string
 }
 
 // QuotaDim names a counter dimension. The Store holds the counters; the policy

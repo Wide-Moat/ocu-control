@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"regexp"
 	"time"
 )
 
@@ -28,36 +29,51 @@ const (
 
 // config is the parsed serving invocation — the daemon's full flag surface.
 type config struct {
-	operatorListen  string        // operator/lifecycle ingress endpoint (distinct from gateway)
-	gatewayListen   string        // gateway service-identity ingress endpoint
-	runtimeTier     string        // deployment-wide isolation tier; never per-request
-	runtimeProvider string        // container backend behind the RuntimeProvider seam
-	workloadProfile string        // deployment-declared trust profile feeding the admission matrix; never per-request
-	guestImage      string        // deployment-declared default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); the body image is an override; unset + no body image is a fail-closed 400
-	guestImageAllow string        // comma-separated exact-match allow-list of guest images a create BODY may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only (deny-by-default)
-	grantedIntents  string        // comma-separated Storage-JWT intent ceiling (read|write|preview) the deployment serves (ADR-0029); empty = the pinned default (read,write); a claim outside it is refused fail-closed. The flag never grants, only narrows.
-	jwtSigningKey   string        // path to the Storage-JWT signing key (config/secret mount)
-	execSigningKey  string        // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
-	gatewayTLSCert  string        // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
-	gatewayTLSKey   string        // OPTIONAL gateway mTLS server-key PEM (all-or-none)
-	gatewayClientCA string        // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
-	jwtAlg          string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
-	storageIssuer   string        // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
-	storageAudience string        // provisional Storage-JWT aud (PIN-PENDING)
-	execIssuer      string        // provisional exec-JWT iss (PIN-PENDING)
-	execAudience    string        // provisional exec-JWT aud (PIN-PENDING)
-	serviceURL      string        // filestore service_url rendered into every mount-config
-	caCert          string        // path to the CA certificate PEM rendered into every mount-config
-	egressNetwork   string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
-	edgeHost        string        // OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (gVisor cannot reach docker embedded DNS); unset adds no entry
-	auditSink       string        // OCSF audit fan-in sink
-	stateDSN        string        // Postgres DSN for durable state; empty selects the in-memory store
-	jwksPath        string        // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
-	mcpKeysetPath   string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
-	mcpKeyFile      string        // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
-	sessionIdleTTL  time.Duration // OPTIONAL idle-session reaper window; 0 = unset (shelf-split resolution in resolveIdleTTL: off on the minimal shelf, ≤15 min ceiling on the full shelf per NFR-SEC-40)
-	create          bool          // a create request presented at startup (smoke hook)
+	operatorListen   string        // operator/lifecycle ingress endpoint (distinct from gateway)
+	gatewayListen    string        // gateway service-identity ingress endpoint
+	runtimeTier      string        // deployment-wide isolation tier; never per-request
+	runtimeProvider  string        // container backend behind the RuntimeProvider seam
+	workloadProfile  string        // deployment-declared trust profile feeding the admission matrix; never per-request
+	guestImage       string        // deployment-declared default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); the body image is an override; unset + no body image is a fail-closed 400
+	guestImageAllow  string        // comma-separated exact-match allow-list of guest images a create BODY may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only (deny-by-default)
+	grantedIntents   string        // comma-separated Storage-JWT intent ceiling (read|write|preview) the deployment serves (ADR-0029); empty = the pinned default (read,write); a claim outside it is refused fail-closed. The flag never grants, only narrows.
+	jwtSigningKey    string        // path to the Storage-JWT signing key (config/secret mount)
+	execSigningKey   string        // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
+	gatewayTLSCert   string        // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
+	gatewayTLSKey    string        // OPTIONAL gateway mTLS server-key PEM (all-or-none)
+	gatewayClientCA  string        // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
+	jwtAlg           string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
+	storageIssuer    string        // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
+	storageAudience  string        // provisional Storage-JWT aud (PIN-PENDING)
+	execIssuer       string        // provisional exec-JWT iss (PIN-PENDING)
+	execAudience     string        // provisional exec-JWT aud (PIN-PENDING)
+	serviceURL       string        // filestore service_url rendered into every mount-config
+	caCert           string        // path to the CA certificate PEM rendered into every mount-config
+	egressNetwork    string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
+	edgeHost         string        // OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (gVisor cannot reach docker embedded DNS); unset adds no entry
+	auditSink        string        // OCSF audit fan-in sink
+	stateDSN         string        // Postgres DSN for durable state; empty selects the in-memory store
+	jwksPath         string        // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
+	mcpKeysetPath    string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
+	mcpKeyFile       string        // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
+	sessionIdleTTL   time.Duration // OPTIONAL idle-session reaper window; 0 = unset (shelf-split resolution in resolveIdleTTL: off on the minimal shelf, ≤15 min ceiling on the full shelf per NFR-SEC-40)
+	deriveChatScope  bool          // per-chat storage-scope derivation (ADR-0030, D5); default false = today's single static scope. When on, control rewrites each mount FilesystemID to "<base>-<hex>" before minting the Storage-JWT, so two chats mint distinct scopes
+	storageScopeBase string        // OPTIONAL deployment-declared storage-scope base fsid the derivation suffixes; unset = the base rides each create request's mount. When -derive-chat-scope is on, a base already carrying a 16-hex suffix is refused (no double-derivation)
+	create           bool          // a create request presented at startup (smoke hook)
 }
+
+// derivedScopeSuffixRe matches a storage-scope base that already carries a
+// 16-hex-char derivation suffix ("<base>-[0-9a-f]{16}$"). When -derive-chat-scope
+// is on, a base of this shape is refused at boot: deriving a second suffix onto an
+// already-derived base ("<base>-<hex>-<hex>") is a double-derivation config error
+// (ADR-0030), and the north-face shape guard would also mis-classify it. The check
+// is on the deployment-fixed service scope, not any request body.
+var derivedScopeSuffixRe = regexp.MustCompile(`-[0-9a-f]{16}$`)
+
+// errBaseAlreadyDerived is the typed refusal for a storage-scope base that already
+// looks derived when -derive-chat-scope is on. It is refused, not silently
+// double-derived, so an operator cannot stack suffixes into an unreachable subtree.
+var errBaseAlreadyDerived = errors.New("storage-scope base already carries a 16-hex derivation suffix; -derive-chat-scope would double-derive it")
 
 // sessionIdleCeiling is the maximum idle-session window the full shelf permits
 // (NFR-SEC-40). An idle ACTIVE session is terminated and its concurrency slot
@@ -163,6 +179,16 @@ func parse(args []string) (config, runMode, error) {
 			"shelf (empty -state-dsn) and resolves to the ≤15 min ceiling on the full shelf; a "+
 			"full-shelf value above the ceiling is refused, not clamped. An idle ACTIVE session "+
 			"past its window is force-killed and its concurrency slot returned")
+	fs.BoolVar(&cfg.deriveChatScope, "derive-chat-scope", false,
+		"per-chat storage-scope derivation (ADR-0030, D5). Default false = today's single static scope. "+
+			"When true, control rewrites each storage mount FilesystemID to \"<base>-<16hex>\" before minting "+
+			"the Storage-JWT, so two chats of one owner mint DISTINCT scopes and a peer chat's guest gets a "+
+			"different credential. The suffix is derived from the host-attested owner and host-minted handle, "+
+			"never a request body (NFR-SEC-43)")
+	fs.StringVar(&cfg.storageScopeBase, "storage-scope-base", "",
+		"OPTIONAL deployment-declared storage-scope base fsid the -derive-chat-scope suffix is appended to; "+
+			"unset means the base rides each create request's mount. When -derive-chat-scope is on, a base that "+
+			"already carries a 16-hex derivation suffix is refused at boot (no double-derivation)")
 	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	fs.BoolVar(&healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")
@@ -260,6 +286,16 @@ func validate(cfg config) error {
 	// is purely the fail-closed enum gate.
 	if _, err := resolveGrantedIntents(cfg); err != nil {
 		return err
+	}
+
+	// When -derive-chat-scope is on and the deployment declares a fixed base fsid, a
+	// base already carrying a 16-hex derivation suffix is refused pre-bind: deriving a
+	// second suffix onto "<base>-<hex>" would produce an unreachable "<base>-<hex>-<hex>"
+	// subtree (ADR-0030 double-derivation), so the misconfiguration aborts boot loudly
+	// rather than silently minting into a subtree no chat can address. An empty base
+	// (the default: the base rides each request) skips the check.
+	if cfg.deriveChatScope && cfg.storageScopeBase != "" && derivedScopeSuffixRe.MatchString(cfg.storageScopeBase) {
+		return fmt.Errorf("%w: -storage-scope-base %q", errBaseAlreadyDerived, cfg.storageScopeBase)
 	}
 
 	return nil

@@ -106,6 +106,12 @@ type rowEnrichment struct {
 	// reclaim (NFR-SEC-48). It is set to activeAt at activation and advanced by
 	// TouchActivity; the zero value on a still-RESERVED row means "no activity yet".
 	lastActivity time.Time
+	// effectiveScope is the per-chat storage scope recorded at activation by
+	// RecordEffectiveScope (ADR-0030): "<base>-<hex>" when the deployment derives
+	// per-chat scopes, empty otherwise. LiveSessionsEnriched maps a non-empty value
+	// to a *string and an empty value to nil, mirroring the NULLABLE Postgres column.
+	// A re-Reserve over a tombstone overwrites the whole entry, clearing it.
+	effectiveScope string
 }
 
 // NewInMemory returns the in-memory Store backed by clk. It is safe for
@@ -406,6 +412,10 @@ func (m *memStore) LiveSessionsEnriched(ctx context.Context) ([]EnrichedSessionR
 			la := en.lastActivity
 			enriched.LastActivity = &la
 		}
+		if en.effectiveScope != "" {
+			es := en.effectiveScope
+			enriched.EffectiveScope = &es
+		}
 		if en.caps != nil {
 			// Copy the caps (and the PidsLimit pointer target) so the returned
 			// snapshot does not alias the stored enrichment.
@@ -483,6 +493,34 @@ func (m *memStore) TouchActivity(ctx context.Context, key string, now time.Time)
 
 	en := m.enrichment[key]
 	en.lastActivity = now
+	m.enrichment[key] = en
+	return nil
+}
+
+// RecordEffectiveScope stamps the per-chat effective storage scope onto the
+// enrichment for an already-committed (ACTIVE) row, out of band of the frozen
+// Commit (registry.EffectiveScopeRecorder seam, ADR-0030). It takes the key stripe
+// then rowMu, the same order the reservation mutators use, so it serializes against
+// a Reserve or Commit on the same key. It is idempotent: re-recording overwrites
+// with the same data. A cancelled context fails closed with ErrStoreUnavailable. It
+// does not require the row to exist - a missing or already-RELEASED row simply
+// records the enrichment LiveSessionsEnriched will ignore (it enumerates live rows
+// only), so a late record after a fast release is a harmless no-op on the read
+// surface rather than an error the create path must handle.
+func (m *memStore) RecordEffectiveScope(ctx context.Context, key string, scope string) error {
+	if err := ctxErr(ctx); err != nil {
+		return err
+	}
+
+	stripe := m.keyStripe(key)
+	stripe.Lock()
+	defer stripe.Unlock()
+
+	m.rowMu.Lock()
+	defer m.rowMu.Unlock()
+
+	en := m.enrichment[key]
+	en.effectiveScope = scope
 	m.enrichment[key] = en
 	return nil
 }
