@@ -203,12 +203,20 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 			writeDecodeError(w, err)
 			return
 		}
-		row, err := h.Status(r.Context(), scope, conn, body.SessionHint)
+		// Route through the ENRICHED read path (ADR-0030, D5) so the caller's OWN status
+		// carries the per-chat effective_scope. The frozen Status returns the frozen
+		// SessionRow, which cannot carry the read-surface enrichment; StatusEnriched reads
+		// the EnrichedSessionRow via the audience-scoped enriched lookup.
+		row, err := h.StatusEnriched(r.Context(), scope, conn, body.SessionHint)
 		if err != nil {
 			writeServiceError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusOK, sessionResponse{Key: row.Key, State: int(row.State)})
+		var effectiveScope string
+		if row.EffectiveScope != nil {
+			effectiveScope = *row.EffectiveScope
+		}
+		writeJSON(w, http.StatusOK, sessionResponse{Key: row.Key, State: int(row.State), EffectiveScope: effectiveScope})
 	})
 
 	mux.HandleFunc("/v1alpha/sessions/exec", func(w http.ResponseWriter, r *http.Request) {
@@ -449,6 +457,12 @@ type hintBody struct {
 type sessionResponse struct {
 	Key   string `json:"key"`
 	State int    `json:"state"`
+	// EffectiveScope is the per-chat storage scope the deployment derived for this
+	// session (ADR-0030, D5): "<base>-<hex>" when -derive-chat-scope is on, otherwise
+	// empty and omitted. The caller reads it to confirm its isolated subtree (the
+	// file-pane resolves its cooperative view against it); no authority is keyed on it
+	// (NFR-SEC-43) - the guest's minted Storage-JWT claim is the real isolation.
+	EffectiveScope string `json:"effective_scope,omitempty"`
 }
 
 // decodeJSON decodes the request body into v, rejecting unknown fields. An empty

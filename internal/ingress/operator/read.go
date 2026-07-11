@@ -93,6 +93,11 @@ type SessionView struct {
 	Caps          *CapsView  `json:"caps,omitempty"`
 	ReservedAt    time.Time  `json:"reserved_at"`
 	ActiveAt      *time.Time `json:"active_at,omitempty"`
+	// EffectiveScope is the per-chat storage scope recorded at create when the
+	// deployment runs -derive-chat-scope (ADR-0030, D5): "<base>-<hex>". Nil/omitted
+	// when derivation is off or the create named no storage scope. Recorded data the
+	// surface renders, never authority (NFR-SEC-43).
+	EffectiveScope *string `json:"effective_scope,omitempty"`
 }
 
 // OwnerView is the host-derived owner pair the surface renders. It is labelling
@@ -138,12 +143,13 @@ func lowercaseState(s state.SessionState) string {
 // include_released is set, which the enumeration handles upstream).
 func toSessionView(row state.EnrichedSessionRow) SessionView {
 	v := SessionView{
-		Key:           row.Key,
-		Owner:         OwnerView{Tenant: row.Owner.Tenant, Caller: row.Owner.Caller},
-		State:         lowercaseState(row.State),
-		ContainerName: row.ContainerName,
-		ReservedAt:    row.ReservedAt,
-		ActiveAt:      row.ActiveAt,
+		Key:            row.Key,
+		Owner:          OwnerView{Tenant: row.Owner.Tenant, Caller: row.Owner.Caller},
+		State:          lowercaseState(row.State),
+		ContainerName:  row.ContainerName,
+		ReservedAt:     row.ReservedAt,
+		ActiveAt:       row.ActiveAt,
+		EffectiveScope: row.EffectiveScope,
 	}
 	if row.Caps != nil {
 		v.Caps = &CapsView{

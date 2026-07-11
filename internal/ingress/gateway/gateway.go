@@ -142,6 +142,21 @@ func (h *Handlers) Status(ctx context.Context, _ ingress.ServiceScope, conn ingr
 	return h.manager.Status(ctx, caller, sessionHint)
 }
 
+// StatusEnriched returns the caller's OWN ENRICHED session row addressed by
+// sessionHint (ADR-0030, D5), the read-surface complement of Status: it carries
+// the per-chat effective_scope the frozen SessionRow cannot. It routes through the
+// Manager's audience-scoped enriched read (the SAME host-derived handle->Key
+// derivation and ErrNotOwned collapse as Status), so a foreign or absent row
+// discloses nothing (NFR-SEC-43). The host-derived caller is the authority; the
+// body hint only ADDRESSES the caller's own namespace.
+func (h *Handlers) StatusEnriched(ctx context.Context, _ ingress.ServiceScope, conn ingress.ConnInfo, sessionHint string) (state.EnrichedSessionRow, error) {
+	caller, err := h.resolveCaller(ctx, conn)
+	if err != nil {
+		return state.EnrichedSessionRow{}, err
+	}
+	return h.manager.StatusEnriched(ctx, caller, sessionHint)
+}
+
 // Exec runs one command in the caller's OWN session guest. The host-derived caller
 // gates the row lookup exactly as Destroy/Status do — a foreign or absent
 // sessionHint yields registry.ErrNotOwned (indistinguishable from not-found), so a

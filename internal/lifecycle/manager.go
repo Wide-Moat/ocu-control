@@ -84,6 +84,16 @@ var ErrUnattested = errors.New("lifecycle: caller identity unattested, refused (
 // the store or another tenant's row must NEVER be wrapped here.
 var ErrInvalidArgument = errors.New("lifecycle: invalid create argument")
 
+// ErrScopeTooLong is the fail-closed refusal of stageDeriveChatScope when a
+// per-chat derivation would push a mount FilesystemID past the 256-rune scope
+// ceiling. The derived scope is "<base>-<16hex>"; a base already near the ceiling
+// plus the suffix could exceed it, and an over-long scope must not silently
+// truncate into a different subtree or reach the edge malformed. The create is
+// refused before any token is minted (no session state leaks). The gateway maps
+// it through the generic service-error path; it is deployment-config-derived (the
+// base is host-set), so it discloses no tenant state.
+var ErrScopeTooLong = errors.New("lifecycle: derived chat scope exceeds the length ceiling")
+
 // CreateInput is what an ingress hands the Manager. It carries NO trusted identity:
 // the authority is the host-derived AuthenticatedCaller the ingress resolved, and
 // SessionHint is explicitly a HINT — it seeds the human-readable host-minted handle,
@@ -219,6 +229,16 @@ type ManagerDeps struct {
 	// Question #2). Publishing is best-effort and NON-FATAL — it never blocks or fails
 	// a create/destroy.
 	Events EventPublisher
+
+	// DeriveChatScope gates the per-chat storage-scope derivation (ADR-0030, D5).
+	// When true, the create pipeline rewrites each storage mount's FilesystemID from
+	// the deployment base to "<base>-<scopeHandle(owner,handle)>" before the
+	// Storage-JWT is minted, so two chats of the same owner mint DISTINCT scopes and
+	// a peer chat's guest gets a different credential. When false (the default) the
+	// deployment base is used unchanged, which is today's single-scope behaviour. The
+	// derivation authority is host-derived (attested owner + host-minted handle),
+	// never a request body (NFR-SEC-43).
+	DeriveChatScope bool
 }
 
 // Recorder is the NARROW observability port the Manager records lifecycle metrics
@@ -321,6 +341,11 @@ type Manager struct {
 	// events is the design-fenced live-view fan-out. nil is a clean no-op (the guarded
 	// publishEvent), so the base pipeline runs without a fan-out hub wired.
 	events EventPublisher
+
+	// deriveChatScope gates stageDeriveChatScope (ADR-0030). false (the default) keeps
+	// the deployment base scope unchanged; true rewrites each mount FilesystemID to the
+	// per-chat "<base>-<hex>" before the mint stage reads it.
+	deriveChatScope bool
 }
 
 // NewManager constructs a Manager from its deps and binds the canon create order
@@ -350,8 +375,9 @@ func NewManager(deps ManagerDeps) *Manager {
 		controlDialer:  deps.ControlDialer,
 		execDriver:     deps.ExecDriver,
 		execVerifyKey:  deps.ExecVerifyKey,
-		metrics:        deps.Metrics,
-		events:         deps.Events,
+		metrics:         deps.Metrics,
+		events:          deps.Events,
+		deriveChatScope: deps.DeriveChatScope,
 	}
 	// Build the body-image override allow-set: the explicitly listed images plus the
 	// deployment default (implicitly allowed — the operator already trusted it by
@@ -378,6 +404,7 @@ func NewManager(deps ManagerDeps) *Manager {
 		{name: "quotaCharge", run: stageQuotaCharge, emitsOwnRejection: true},
 		{name: "reserve", run: stageReserve, emitsOwnRejection: true},
 		{name: "stageHandoff", run: stageStageHandoff},
+		{name: "deriveChatScope", run: stageDeriveChatScope},
 		{name: "mintStorageJWT", run: stageMintStorageJWT},
 		{name: "renderPushMount", run: stageRenderPushMount},
 		{name: "materialize", run: stageMaterialize},
@@ -435,6 +462,11 @@ type createState struct {
 	// pushed is the host-side handle to the pushed mount-config; its Scrub is the
 	// render stage's compensator and (later) the finalizer's scrub-trigger.
 	pushed provisioning.Pushed
+	// effectiveScope is the per-chat storage scope stageDeriveChatScope derived
+	// (ADR-0030): "<base>-<hex>" when derivation is on and a storage mount was
+	// provisioned, otherwise empty. stageCommit records it out of band on the
+	// enriched row so the caller-scoped status verb can read it back.
+	effectiveScope string
 }
 
 // Create runs the ordered fail-closed pipeline (m.stages) with a LIFO unwind stack.
@@ -786,6 +818,29 @@ func (m *Manager) Status(ctx context.Context, caller ingress.AuthenticatedCaller
 	row, err := m.reg.LookupForCaller(ctx, key, owner)
 	if err != nil {
 		return state.SessionRow{}, fmt.Errorf("lifecycle: status lookup: %w", err)
+	}
+	return row, nil
+}
+
+// StatusEnriched returns the caller's OWN ENRICHED session row addressed by
+// sessionHint (ADR-0030, D5). It is the read-surface complement of Status: where
+// Status returns the frozen state.SessionRow (no read-surface enrichment), this
+// routes through the Custodian's LookupForCallerEnriched so the caller-scoped
+// status verb can surface effective_scope without widening the frozen core. It
+// applies the SAME host-derived handle->Key derivation and audience scoping: a
+// foreign or absent row yields registry.ErrNotOwned (indistinguishable from
+// not-found), so a caller can neither read another tenant's scope nor probe its
+// existence (NFR-SEC-43). It is a pure read: it audits nothing and mutates
+// nothing. An empty host identity is refused fail-closed before any Store read.
+func (m *Manager) StatusEnriched(ctx context.Context, caller ingress.AuthenticatedCaller, sessionHint string) (state.EnrichedSessionRow, error) {
+	owner := caller.Identity
+	if owner.Caller == "" || owner.Tenant == "" {
+		return state.EnrichedSessionRow{}, ErrUnattested
+	}
+	key := registry.DeriveKey(owner, mintHandle(sessionHint))
+	row, err := m.reg.LookupForCallerEnriched(ctx, key, owner)
+	if err != nil {
+		return state.EnrichedSessionRow{}, fmt.Errorf("lifecycle: status-enriched lookup: %w", err)
 	}
 	return row, nil
 }

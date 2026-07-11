@@ -206,6 +206,69 @@ func hasAnyStorageScope(mounts []runtime.MountIntent) bool {
 	return false
 }
 
+// scopeCeiling is the maximum rune length a derived mount FilesystemID may reach.
+// A derived scope is "<base>-<16hex>"; a base near this ceiling plus the suffix
+// could exceed it, and an over-long scope must never silently truncate into a
+// different subtree or reach the edge malformed. stageDeriveChatScope fails the
+// create closed (ErrScopeTooLong) rather than emit a truncated scope.
+const scopeCeiling = 256
+
+// stageDeriveChatScope derives the per-chat storage scope (ADR-0030, D5) and
+// rewrites each provisioned mount's FilesystemID from the deployment base to
+// "<base>-<scopeHandle(owner,handle)>" IN PLACE, so the mint (S6), render (S7),
+// and materialize (S8) stages that follow all read the derived value. It runs
+// IMMEDIATELY BEFORE the mint stage: handoff (S5) has already set st.handle and
+// st.owner (resolveIdentity mints the handle, handoff stages under it), and the
+// mint keys the Storage-JWT claim on the mount FilesystemID, so the rewrite must
+// land before the mint reads it.
+//
+// It is gated on m.deriveChatScope: when false (today's single-scope default) it
+// is a clean no-op returning (nil, nil), leaving every mount on the deployment
+// base. When true it derives ONE suffix from the host-attested owner and the
+// host-minted handle (never a body hint, NFR-SEC-43) and applies it to every
+// non-empty-base storage mount, so the two-mount uploads/outputs pair of one chat
+// share a subtree distinct from any other chat's. A mount with an empty
+// FilesystemID (a pure memory-store mount, or a no-scope compute session) is left
+// untouched: there is no base to suffix. A derived scope exceeding the rune
+// ceiling fails the create closed (ErrScopeTooLong) before any token is minted.
+//
+// It is COMPENSATOR-FREE by construction: the rewrite mutates only the in-memory
+// createState copy of the mounts, so a downstream failure that unwinds the
+// pipeline discards st along with the rewritten mounts. No host state, token, or
+// substrate carries the derived scope at this point (the mint and push stages
+// come AFTER), so there is nothing to reverse. It records st.effectiveScope for
+// the commit stage's out-of-band read-surface write.
+func stageDeriveChatScope(_ context.Context, m *Manager, st *createState) (compensator, error) {
+	if !m.deriveChatScope {
+		return nil, nil
+	}
+	suffix := scopeHandle(st.owner, st.handle)
+	var effective string
+	for i := range st.in.Mounts {
+		base := st.in.Mounts[i].FilesystemID
+		if base == "" {
+			// No base to suffix (a memory-store-only or no-scope mount); leave it.
+			continue
+		}
+		derived := base + "-" + suffix
+		if len([]rune(derived)) > scopeCeiling {
+			// Fail closed before the mint: an over-long scope must not truncate into a
+			// different subtree or reach the edge malformed. Nothing external was
+			// effected (mint/push/materialize all follow), so no compensator is owed.
+			return nil, fmt.Errorf("%w: %q (%d runes > %d)", ErrScopeTooLong, derived, len([]rune(derived)), scopeCeiling)
+		}
+		st.in.Mounts[i].FilesystemID = derived
+		// Record the derived scope for the read-surface write. Every non-empty mount
+		// of one create shares the same base and suffix, so the first derived value is
+		// the session's effective scope.
+		if effective == "" {
+			effective = derived
+		}
+	}
+	st.effectiveScope = effective
+	return nil, nil
+}
+
 // stageMintStorageJWT (S6) mints the weak, edge-only Storage-JWT for the session's
 // mount, keyed on the HOST-DERIVED session key (never a body hint, NFR-SEC-43).
 // The Signer records the jti against that key on the shared Revoker, so the
@@ -406,6 +469,20 @@ func stageCommit(ctx context.Context, m *Manager, st *createState) (compensator,
 	// the read surface simply lacks the enrichment for this row until it is
 	// re-recorded. It MUST NOT unwind the commit.
 	_ = m.reg.RecordActivation(ctx, st.key, runtimemap.CapsToState(st.in.Resources), m.clk.Now())
+
+	// Record the per-chat effective storage scope (ADR-0030) out of band of the
+	// frozen Commit, keyed on the host-derived key, so the caller-scoped status verb
+	// can read it back on the enriched row. It is NON-FATAL exactly as
+	// RecordActivation is: the row is already ACTIVE and correct, and the scope was
+	// already minted into the guest's Storage-JWT claim (the load-bearing isolation
+	// property) BEFORE this write. If this record fails, the read surface simply lacks
+	// the scope for this row until re-recorded; recovery is a re-derivation from the
+	// persisted owner+handle (both durable on the row via DeriveKey's inputs), not a
+	// stored secret. An empty effectiveScope (derivation off, or a no-scope create)
+	// records nothing. It MUST NOT unwind the commit.
+	if st.effectiveScope != "" {
+		_ = m.reg.RecordEffectiveScope(ctx, st.key, st.effectiveScope)
+	}
 
 	// Observe the reserved->active start duration into the admin /metrics histogram
 	// — a MONOTONIC interval (clk.Since), so a wall-clock setback between reserve and
