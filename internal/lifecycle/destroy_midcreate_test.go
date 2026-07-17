@@ -18,8 +18,8 @@ import (
 )
 
 // commitHookStore wraps the harness store and runs afterCommit exactly once,
-// synchronously, immediately after a successful Commit — that is, INSIDE the
-// create pipeline, in the commit→bind window. It turns the probabilistic
+// synchronously, immediately after a successful Commit -- that is, INSIDE the
+// create pipeline, in the commit->bind window. It turns the probabilistic
 // TestRace_CreateVsDestroySameKey interleaving (~1 orphan in hundreds of rounds)
 // into a deterministic schedule: the destroy is guaranteed to observe the row
 // ACTIVE with no container name bound yet.
@@ -48,7 +48,7 @@ func (s *commitHookStore) Commit(ctx context.Context, key string, owner state.Id
 //
 // Before the tombstone guard, BindContainerName silently succeeded onto the
 // RELEASED row: the create reported SUCCESS for a session the destroy had
-// already torn down, no unwind ran, and the container leaked — exactly the
+// already torn down, no unwind ran, and the container leaked -- exactly the
 // activeRows==0 && liveCount==1 orphan the race test catches probabilistically.
 func TestDestroyInCommitBindWindowLeavesNoOrphan(t *testing.T) {
 	t.Parallel()
@@ -76,7 +76,7 @@ func TestDestroyInCommitBindWindowLeavesNoOrphan(t *testing.T) {
 		ExecVerifyKey: pub32(),
 	})
 
-	// The destroy runs synchronously inside the create's commit→bind window.
+	// The destroy runs synchronously inside the create's commit->bind window.
 	var destroyErr error
 	hook.afterCommit = func() { destroyErr = mgr.Destroy(ctx, testCaller, hint) }
 
@@ -84,11 +84,11 @@ func TestDestroyInCommitBindWindowLeavesNoOrphan(t *testing.T) {
 
 	// The destroy legitimately tore down the just-committed ACTIVE session.
 	if destroyErr != nil {
-		t.Fatalf("Destroy inside the commit→bind window = %v; want nil (it addressed a live ACTIVE row)", destroyErr)
+		t.Fatalf("Destroy inside the commit->bind window = %v; want nil (it addressed a live ACTIVE row)", destroyErr)
 	}
 	// The create must NOT report success for a session the destroy tombstoned
 	// mid-flight: its bind lands on the RELEASED row, refuses, and the pipeline
-	// unwinds. A nil error here is the resurrection bug — the caller would hold
+	// unwinds. A nil error here is the resurrection bug -- the caller would hold
 	// a "live" session whose row is a tombstone.
 	if createErr == nil {
 		t.Fatal("Create returned nil after its session was destroyed mid-flight; want the bind-stage refusal (the row is a RELEASED tombstone)")
@@ -97,7 +97,7 @@ func TestDestroyInCommitBindWindowLeavesNoOrphan(t *testing.T) {
 	// No orphan: the create's unwind removed the container the destroy's
 	// teardown could not address (its row snapshot carried no container name).
 	if got := provider.liveCount(); got != 0 {
-		t.Fatalf("%d container(s) survive with no live row — the create's unwind did not reclaim its materialize", got)
+		t.Fatalf("%d container(s) survive with no live row -- the create's unwind did not reclaim its materialize", got)
 	}
 	// And no live row: the tombstone is the terminal state.
 	live, err := hook.LiveSessions(ctx)

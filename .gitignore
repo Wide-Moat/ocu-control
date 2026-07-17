@@ -46,6 +46,6 @@ build/
 CLAUDE.local.md
 
 # Developer-local workspace override (e.g. a pre-release host/exec checkout);
-# never committed — the pinned go.mod is the buildable truth.
+# never committed -- the pinned go.mod is the buildable truth.
 go.work
 go.work.sum

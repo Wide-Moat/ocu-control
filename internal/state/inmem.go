@@ -295,8 +295,8 @@ func (m *memStore) BindContainerName(ctx context.Context, key string, owner Iden
 	}
 	if row.State == StateReleased {
 		// RELEASED is a terminal tombstone: a destroy that lands inside the
-		// create's commit→bind window must make this bind REFUSE (so the create
-		// fails its bind stage and unwinds its container) — a silent bind onto
+		// create's commit->bind window must make this bind REFUSE (so the create
+		// fails its bind stage and unwinds its container) -- a silent bind onto
 		// the tombstone let the create report success for a destroyed session
 		// and orphaned the container. Mirrors Commit's wrong-state refusal.
 		return SessionRow{}, ErrReservationConflict

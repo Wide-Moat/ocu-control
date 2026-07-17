@@ -350,7 +350,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 
 	t.Run("BindContainerName refuses a RELEASED tombstone (no bind onto a dead row)", func(t *testing.T) {
 		s := newFixture()
-		// A destroy can tombstone the row inside the create's commit→bind window:
+		// A destroy can tombstone the row inside the create's commit->bind window:
 		// the bind that then lands must REFUSE, so the create fails its bind stage
 		// and unwinds its container. A bind that silently succeeded onto the
 		// tombstone let the create report success for a destroyed session and
