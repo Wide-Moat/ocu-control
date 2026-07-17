@@ -108,3 +108,99 @@ func TestDestroyInCommitBindWindowLeavesNoOrphan(t *testing.T) {
 		t.Fatalf("%d live row(s) after the settled destroy-mid-create, want 0", len(live))
 	}
 }
+
+// TestDestroyInCommitBindWindowKeepsConcurrencyCount pins the slot-ownership
+// rule for the same interleaving: the concurrency slot is owned by the CREATE
+// from admission until its bind succeeds (then the session owns it) or its
+// unwind refunds it. A Destroy that releases a row still unbound (empty
+// ContainerName on the released row = the bind had not landed) must NOT
+// ReleaseConcurrency -- that refund is still the create's to make via its
+// unwind. A destroy that also decremented handed the tenant a double credit:
+// with another session legitimately holding a slot, the cell under-counted by
+// one (over-admitting a later create). The seeded live session below makes the
+// under-count observable -- without it the store's saturate-at-zero would mask
+// the double credit.
+func TestDestroyInCommitBindWindowKeepsConcurrencyCount(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	clk := state.NewFakeClock(lifeStart)
+	hook := &commitHookStore{listerStore: newListerStore(state.NewInMemory(clk))}
+	cust := registry.NewCustodian(hook)
+	provider := newRecordingProvider()
+	stager := newFaultStager(t.TempDir())
+	sink := audit.NewRecordingFake()
+	gate := quota.NewGate(hook, clk, generousLimits())
+
+	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+		Custodian:     cust,
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
+		ExecVerifyKey: pub32(),
+	})
+
+	// Seed one live session holding one slot; the hook is not armed yet, so its
+	// commit passes through untouched.
+	if _, err := mgr.Create(ctx, input("held-session")); err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+
+	// Now the destroy-mid-create interleaving on a second hint.
+	hook.afterCommit = func() { _ = mgr.Destroy(ctx, testCaller, "destroyed-mid-create-2") }
+	if _, err := mgr.Create(ctx, input("destroyed-mid-create-2")); err == nil {
+		t.Fatal("Create returned nil after its session was destroyed mid-flight; want the bind-stage refusal")
+	}
+
+	// The tenant's cell must still count exactly the seeded live session: the
+	// raced create's charge was refunded ONCE (by its own unwind), never twice.
+	concKey := state.QuotaKey{Dim: state.DimConcurrentSessions, Identity: testCaller.Identity}
+	level, err := hook.Charge(ctx, concKey, 0, 1<<30)
+	if err != nil {
+		t.Fatalf("read concurrency cell: %v", err)
+	}
+	if level != 1 {
+		t.Fatalf("concurrency cell = %d, want 1 (the seeded session's slot; a destroy-mid-create must not double-credit the raced create's slot)", level)
+	}
+}
+
+// TestDoubleDestroyReturnsTheSlotOnce pins the other face of the same
+// slot-ownership rule: a REPEATED destroy of an already-RELEASED session tears
+// nothing down (the lookup has no state filter, and Release is an idempotent
+// no-op on a tombstone), so it must not return the slot a second time. The
+// first destroy returned it; a second unconditional decrement hands the tenant
+// another credit and under-counts the cell exactly like the mid-create race.
+// The seeded live session makes it observable past the saturate-at-zero floor.
+func TestDoubleDestroyReturnsTheSlotOnce(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	h := newHarness(t)
+
+	if _, err := h.mgr.Create(ctx, input("held-session")); err != nil {
+		t.Fatalf("seed Create: %v", err)
+	}
+	if _, err := h.mgr.Create(ctx, input("victim")); err != nil {
+		t.Fatalf("victim Create: %v", err)
+	}
+	if err := h.mgr.Destroy(ctx, testCaller, "victim"); err != nil {
+		t.Fatalf("first Destroy: %v", err)
+	}
+	// The repeat destroy addresses the tombstone: idempotent, and slot-neutral.
+	if err := h.mgr.Destroy(ctx, testCaller, "victim"); err != nil {
+		t.Fatalf("second Destroy: %v", err)
+	}
+
+	concKey := state.QuotaKey{Dim: state.DimConcurrentSessions, Identity: testCaller.Identity}
+	level, err := h.store.Charge(ctx, concKey, 0, 1<<30)
+	if err != nil {
+		t.Fatalf("read concurrency cell: %v", err)
+	}
+	if level != 1 {
+		t.Fatalf("concurrency cell = %d, want 1 (a repeat destroy of a tombstone must not return the slot again)", level)
+	}
+}
