@@ -348,6 +348,38 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		}
 	})
 
+	t.Run("BindContainerName refuses a RELEASED tombstone (no bind onto a dead row)", func(t *testing.T) {
+		s := newFixture()
+		// A destroy can tombstone the row inside the create's commit→bind window:
+		// the bind that then lands must REFUSE, so the create fails its bind stage
+		// and unwinds its container. A bind that silently succeeded onto the
+		// tombstone let the create report success for a destroyed session and
+		// orphaned the container (the TestRace_CreateVsDestroySameKey flake).
+		// RELEASED is a terminal tombstone: no reservation mutator writes to it.
+		mustReserve(ctx, t, s, "k1", owner)
+		mustCommit(ctx, t, s, "k1", owner)
+		if _, err := s.Release(ctx, "k1", owner); err != nil {
+			t.Fatalf("Release: unexpected error %v", err)
+		}
+		if _, err := s.BindContainerName(ctx, "k1", owner, "ctr-1"); !errors.Is(err, state.ErrReservationConflict) {
+			t.Fatalf("bind onto a RELEASED tombstone: want ErrReservationConflict, got %v", err)
+		}
+		// The tombstone is unchanged: no container name landed on the dead row.
+		if got := mustLookup(ctx, t, s, "k1"); got.ContainerName != "" {
+			t.Fatalf("tombstone container_name = %q, want empty (the refused bind must not write)", got.ContainerName)
+		}
+
+		// The same refusal holds for a row released straight from RESERVED (a
+		// destroy that raced ahead of the create's commit).
+		mustReserve(ctx, t, s, "k2", owner)
+		if _, err := s.Release(ctx, "k2", owner); err != nil {
+			t.Fatalf("Release k2: unexpected error %v", err)
+		}
+		if _, err := s.BindContainerName(ctx, "k2", owner, "ctr-2"); !errors.Is(err, state.ErrReservationConflict) {
+			t.Fatalf("bind onto a reserved-then-released tombstone: want ErrReservationConflict, got %v", err)
+		}
+	})
+
 	t.Run("BindContainerName rejects a container_name already bound to another row", func(t *testing.T) {
 		s := newFixture()
 		mustReserve(ctx, t, s, "k1", owner)
