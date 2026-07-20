@@ -92,12 +92,13 @@ func (c *Collector) IncDestroy() {
 	c.mu.Unlock()
 }
 
-// IncQuotaRefundFailed records one quota-refund compensator failure on the create
-// unwind — a refund that could not be applied and was swallowed, leaving the
-// concurrency cell drifted until the boot cell-reconcile heals it. It is the
-// observability half of the create-abort concurrency-leak fix: the boot reconcile
-// self-heals the drift, this counter makes the drift's cause visible so it is never
-// silent.
+// IncQuotaRefundFailed records one quota-refund compensator failure -- a refund that
+// could not be applied, leaving the concurrency cell drifted until the boot cell-
+// reconcile heals it. The condition is path-independent: it fires on the create unwind
+// (stages.go), the idle-reap release (reapOne), and the orphan-reclaim release
+// (reclaimOrphanRow). The boot reconcile self-heals the drift; this counter makes the
+// drift's cause visible so it is never silent (the reap/reclaim paths return the error
+// to a daemon tick that has no logger, so without this the drift would be invisible).
 func (c *Collector) IncQuotaRefundFailed() {
 	c.mu.Lock()
 	c.quotaRefundFailedTotal++
@@ -208,7 +209,7 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	writeln(w, "# HELP ocu_control_session_destroys_total Sessions successfully destroyed.")
 	writeln(w, "# TYPE ocu_control_session_destroys_total counter")
 	fmt.Fprintf(w, "ocu_control_session_destroys_total %d\n", destroys)
-	writeln(w, "# HELP ocu_control_quota_refund_failed_total Quota-refund compensator failures on the create unwind (leaked-counter alarm).")
+	writeln(w, "# HELP ocu_control_quota_refund_failed_total Quota-refund compensator failures on create-unwind, idle-reap, or orphan-reclaim (leaked-counter alarm).")
 	writeln(w, "# TYPE ocu_control_quota_refund_failed_total counter")
 	fmt.Fprintf(w, "ocu_control_quota_refund_failed_total %d\n", quotaRefundFailed)
 

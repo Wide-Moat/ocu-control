@@ -233,9 +233,11 @@ type Recorder interface {
 	IncDestroy()
 	// ObserveStart records one reserved->active start duration.
 	ObserveStart(d time.Duration)
-	// IncQuotaRefundFailed records one quota-refund compensator failure on the create
-	// unwind — a swallowed refund that leaves the concurrency cell drifted until the
-	// boot cell-reconcile heals it.
+	// IncQuotaRefundFailed records one quota-refund compensator failure -- a refund that
+	// leaves the concurrency cell drifted until the boot cell-reconcile heals it. It
+	// fires on the create unwind (stages.go) AND the idle-reap / orphan-reclaim release
+	// paths (reapOne / reclaimOrphanRow), whose errors otherwise reach a loggerless
+	// daemon tick and would be silent.
 	IncQuotaRefundFailed()
 }
 
@@ -932,6 +934,14 @@ func (m *Manager) reclaimOrphanRow(ctx context.Context, row state.SessionRow) er
 		return fmt.Errorf("release reclaimed row: %w", err)
 	}
 	if err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {
+		// A reclaimed slot that could not be released drifts the concurrency cell until
+		// the boot cell-reconcile heals it -- the SAME condition IncQuotaRefundFailed
+		// records on the create unwind. Emit it here too so the reclaim-path drift is
+		// not silent. Mirrors stages.go including its nil-metrics guard (the Recorder is
+		// optional): record the failed refund, still return the error.
+		if m.metrics != nil {
+			m.metrics.IncQuotaRefundFailed()
+		}
 		return fmt.Errorf("release reclaimed concurrency: %w", err)
 	}
 	return nil
@@ -1033,6 +1043,15 @@ func (m *Manager) reapOne(ctx context.Context, row state.SessionRow) error {
 		return fmt.Errorf("release reaped row: %w", err)
 	}
 	if err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {
+		// A reaped slot that could not be released drifts the concurrency cell until
+		// the boot cell-reconcile heals it -- the SAME condition IncQuotaRefundFailed
+		// records on the create unwind. Emit it here too so the reap-path drift is not
+		// silent (the returned error terminates at the daemon reaper tick, which has no
+		// logger). Mirrors stages.go including its nil-metrics guard (the Recorder is
+		// optional): record the failed refund, still return the error.
+		if m.metrics != nil {
+			m.metrics.IncQuotaRefundFailed()
+		}
 		return fmt.Errorf("release reaped concurrency: %w", err)
 	}
 	return nil
