@@ -39,13 +39,29 @@ func (p *recordingPublisher) Publish(_ context.Context, wire PublishWire) error 
 	return nil
 }
 
+// sampleChainEnvelope carries an OCSF event shaped as buildEvent produces it,
+// so the mandatory-field projection has real nested values to extract.
 func sampleChainEnvelope() ChainEnvelope {
+	event := `{
+		"class_uid": 6003,
+		"activity_name": "session.create",
+		"status": "success",
+		"actor": {
+			"user": {"name": "caller-principal", "uid_alt": "tenant-x"},
+			"session": {"uid": "resv-key-1"},
+			"invoked_by": "gateway"
+		},
+		"metadata": {
+			"correlation_uid": "trace-corr-1",
+			"unmapped": {"action": "session_create"}
+		}
+	}`
 	return ChainEnvelope{
 		Source:    "control",
 		Sequence:  7,
 		PriorHash: "deadbeef",
 		Hash:      "cafef00d",
-		Event:     json.RawMessage(`{"class_uid":6003,"activity_name":"session.create"}`),
+		Event:     json.RawMessage(event),
 	}
 }
 
@@ -85,8 +101,8 @@ func TestFanInPublishWireStripsChainFields(t *testing.T) {
 	if wire.Sequence != env.Sequence {
 		t.Fatalf("publish wire Sequence = %d, want %d (the ingest 409 authority)", wire.Sequence, env.Sequence)
 	}
-	if string(wire.Event) != string(env.Event) {
-		t.Fatalf("publish wire Event must be the canonical bytes verbatim")
+	if string(wire.Payload) != string(env.Event) {
+		t.Fatalf("publish wire Payload must be the canonical event bytes verbatim")
 	}
 	raw, err := json.Marshal(wire)
 	if err != nil {
@@ -101,10 +117,62 @@ func TestFanInPublishWireStripsChainFields(t *testing.T) {
 			t.Fatalf("publish wire carries forbidden pipeline-authored key %q (INV-1/INV-3)", forbidden)
 		}
 	}
-	for _, want := range []string{"sequence", "event"} {
+	// All OCU mandatory audit fields (NFR-MAINT-AUDIT-SCHEMA) present as
+	// discrete top-level keys.
+	for _, want := range []string{"trace_id", "session_id", "actor_id", "resource", "action", "outcome", "sequence", "payload"} {
 		if _, ok := keyed[want]; !ok {
-			t.Fatalf("publish wire missing required field %q", want)
+			t.Fatalf("publish wire missing required mandatory field %q", want)
 		}
+	}
+}
+
+// The mandatory-field projection reads the OCSF positions buildEvent writes:
+// actor.user.name -> actor_id, actor.session.uid -> session_id/resource,
+// metadata.unmapped.action -> action, status -> outcome,
+// metadata.correlation_uid -> trace_id. A wrong mapping (e.g. trace_id lost)
+// would break SIEM correlation, so pin each one.
+func TestFanInProjectsMandatoryFieldsFromOCSF(t *testing.T) {
+	lw := &recordingWriter{}
+	pub := &recordingPublisher{}
+	w, _ := NewFanInWriter(lw, pub)
+	if err := w.Write(context.Background(), sampleChainEnvelope()); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	wire := pub.got[0]
+	cases := map[string]string{
+		"trace_id":   "trace-corr-1",
+		"session_id": "resv-key-1",
+		"actor_id":   "caller-principal",
+		"resource":   "resv-key-1",
+		"action":     "session_create",
+		"outcome":    "success",
+	}
+	got := map[string]string{
+		"trace_id": wire.TraceID, "session_id": wire.SessionID, "actor_id": wire.ActorID,
+		"resource": wire.Resource, "action": wire.Action, "outcome": wire.Outcome,
+	}
+	for field, want := range cases {
+		if got[field] != want {
+			t.Fatalf("projected %s = %q, want %q", field, got[field], want)
+		}
+	}
+}
+
+// A malformed OCSF event does not crash the projection: the wire keeps sequence
+// and payload with empty header fields, and the server's validate() then 400s
+// it (fail-closed), never a silent partial accept.
+func TestFanInProjectionToleratesMalformedEvent(t *testing.T) {
+	lw := &recordingWriter{}
+	pub := &recordingPublisher{}
+	w, _ := NewFanInWriter(lw, pub)
+	env := sampleChainEnvelope()
+	env.Event = json.RawMessage(`{not-json`)
+	if err := w.Write(context.Background(), env); err != nil {
+		t.Fatalf("Write must not crash on a malformed event, got %v", err)
+	}
+	wire := pub.got[0]
+	if wire.Sequence != env.Sequence || wire.ActorID != "" {
+		t.Fatalf("malformed event: want seq kept + empty header, got seq=%d actor_id=%q", wire.Sequence, wire.ActorID)
 	}
 }
 

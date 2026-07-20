@@ -37,14 +37,27 @@ type Publisher interface {
 }
 
 // PublishWire is the wire envelope a source POSTs, mirroring the frozen contract
-// (ocu-audit docs/wire-surface.md). It carries the per-source Sequence (the
-// ingest 409s a non-increasing value) and the canonical OCSF Event bytes, and
-// deliberately no source/prior_hash/chain_hash. An adapter in the wiring layer
-// converts this to the ocu-audit client's Envelope type; keeping our own struct
-// keeps this package free of an ocu-audit import.
+// (ocu-audit docs/wire-surface.md + contracts/audit/audit-fanin.asyncapi.yaml,
+// NFR-MAINT-AUDIT-SCHEMA). It carries the OCU mandatory audit fields as DISCRETE
+// top-level values -- trace_id is the SIEM cross-surface correlation key, so it
+// must be a flat field, never buried in the payload -- plus the per-source
+// Sequence (the ingest 409s a non-increasing value) and the OCSF event as the
+// payload. It deliberately has no source/prior_hash/chain_hash: the pipeline
+// authors the chain and derives the source from the mTLS client-cert CN
+// (INV-1/INV-3). The discrete fields are populated by ChainSink from the
+// audit.Record it already holds (Caller->ActorID, Key->SessionID/Resource,
+// Action->Action, outcome->Outcome) plus a trace_id threaded in at the caller;
+// keeping our own struct keeps this package free of an ocu-audit import, and an
+// adapter in the wiring layer copies it 1:1 onto the ocu-audit client Envelope.
 type PublishWire struct {
-	Sequence uint64          `json:"sequence"`
-	Event    json.RawMessage `json:"event"`
+	TraceID   string          `json:"trace_id"`
+	SessionID string          `json:"session_id"`
+	ActorID   string          `json:"actor_id"`
+	Resource  string          `json:"resource"`
+	Action    string          `json:"action"`
+	Outcome   string          `json:"outcome"`
+	Sequence  uint64          `json:"sequence"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 // FanInWriter is a composite EventWriter: it writes to the local durable sink
@@ -101,17 +114,62 @@ func (w *FanInWriter) Write(ctx context.Context, env ChainEnvelope) error {
 }
 
 // toPublishWire maps a locally-chained ChainEnvelope onto the pre-chain wire
-// envelope. It KEEPS Sequence (the ingest's 409 authority) and Event (the
-// canonical bytes the pipeline will re-chain and hash), and DROPS Source,
-// PriorHash, and Hash: the ingest derives source from the verified client-cert
-// CN (INV-1) and authors its own chain (INV-3). A source that smuggled any of
-// those would get a 400; this mapper structurally cannot, since PublishWire has
-// no such field.
+// envelope. It KEEPS Sequence (the ingest's 409 authority), projects the OCU
+// mandatory audit fields out of the canonical OCSF Event (which buildEvent
+// populated injectively from the audit.Record), and carries the Event as the
+// payload. It DROPS Source, PriorHash, and Hash: the ingest derives source from
+// the verified client-cert CN (INV-1) and authors its own chain (INV-3).
+//
+// The projection reads the OCSF positions buildEvent writes: actor.user.name is
+// the host-attested caller (actor_id, NFR-SEC-09), actor.session.uid is the
+// reservation key (session_id and resource), metadata.unmapped.action is the
+// privileged action, status is the outcome, and metadata.correlation_uid is the
+// cross-surface correlation id (trace_id). A malformed Event that does not parse
+// yields a wire with the sequence and payload set and empty header fields; the
+// server's validate() then 400s it (bounds), which is the fail-closed outcome --
+// never a silent partial accept.
+//
+// OWNER-GATED SEAM: trace_id here is metadata.correlation_uid. If the deployment
+// requires a distinct request-scoped trace id (not the OCSF correlation_uid),
+// ChainSink must thread it and this projection reads it from a widened
+// ChainEnvelope instead -- a control-side decision at the injection layer.
 func toPublishWire(env ChainEnvelope) PublishWire {
-	return PublishWire{
-		Sequence: env.Sequence,
-		Event:    env.Event,
+	w := PublishWire{Sequence: env.Sequence, Payload: env.Event}
+	var e struct {
+		ActivityName string `json:"activity_name"`
+		Status       string `json:"status"`
+		Actor        struct {
+			User struct {
+				Name string `json:"name"`
+			} `json:"user"`
+			Session struct {
+				UID string `json:"uid"`
+			} `json:"session"`
+		} `json:"actor"`
+		Metadata struct {
+			CorrelationUID string `json:"correlation_uid"`
+			Unmapped       struct {
+				Action string `json:"action"`
+			} `json:"unmapped"`
+		} `json:"metadata"`
 	}
+	if err := json.Unmarshal(env.Event, &e); err != nil {
+		return w // header fields empty -> server validate() 400s -> fail-closed
+	}
+	w.TraceID = e.Metadata.CorrelationUID
+	w.SessionID = e.Actor.Session.UID
+	w.ActorID = e.Actor.User.Name
+	w.Resource = e.Actor.Session.UID
+	w.Action = firstNonEmpty(e.Metadata.Unmapped.Action, e.ActivityName)
+	w.Outcome = e.Status
+	return w
+}
+
+func firstNonEmpty(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 // interface assertion aid: any Publisher whose Publish maps a non-200 to a
