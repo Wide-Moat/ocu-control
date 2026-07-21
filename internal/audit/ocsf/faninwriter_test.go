@@ -215,3 +215,55 @@ func TestNewFanInWriterRejectsNilLegs(t *testing.T) {
 		t.Fatal("nil publisher must be rejected")
 	}
 }
+
+// closingRecordingWriter is a local EventWriter that also records whether Close
+// ran and can return a Close error. It is an io.Closer, so the composite must
+// forward Close to it (the FileSink is a Closer in production).
+type closingRecordingWriter struct {
+	recordingWriter
+	closed   bool
+	closeErr error
+}
+
+func (w *closingRecordingWriter) Close() error {
+	w.closed = true
+	return w.closeErr
+}
+
+// The composite must be a drop-in for the bare FileSink at the daemon's
+// auditWriter seam (EventWriter + Close). Close forwards to the local durable
+// sink's Close so the shutdown fsync still runs when the fan-in replaces the
+// FileSink; the synchronous publish leg carries no shutdown obligation.
+func TestFanInCloseForwardsToLocalSink(t *testing.T) {
+	lw := &closingRecordingWriter{}
+	w, err := NewFanInWriter(lw, &recordingPublisher{})
+	if err != nil {
+		t.Fatalf("construct: %v", err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !lw.closed {
+		t.Fatal("Close must forward to the local durable sink (the shutdown fsync); local Close was NOT called")
+	}
+}
+
+// A Close error from the local sink propagates: a failed shutdown fsync must not
+// be swallowed.
+func TestFanInCloseSurfacesLocalCloseError(t *testing.T) {
+	sentinel := errors.New("local close boom")
+	lw := &closingRecordingWriter{closeErr: sentinel}
+	w, _ := NewFanInWriter(lw, &recordingPublisher{})
+	if err := w.Close(); !errors.Is(err, sentinel) {
+		t.Fatalf("Close must surface the local sink's close error, got %v", err)
+	}
+}
+
+// A local sink that is NOT a Closer (a stateless test sink) makes Close a safe
+// no-op -- never a panic, never an error.
+func TestFanInCloseIsNoOpWhenLocalIsNotACloser(t *testing.T) {
+	w, _ := NewFanInWriter(&recordingWriter{}, &recordingPublisher{})
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close on a non-Closer local must be a nil-error no-op, got %v", err)
+	}
+}

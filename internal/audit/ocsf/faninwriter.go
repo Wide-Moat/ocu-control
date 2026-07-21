@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 )
@@ -80,6 +81,17 @@ type FanInWriter struct {
 
 var _ EventWriter = (*FanInWriter)(nil)
 
+// auditSeam is the shape the daemon's audit writer interface requires
+// (cmd/ocu-controld auditWriter = EventWriter + Close). It is asserted here so a
+// missing Close on the composite fails THIS package's build, not the injection
+// site's: the fan-in writer must be a drop-in for the bare FileSink at that seam.
+type auditSeam interface {
+	EventWriter
+	Close() error
+}
+
+var _ auditSeam = (*FanInWriter)(nil)
+
 // NewFanInWriter composes a local EventWriter with a central Publisher. Both are
 // required; a nil argument is a construction error, not a deferred write
 // failure, because a source with no publish leg silently regresses to the
@@ -109,6 +121,24 @@ func (w *FanInWriter) Write(ctx context.Context, env ChainEnvelope) error {
 	// Publisher) fails the whole Write closed.
 	if err := w.pub.Publish(ctx, toPublishWire(env)); err != nil {
 		return fmt.Errorf("ocsf: fan-in publish (seq=%d): %w", env.Sequence, err)
+	}
+	return nil
+}
+
+// Close runs the shutdown flush of the durable-emit seam. The daemon's audit
+// writer interface is EventWriter + Close (cmd/ocu-controld: the FileSink already
+// satisfies it, and buildAuditWriter runs Close on shutdown to flush the final
+// fsync). When the fan-in composite REPLACES the bare FileSink at that seam, it
+// must forward Close to the local sink so the final fsync still runs -- otherwise
+// the last durably-written envelope's fsync is lost on a clean shutdown.
+//
+// The publish leg needs no shutdown flush: Publish is synchronous and returns nil
+// only after the ingest's WAL fsync (a 200), so there is never a buffered central
+// event to drain here. Only the local durable sink carries a shutdown obligation,
+// and only if it is a Closer (the FileSink is; a stateless test sink is not).
+func (w *FanInWriter) Close() error {
+	if c, ok := w.local.(io.Closer); ok {
+		return c.Close()
 	}
 	return nil
 }
