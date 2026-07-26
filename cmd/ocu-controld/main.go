@@ -32,6 +32,7 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -233,6 +234,7 @@ func serve(ctx context.Context, cfg config) error {
 	// The shared Revoker is recorded against by every Storage-JWT mint (via the
 	// Signer) and consulted by the below-seam finalizer step-1, so one index serves
 	// both the create path and teardown.
+	announceStorageTTL(os.Stderr, cfg)
 	signer, revoker, err := buildSigner(cfg, clk)
 	if err != nil {
 		return fmt.Errorf("boot: load storage-jwt signer: %w", err)
@@ -501,6 +503,10 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 	// reserved->active start duration) and to the operator listener (which mounts its
 	// /metrics scrape handler). It is purely observational — non-fatal everywhere.
 	collector := metrics.NewCollector(custodian)
+	// Publish the EFFECTIVE Storage-JWT window. -storage-ttl has no upper ceiling, so
+	// an unpublished window is how a very wide credential lifetime ends up running with
+	// nothing anywhere saying so; a scrapeable value makes it alertable.
+	collector.SetStorageJWTTTL(resolveStorageTTL(cfg))
 	stager := handoff.NewStager(handoffBase)
 	// The OCSF chain sink is built and RESUMED in main() (buildResumedChainSink), where
 	// the boot-edge I/O — reading the prior spine's tip, recording a chain-break on a
@@ -733,6 +739,24 @@ func resolveStorageTTL(cfg config) time.Duration {
 		return cfg.storageTTL
 	}
 	return defaultStorageTTL
+}
+
+// announceStorageTTL states the effective Storage-JWT window on stderr at boot, and
+// says plainly which of the two ways it was arrived at. Because the flag has no
+// ceiling, "how wide is the credential window on this deployment" must be answerable
+// without reading the argv against the source; a window materially wider than the
+// default is called out rather than merely reported, since that is the case where
+// nobody meant to widen it.
+func announceStorageTTL(w io.Writer, cfg config) {
+	ttl := resolveStorageTTL(cfg)
+	switch {
+	case cfg.storageTTL <= 0:
+		fmt.Fprintf(w, "ocu-controld: Storage-JWT window %s (default; -storage-ttl unset)\n", ttl)
+	case ttl > defaultStorageTTL:
+		fmt.Fprintf(w, "ocu-controld: WARNING: Storage-JWT window %s from -storage-ttl, WIDER than the %s default. The token has no refresh path, so this is how long a leaked credential stays usable.\n", ttl, defaultStorageTTL)
+	default:
+		fmt.Fprintf(w, "ocu-controld: Storage-JWT window %s from -storage-ttl\n", ttl)
+	}
 }
 
 // buildSigner loads the Storage-JWT signer from the -jwt-signing-key MOUNT path,

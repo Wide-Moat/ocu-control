@@ -142,3 +142,26 @@ func TestContentType(t *testing.T) {
 		t.Errorf("ContentType drifted from the Prometheus 0.0.4 exposition type: %q", ContentType)
 	}
 }
+
+// TestExposition_StorageJWTTTLGauge asserts the effective Storage-JWT window is
+// observable. The window is an operator-settable duration with no upper ceiling, so
+// without a published value a deployment can run a very wide credential window and
+// nothing anywhere says so -- which is precisely how a long-lived token appears
+// silently. The gauge makes the effective value scrapeable and alertable.
+func TestExposition_StorageJWTTTLGauge(t *testing.T) {
+	c := NewCollector(fakeReader{})
+	c.SetStorageJWTTTL(2 * time.Hour)
+
+	var buf bytes.Buffer
+	c.WritePrometheus(context.Background(), &buf)
+	out := buf.String()
+
+	for _, want := range []string{
+		`# TYPE ocu_control_storage_jwt_ttl_seconds gauge`,
+		"ocu_control_storage_jwt_ttl_seconds 7200",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("exposition missing %q\n--- got ---\n%s", want, out)
+		}
+	}
+}

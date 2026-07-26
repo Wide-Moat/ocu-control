@@ -60,6 +60,13 @@ type Collector struct {
 	// observable so an operator can alert on it rather than discover it as an opaque
 	// tier-cap wedge.
 	quotaRefundFailedTotal uint64
+	// storageJWTTTL is the EFFECTIVE Storage-JWT window this process resolved at
+	// boot, published so the value is observable rather than inferable. The window is
+	// operator-settable with no upper ceiling, so an unpublished value is how a very
+	// wide credential window comes to be running with nothing anywhere saying so. It
+	// is set once at boot and never changes, which is why it is a gauge of config
+	// rather than a counter of events.
+	storageJWTTTL time.Duration
 	// startBucketCounts[i] is the count of start-durations <= buckets[i] (filled
 	// cumulatively at emit). startCount and startSum drive the histogram's _count
 	// and _sum and thus the average (sum/count = avg start seconds).
@@ -101,6 +108,18 @@ func (c *Collector) IncDestroy() {
 func (c *Collector) IncQuotaRefundFailed() {
 	c.mu.Lock()
 	c.quotaRefundFailedTotal++
+	c.mu.Unlock()
+}
+
+// SetStorageJWTTTL publishes the effective Storage-JWT window the daemon resolved at
+// boot. A non-positive duration is ignored so a caller that has not resolved a window
+// cannot publish a misleading zero.
+func (c *Collector) SetStorageJWTTTL(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.storageJWTTTL = d
 	c.mu.Unlock()
 }
 
@@ -177,6 +196,7 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	creates := c.createsTotal
 	destroys := c.destroysTotal
 	quotaRefundFailed := c.quotaRefundFailedTotal
+	storageTTL := c.storageJWTTTL
 	startCount := c.startCount
 	startSum := c.startSum
 	bucketCounts := make([]uint64, len(c.startBucketCounts))
@@ -211,6 +231,11 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	writeln(w, "# HELP ocu_control_quota_refund_failed_total Quota-refund compensator failures on the create unwind (leaked-counter alarm).")
 	writeln(w, "# TYPE ocu_control_quota_refund_failed_total counter")
 	fmt.Fprintf(w, "ocu_control_quota_refund_failed_total %d\n", quotaRefundFailed)
+	if storageTTL > 0 {
+		writeln(w, "# HELP ocu_control_storage_jwt_ttl_seconds Effective Storage-JWT lifetime resolved at boot (-storage-ttl, or the built-in default when unset). The token has no refresh path, so this is how long a session's storage credential lives.")
+		writeln(w, "# TYPE ocu_control_storage_jwt_ttl_seconds gauge")
+		fmt.Fprintf(w, "ocu_control_storage_jwt_ttl_seconds %g\n", storageTTL.Seconds())
+	}
 
 	// Reserved->active start-duration histogram. Buckets are cumulative le-bounds;
 	// +Inf equals _count. avg start = _sum / _count.

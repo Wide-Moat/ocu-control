@@ -4,10 +4,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -330,4 +332,42 @@ func Test_storageTTL_FlagRestoresDeployedSurface(t *testing.T) {
 			t.Fatalf("validate with -storage-ttl -1s = %v, want errStorageTTLNegative", err)
 		}
 	})
+}
+
+// Test_announceStorageTTL_StatesTheEffectiveWindow covers the boot-time
+// observability the uncapped -storage-ttl requires. With no ceiling, "how wide is the
+// credential window here" must be answerable from the daemon's own output rather than
+// by reading argv against the source -- an unannounced window is how a very wide
+// credential lifetime ends up running with nothing saying so.
+//
+// The three cases are distinct on purpose: an unset flag says it took the default, a
+// value at or under the default is reported plainly, and a WIDER value is warned
+// about, because that is the case nobody meant to configure.
+func Test_announceStorageTTL_StatesTheEffectiveWindow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name        string
+		ttl         time.Duration
+		wantSubstrs []string
+		wantWarn    bool
+	}{
+		{"unset-says-default", 0, []string{defaultStorageTTL.String(), "default"}, false},
+		{"narrower-reported-plainly", time.Minute, []string{"1m0s", "-storage-ttl"}, false},
+		{"wider-is-warned", 2 * time.Hour, []string{"2h0m0s", "WIDER", "no refresh path"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf bytes.Buffer
+			announceStorageTTL(&buf, config{storageTTL: tc.ttl})
+			got := buf.String()
+			for _, want := range tc.wantSubstrs {
+				if !strings.Contains(got, want) {
+					t.Errorf("announcement %q does not contain %q", got, want)
+				}
+			}
+			if warned := strings.Contains(got, "WARNING"); warned != tc.wantWarn {
+				t.Errorf("announcement %q warned=%v, want %v (only a window wider than the default warrants a warning)", got, warned, tc.wantWarn)
+			}
+		})
+	}
 }
