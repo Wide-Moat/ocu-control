@@ -305,3 +305,49 @@ func Test_parse_SessionIdleTTL_Set(t *testing.T) {
 		t.Fatalf("sessionIdleTTL = %v, want 10m", cfg.sessionIdleTTL)
 	}
 }
+
+// fakeReapRecorder records every counter call the observer makes, keeping the reaped
+// counts in order so a test can assert WHICH tick recorded what -- not just the totals.
+type fakeReapRecorder struct {
+	reaped []int
+	failed int
+}
+
+func (r *fakeReapRecorder) IncSessionsReaped(n int) { r.reaped = append(r.reaped, n) }
+func (r *fakeReapRecorder) IncReapPassFailed()      { r.failed++ }
+
+// Test_newReapObserver_MapsTickOutcomeToCounters covers the wiring serve() installs
+// (main.go: startIdleReaper(..., newReapObserver(collector))). serve() binds sockets and
+// is not unit-driven, so without this the mapping from a tick's (reaped, err) to the two
+// counters would be the one uncovered link between a tested seam and tested counters.
+//
+// The load-bearing case is the LAST one: ReapIdle reclaims row by row and returns
+// (reaped, err) when a mid-pass reclaim fails, so a tick can BOTH reclaim rows and fail.
+// The observer must record both, or an operator either undercounts throughput or gets no
+// stuck-reaper alarm. Red-probe: drop the IncSessionsReaped call and the reaped sequence
+// mismatches; drop the `if err != nil` branch and failed stays 0.
+func Test_newReapObserver_MapsTickOutcomeToCounters(t *testing.T) {
+	t.Parallel()
+	rec := &fakeReapRecorder{}
+	observe := newReapObserver(rec)
+	boom := errors.New("reap enumerate failed")
+
+	observe(0, nil)  // an idle-nothing tick
+	observe(2, nil)  // a clean reclaiming tick
+	observe(0, boom) // an enumerate failure: nothing reclaimed, alarm trips
+	observe(3, boom) // a MID-PASS failure: 3 rows reclaimed AND the pass failed
+
+	wantReaped := []int{0, 2, 0, 3}
+	if len(rec.reaped) != len(wantReaped) {
+		t.Fatalf("observer made %d reaped-counter calls (%v), want %d (%v) -- every tick must report its count",
+			len(rec.reaped), rec.reaped, len(wantReaped), wantReaped)
+	}
+	for i, want := range wantReaped {
+		if rec.reaped[i] != want {
+			t.Errorf("tick %d recorded reaped=%d, want %d (sequence %v)", i, rec.reaped[i], want, rec.reaped)
+		}
+	}
+	if rec.failed != 2 {
+		t.Errorf("failed-pass counter = %d, want 2 (both the enumerate failure and the mid-pass failure must alarm)", rec.failed)
+	}
+}
