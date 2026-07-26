@@ -730,8 +730,6 @@ func buildSigner(cfg config, clk state.Clock) (*cred.Signer, *cred.Revoker, erro
 		Alg:             alg,
 		StorageIssuer:   cfg.storageIssuer,
 		StorageAudience: cfg.storageAudience,
-		ExecIssuer:      cfg.execIssuer,
-		ExecAudience:    cfg.execAudience,
 		StorageTTL:      storageTTL,
 	})
 	if err != nil {

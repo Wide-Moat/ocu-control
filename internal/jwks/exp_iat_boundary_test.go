@@ -72,8 +72,6 @@ func TestIatIsInformationalNotGated(t *testing.T) {
 		Alg:             cred.AlgEdDSA,
 		StorageIssuer:   "https://control.example/provisional",
 		StorageAudience: "egress.provisional",
-		ExecIssuer:      "https://control.example/exec-provisional",
-		ExecAudience:    "guest.exec.provisional",
 		StorageTTL:      testStorageTTL,
 	}
 	signer, err := cred.LoadSignerFromMount(writeKeyMount(t, cred.AlgEdDSA), mintClk, cfg)

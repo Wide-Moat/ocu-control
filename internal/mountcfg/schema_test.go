@@ -110,8 +110,6 @@ func signerForTest(t *testing.T) *cred.Signer {
 		Alg:             cred.AlgEdDSA,
 		StorageIssuer:   "https://control.example/provisional",
 		StorageAudience: "egress.provisional",
-		ExecIssuer:      "https://control.example/exec-provisional",
-		ExecAudience:    "guest.exec.provisional",
 		StorageTTL:      15 * time.Minute,
 	})
 	if err != nil {

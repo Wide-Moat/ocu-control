@@ -108,8 +108,6 @@ type Config struct {
 	Alg             Alg
 	StorageIssuer   string        // provisional, PIN-PENDING
 	StorageAudience string        // provisional, PIN-PENDING
-	ExecIssuer      string        // provisional, PIN-PENDING
-	ExecAudience    string        // provisional, PIN-PENDING
 	StorageTTL      time.Duration // SHORT fixed window
 }
 

@@ -85,8 +85,6 @@ func newTestSigner(t *testing.T, alg cred.Alg, storageTTL time.Duration) (*cred.
 		Alg:             alg,
 		StorageIssuer:   "https://control.example/provisional",
 		StorageAudience: "egress.provisional",
-		ExecIssuer:      "https://control.example/exec-provisional",
-		ExecAudience:    "guest.exec.provisional",
 		StorageTTL:      storageTTL,
 	}
 	signer, err := cred.LoadSignerFromMount(writeKeyMount(t, alg), clk, cfg)

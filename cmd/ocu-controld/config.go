@@ -44,8 +44,6 @@ type config struct {
 	jwtAlg          string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
 	storageIssuer   string        // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
 	storageAudience string        // provisional Storage-JWT aud (PIN-PENDING)
-	execIssuer      string        // provisional exec-JWT iss (PIN-PENDING)
-	execAudience    string        // provisional exec-JWT aud (PIN-PENDING)
 	serviceURL      string        // filestore service_url rendered into every mount-config
 	caCert          string        // path to the CA certificate PEM rendered into every mount-config
 	egressNetwork   string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
@@ -136,8 +134,6 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.jwtAlg, "jwt-alg", "eddsa", "Storage-JWT signing algorithm: eddsa|es256 (default eddsa, NFR-SEC-11)")
 	fs.StringVar(&cfg.storageIssuer, "storage-issuer", "", "provisional Storage-JWT issuer (PIN-PENDING; never hardcoded)")
 	fs.StringVar(&cfg.storageAudience, "storage-audience", "", "provisional Storage-JWT audience (PIN-PENDING)")
-	fs.StringVar(&cfg.execIssuer, "exec-issuer", "", "provisional exec-JWT issuer (PIN-PENDING)")
-	fs.StringVar(&cfg.execAudience, "exec-audience", "", "provisional exec-JWT audience (PIN-PENDING)")
 	fs.StringVar(&cfg.serviceURL, "service-url", "", "filestore service_url rendered into every mount-config (https://)")
 	fs.StringVar(&cfg.caCert, "ca-cert", "", "path to the CA certificate PEM rendered into every mount-config")
 	fs.StringVar(&cfg.egressNetwork, "egress-network", "", "OPTIONAL docker network a storage-scoped guest joins to reach the egress edge (edge is multi-homed onto it); unset keeps every session on its per-session Internal deny-all bridge")
