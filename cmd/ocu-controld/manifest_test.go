@@ -533,3 +533,52 @@ func runBinary(t *testing.T, bin string, argv []string, timeout time.Duration) (
 		return out.String(), errors.New("timeout")
 	}
 }
+
+// Test_Manifests_StoragePinAgreesAcrossManifests pins the Storage-JWT iss/aud
+// literals to ONE value each across every shipped manifest. The claims are one side
+// of a cross-component agreement: the egress edge's jwt_authn pins the same issuer
+// and audience, and a token whose claims differ by one byte is rejected there, on
+// live traffic, per session. Three manifests that disagree among themselves
+// guarantee at least two of them are wrong.
+//
+// This asserts what this repo can actually see. The other side of the agreement (the
+// edge config) lives in the deployment repo, so the cross-repo half is a documented
+// pairing, not a test -- and the manifests carry that documentation, including which
+// of ADR-0019's two tokens this pair belongs to, because collapsing the two tokens
+// into one is how the wrong literals got chosen once already.
+func Test_Manifests_StoragePinAgreesAcrossManifests(t *testing.T) {
+	t.Parallel()
+	type pin struct{ iss, aud string }
+	seen := map[string]pin{}
+	for _, m := range loadManifestArgvs(t) {
+		got := pin{}
+		for i := 0; i+1 < len(m.argv); i++ {
+			switch m.argv[i] {
+			case "-storage-issuer":
+				got.iss = m.argv[i+1]
+			case "-storage-audience":
+				got.aud = m.argv[i+1]
+			}
+		}
+		if got.iss == "" || got.aud == "" {
+			t.Fatalf("%s manifest does not carry both -storage-issuer and -storage-audience (got %+v)", m.name, got)
+		}
+		seen[m.name] = got
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected at least two shipped manifests to compare, got %d", len(seen))
+	}
+	var ref string
+	for name := range seen {
+		if ref == "" || name < ref {
+			ref = name // deterministic reference manifest
+		}
+	}
+	want := seen[ref]
+	for name, got := range seen {
+		if got != want {
+			t.Errorf("manifest %s pins iss=%q aud=%q but %s pins iss=%q aud=%q -- every shipped manifest must present the SAME pair to the edge",
+				name, got.iss, got.aud, ref, want.iss, want.aud)
+		}
+	}
+}

@@ -89,15 +89,22 @@ services:
       - /run/secrets/storage-jwt-signing.key
       - -audit-sink
       - /var/log/ocu-control/audit.ocsf.jsonl
-      # Storage-JWT iss/aud. REQUIRED: the egress trust-edge verifier PINS both and
-      # rejects a token whose claims do not match, so an unset value would mint a
-      # credential that fails at the edge on live traffic rather than at boot. These
-      # two strings are one half of a contract — the egress verifier must pin the SAME
-      # pair. Change them here and at the edge together, or every mount breaks.
+      # Storage-JWT iss/aud. REQUIRED: an unset value mints a token no verifier
+      # accepts, and it fails at the trust edge on live traffic rather than at boot.
+      #
+      # WHICH token these belong to matters, because ADR-0019 puts TWO tokens on the
+      # path and each has its own iss/aud pair naming its own verifier:
+      #   token 1  Control -> egress edge      <- THIS pair
+      #   token 2  edge exchange -> filestore engine (different iss/aud; not ours)
+      # So `aud` here names the EDGE, not the filestore: the edge is what verifies the
+      # token Control mints. These two strings must equal the edge's jwt_authn
+      # `issuer` and `audiences` byte-for-byte; change them together or every mount
+      # breaks. Setting them to the filestore's pair instead is the specific mistake
+      # this comment exists to prevent.
       - -storage-issuer
-      - ${OCU_STORAGE_ISSUER:-https://control.ocu.internal}
+      - ${OCU_STORAGE_ISSUER:-https://control-plane.test}
       - -storage-audience
-      - ${OCU_STORAGE_AUDIENCE:-ocu-egress}
+      - ${OCU_STORAGE_AUDIENCE:-filestore-edge}
       # Storage-JWT JWKS artifact (ADR-0019 §35). ACTIVE in this reference
       # deployment: the egress trust-edge verifies every Storage-JWT against this
       # published key set, so a deployment that does not emit it has no working
