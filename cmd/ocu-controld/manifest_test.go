@@ -262,18 +262,20 @@ func Test_Manifests_ClearFlagValidation_InProcess(t *testing.T) {
 
 // assertAllRequiredFlagsPresent independently confirms each manifest argv carries
 // every flag in the validator's required set with a non-empty value. validate()
-// already enforces this, but asserting it explicitly documents the cross-check the
-// review asked for and pins exactly which flags a manifest must carry.
+// already enforces this, but asserting it explicitly names WHICH flag a manifest
+// dropped instead of surfacing one generic refusal.
+//
+// The set is DERIVED from requiredFlags (config.go), not restated here. A hand-copied
+// list is what let this cross-check drift: it silently stopped covering any flag added
+// to the validator after the list was written, which is the opposite of what its own
+// comment promised. Deriving it means a new required flag is demanded of every shipped
+// manifest the moment it lands.
 func assertAllRequiredFlagsPresent(t *testing.T, m manifestArgv) {
 	t.Helper()
-	required := []string{
-		"-operator-listen",
-		"-gateway-listen",
-		"-runtime-tier",
-		"-runtime-provider",
-		"-workload-profile",
-		"-jwt-signing-key",
-		"-audit-sink",
+	// The zero config yields the flag NAMES; the values are irrelevant here.
+	var required []string
+	for _, rf := range requiredFlags(config{}) {
+		required = append(required, "-"+rf.name)
 	}
 	present := map[string]string{}
 	for i := 0; i < len(m.argv); i++ {

@@ -89,6 +89,15 @@ services:
       - /run/secrets/storage-jwt-signing.key
       - -audit-sink
       - /var/log/ocu-control/audit.ocsf.jsonl
+      # Storage-JWT iss/aud. REQUIRED: the egress trust-edge verifier PINS both and
+      # rejects a token whose claims do not match, so an unset value would mint a
+      # credential that fails at the edge on live traffic rather than at boot. These
+      # two strings are one half of a contract — the egress verifier must pin the SAME
+      # pair. Change them here and at the edge together, or every mount breaks.
+      - -storage-issuer
+      - ${OCU_STORAGE_ISSUER:-https://control.ocu.internal}
+      - -storage-audience
+      - ${OCU_STORAGE_AUDIENCE:-ocu-egress}
       # OPTIONAL — Storage-JWT JWKS artifact (ADR-0019 §35). Uncomment the two
       # lines below (and the `jwks:` volume + mount) to have Control EMIT the
       # static JWKS document at this path. Control emits the JWKS artifact at

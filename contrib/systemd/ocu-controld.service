@@ -55,8 +55,14 @@ Group=ocucontrol
 #
 # This invocation carries EVERY required flag the daemon's boot validator
 # demands (operator-listen, gateway-listen, runtime-tier, runtime-provider,
-# workload-profile, jwt-signing-key, audit-sink); omitting any one is a fail-
-# closed boot refusal. -workload-profile is the deployment-declared trust
+# workload-profile, jwt-signing-key, audit-sink, storage-issuer,
+# storage-audience); omitting any one is a fail-closed boot refusal.
+# -storage-issuer / -storage-audience are the Storage-JWT iss/aud claims: the
+# egress trust-edge verifier PINS both and rejects a token whose claims do not
+# match, so an unset value would mint a credential that fails at the edge on live
+# traffic rather than at boot. The two strings are one half of a contract — the
+# egress verifier must pin the SAME pair; change them here and at the edge
+# together, or every mount breaks. -workload-profile is the deployment-declared trust
 # profile feeding the admission matrix (one of trusted_operator |
 # internal_workforce | untrusted; never per-request); `untrusted` is the safe
 # default — the most restrictive admission cell. Override it per deployment.
@@ -80,7 +86,9 @@ ExecStart=/usr/local/bin/ocu-controld \
     -runtime-provider docker \
     -workload-profile untrusted \
     -jwt-signing-key /etc/ocu-control/storage-jwt-signing.key \
-    -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+    -audit-sink /var/log/ocu-control/audit.ocsf.jsonl \
+    -storage-issuer https://control.ocu.internal \
+    -storage-audience ocu-egress
 
 # Graceful stop must cover the host-driven teardown finalizer (credential
 # revoke, egress-route drop, writable-surface scrub) for every live session
