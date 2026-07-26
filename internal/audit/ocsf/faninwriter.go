@@ -21,15 +21,16 @@ import (
 // file provides); this writer sits behind ChainSink at the EventWriter seam and
 // adds the publish leg, per ADR-0009 and the sink.go seam contract.
 
-// Publisher is the central-ingest publish leg. ocu-audit's pkg/publish.Client
-// satisfies it. It is an interface here so control does not hard-import the
-// ocu-audit client into this package and so the composite is unit-testable
-// against a stub.
+// Publisher is the central-ingest publish leg, satisfied by
+// internal/audit/publish.Client. It stays an interface here so this package holds
+// no transport, and so the composite is unit-testable against a stub.
 //
-// Publish returns nil ONLY when the ingest durably committed the event (a 200
-// after its WAL fsync). Any non-nil error means NOT committed: the composite
-// fails closed so the caller's existing ErrAuditWriteFailed branch denies the
-// privileged action.
+// Publish returns nil ONLY when the ingest durably COMMITTED the event. Every other
+// outcome is an error, with no exceptions carved out: a sequence conflict, a
+// rejected envelope, and a transport failure are all "not committed", and the
+// composite fails closed so the caller's existing ErrAuditWriteFailed branch denies
+// the privileged action. An implementation that quietly swallows one status class
+// breaks that guarantee at its narrowest point.
 type Publisher interface {
 	// Publish sends one pre-chain event to the source's channel. The wire body
 	// omits source/prev_hash/chain_hash (the pipeline authors them; the source
@@ -69,9 +70,18 @@ type PublishWire struct {
 // Ordering is local-then-publish deliberately. If the publish leg fails after a
 // successful local write, the local mirror carries a committed tail event that
 // the central chain does not; on the caller's retry with the SAME sequence, the
-// ingest treats the duplicate as already-committed (idempotent 409/200 dedup)
-// and the local mirror tolerates the same-sequence tail artifact on resume. The
-// inverse order (publish-then-file) could commit to canon an action the local
+// ingest recognises the duplicate as already-committed and acknowledges it, and
+// the local mirror tolerates the same-sequence tail artifact on resume.
+//
+// An earlier version of this comment described that as "idempotent 409/200
+// dedup", which is wrong and dangerous in opposite directions: a duplicate is
+// acknowledged (it is NOT a 409), and a 409 means the sequence REGRESSED -- a real
+// conflict that must fail closed. Treating 409 as a benign dedup signal would drop
+// exactly the events whose ordering broke. The Publisher contract below therefore
+// admits no "expected" error status: anything that is not an acknowledgement is an
+// error.
+//
+// The inverse order (publish-then-file) could commit to canon an action the local
 // write then rejects, which P7-R3 forbids: the pipeline commit governs the ack,
 // so the local mirror is the leg allowed to carry a benign same-sequence tail.
 type FanInWriter struct {

@@ -49,14 +49,18 @@ type config struct {
 	caCert          string        // path to the CA certificate PEM rendered into every mount-config
 	egressNetwork   string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
 	edgeHost        string        // OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (gVisor cannot reach docker embedded DNS); unset adds no entry
-	auditSink       string        // OCSF audit fan-in sink
-	auditColdDir    string        // OPTIONAL directory sealed audit segments rotate into (NFR-COMP-01 hot->cold); unset = no rotation
-	stateDSN        string        // Postgres DSN for durable state; empty selects the in-memory store
-	jwksPath        string        // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
-	mcpKeysetPath   string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
-	mcpKeyFile      string        // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
-	sessionIdleTTL  time.Duration // OPTIONAL idle-session reaper window; 0 = unset (shelf-split resolution in resolveIdleTTL: off on the minimal shelf, ≤15 min ceiling on the full shelf per NFR-SEC-40)
-	create          bool          // a create request presented at startup (smoke hook)
+	auditSink        string        // OCSF audit fan-in sink (the LOCAL durable leg)
+	auditColdDir     string        // OPTIONAL directory sealed audit segments rotate into (NFR-COMP-01 hot->cold); unset = no rotation
+	auditCentralURL  string        // OPTIONAL central audit-ingest origin; unset = local-only (Control publishes nowhere). Set = the F10 fan-in leg is active and fail-closed
+	auditCentralCert string        // mTLS client cert for the central leg; REQUIRED when auditCentralURL is set (the verified peer identity IS the audit source)
+	auditCentralKey  string        // mTLS client key for the central leg (all-or-none with the cert)
+	auditCentralCA   string        // OPTIONAL CA anchoring the central ingest's server certificate
+	stateDSN         string        // Postgres DSN for durable state; empty selects the in-memory store
+	jwksPath         string        // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
+	mcpKeysetPath    string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
+	mcpKeyFile       string        // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
+	sessionIdleTTL   time.Duration // OPTIONAL idle-session reaper window; 0 = unset (shelf-split resolution in resolveIdleTTL: off on the minimal shelf, ≤15 min ceiling on the full shelf per NFR-SEC-40)
+	create           bool          // a create request presented at startup (smoke hook)
 }
 
 // sessionIdleCeiling is the maximum idle-session window the full shelf permits
@@ -170,6 +174,18 @@ func parse(args []string) (config, runMode, error) {
 			"shelf (empty -state-dsn) and resolves to the ≤15 min ceiling on the full shelf; a "+
 			"full-shelf value above the ceiling is refused, not clamped. An idle ACTIVE session "+
 			"past its window is force-killed and its concurrency slot returned")
+	fs.StringVar(&cfg.auditCentralURL, "audit-central-url", "",
+		"OPTIONAL central audit-ingest origin (F10 fan-in). Unset keeps Control local-only: "+
+			"events are durably mirrored to -audit-sink and published nowhere. Set makes the "+
+			"publish leg fail-closed -- an event the central ingest does not commit denies the "+
+			"privileged action")
+	fs.StringVar(&cfg.auditCentralCert, "audit-central-cert", "",
+		"mTLS client certificate for the central audit ingest; REQUIRED with -audit-central-url "+
+			"(the verified peer identity IS the audit source)")
+	fs.StringVar(&cfg.auditCentralKey, "audit-central-key", "",
+		"mTLS client key for the central audit ingest (all-or-none with -audit-central-cert)")
+	fs.StringVar(&cfg.auditCentralCA, "audit-central-ca", "",
+		"OPTIONAL CA PEM anchoring the central audit ingest's server certificate")
 	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	fs.BoolVar(&healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")
@@ -260,6 +276,16 @@ func validate(cfg config) error {
 	// (PIN-PENDING): they default to empty and are not enum-checked, so a deployment
 	// without storage provisioning still validates. The STORAGE iss/aud are no longer
 	// in that class — see requiredFlags.
+	//
+	// The central audit leg is ALL-OR-NONE on its identity: -audit-central-url without a
+	// client certificate would build a publisher the ingest cannot attribute, so every
+	// audited action would be denied on first traffic. Refused pre-bind instead.
+	if cfg.auditCentralURL != "" && (cfg.auditCentralCert == "" || cfg.auditCentralKey == "") {
+		return fmt.Errorf("%w: -audit-central-url requires -audit-central-cert and -audit-central-key", errRequiredFlagMissing)
+	}
+	if (cfg.auditCentralCert != "" || cfg.auditCentralKey != "") && cfg.auditCentralURL == "" {
+		return fmt.Errorf("%w: -audit-central-cert/-audit-central-key are set but -audit-central-url is not, so nothing publishes", errRequiredFlagMissing)
+	}
 	if !knownJWTAlgs[cfg.jwtAlg] {
 		return fmt.Errorf("%w: %q (choose eddsa|es256)", errUnknownJWTAlg, cfg.jwtAlg)
 	}

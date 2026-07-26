@@ -23,7 +23,7 @@ import (
 func Test_buildAuditWriter_RealPathIsDurable(t *testing.T) {
 	t.Parallel()
 	path := filepath.Join(t.TempDir(), "audit.ocsf.jsonl")
-	w, err := buildAuditWriter(path)
+	w, err := buildAuditWriter(config{auditSink: path})
 	if err != nil {
 		t.Fatalf("buildAuditWriter(%q) = %v, want a durable writer", path, err)
 	}
@@ -50,7 +50,7 @@ func Test_buildAuditWriter_NoneSelectsNullWriter(t *testing.T) {
 		sink := sink
 		t.Run(sink, func(t *testing.T) {
 			t.Parallel()
-			w, err := buildAuditWriter(sink)
+			w, err := buildAuditWriter(config{auditSink: sink})
 			if err != nil {
 				t.Fatalf("buildAuditWriter(%q) = %v, want the null writer", sink, err)
 			}
@@ -70,7 +70,7 @@ func Test_buildAuditWriter_NoneSelectsNullWriter(t *testing.T) {
 func Test_buildAuditWriter_UnwritablePathFailsClosed(t *testing.T) {
 	t.Parallel()
 	bad := filepath.Join(t.TempDir(), "no-such-dir", "audit.ocsf.jsonl")
-	if _, err := buildAuditWriter(bad); err == nil {
+	if _, err := buildAuditWriter(config{auditSink: bad}); err == nil {
 		t.Fatal("buildAuditWriter on an uncreatable path = nil, want an error (fail-closed boot abort)")
 	}
 }
@@ -80,7 +80,7 @@ func Test_buildAuditWriter_UnwritablePathFailsClosed(t *testing.T) {
 // daemon boot through the real boot wiring.
 func bootEmit(t *testing.T, path string, n int) {
 	t.Helper()
-	w, err := buildAuditWriter(path)
+	w, err := buildAuditWriter(config{auditSink: path})
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
@@ -136,7 +136,7 @@ func Test_buildResumedChainSink_DecoupledTailRecordsChainBreak(t *testing.T) {
 	// A boot over the torn file: verifyAuditChainFile runs first and rejects the torn
 	// tail, so the boot aborts BEFORE appending — the file is already broken. This is
 	// the fail-closed guard: a boot never appends onto a spine that already fails.
-	w, err := buildAuditWriter(path)
+	w, err := buildAuditWriter(config{auditSink: path})
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
@@ -174,4 +174,70 @@ func Test_verifyAuditChainFile_RejectsTamper(t *testing.T) {
 	if err := verifyAuditChainFile(path); err == nil {
 		t.Fatal("verifyAuditChainFile on a tampered file = nil; the boot verifier must catch a mutated event")
 	}
+}
+
+// Test_buildAuditWriter_InjectsTheCentralPublishLeg is the config-drift guard for the
+// F10 fan-in. The failure it exists to catch is not a crash: it is a daemon that
+// mirrors every audited action to its local file, publishes NOTHING to the central
+// log, and looks completely healthy while doing it. That is how a central WAL stays
+// empty by construction, and nothing else in the system notices.
+//
+// So it asserts the WIRING, not the writer's internals: with a central endpoint
+// configured the returned writer must be the composite fan-in, and without one it must
+// be the plain local sink. A refactor that drops the injection -- returning the local
+// sink in both cases -- reddens here.
+// writeTestClientKeypair writes a self-signed CLIENT keypair for the central audit leg.
+// It reuses the gateway helper's shape but with client-auth usage, so the material
+// is the kind tls.LoadX509KeyPair accepts for an mTLS client identity.
+func writeTestClientKeypair(t *testing.T, dir string) (certPath, keyPath string) {
+	t.Helper()
+	return writeServerCert(t, dir)
+}
+
+func Test_buildAuditWriter_InjectsTheCentralPublishLeg(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	certPath, keyPath := writeTestClientKeypair(t, dir)
+
+	t.Run("configured-central-endpoint-yields-the-fan-in-writer", func(t *testing.T) {
+		t.Parallel()
+		w, err := buildAuditWriter(config{
+			auditSink:        filepath.Join(t.TempDir(), "audit.jsonl"),
+			auditCentralURL:  "https://audit.internal:8443",
+			auditCentralCert: certPath,
+			auditCentralKey:  keyPath,
+		})
+		if err != nil {
+			t.Fatalf("buildAuditWriter with a central endpoint: %v", err)
+		}
+		defer func() { _ = w.Close() }()
+		if _, ok := w.(*ocsf.FanInWriter); !ok {
+			t.Fatalf("audit writer is %T, want *ocsf.FanInWriter -- a configured central endpoint that does not produce the composite means Control publishes nothing while looking healthy", w)
+		}
+	})
+
+	t.Run("no-central-endpoint-stays-local-only", func(t *testing.T) {
+		t.Parallel()
+		w, err := buildAuditWriter(config{auditSink: filepath.Join(t.TempDir(), "audit.jsonl")})
+		if err != nil {
+			t.Fatalf("buildAuditWriter local-only: %v", err)
+		}
+		defer func() { _ = w.Close() }()
+		if _, ok := w.(*ocsf.FanInWriter); ok {
+			t.Fatal("audit writer is the fan-in composite with no central endpoint configured; local-only must publish nowhere")
+		}
+	})
+
+	t.Run("unusable-central-identity-aborts-boot", func(t *testing.T) {
+		t.Parallel()
+		_, err := buildAuditWriter(config{
+			auditSink:        filepath.Join(t.TempDir(), "audit.jsonl"),
+			auditCentralURL:  "https://audit.internal:8443",
+			auditCentralCert: filepath.Join(dir, "absent.pem"),
+			auditCentralKey:  filepath.Join(dir, "absent.key"),
+		})
+		if err == nil {
+			t.Fatal("buildAuditWriter with unreadable mTLS material returned nil error; a broken publish leg must abort boot, not deny every action later")
+		}
+	})
 }
