@@ -47,7 +47,7 @@ func Test_startIdleReaper_NotStartedWhenOff(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	started := startIdleReaper(ctx, r, 0)
+	started := startIdleReaper(ctx, r, 0, nil)
 	if started {
 		t.Fatal("startIdleReaper reported started=true for a zero window; the reaper must not run when off")
 	}
@@ -68,7 +68,7 @@ func Test_startIdleReaper_TicksWhenOn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	window := 20 * time.Millisecond
-	started := startIdleReaper(ctx, r, window)
+	started := startIdleReaper(ctx, r, window, nil)
 	if !started {
 		t.Fatal("startIdleReaper reported started=false for a positive window; the reaper must run when on")
 	}
@@ -92,6 +92,97 @@ func Test_startIdleReaper_TicksWhenOn(t *testing.T) {
 	time.Sleep(40 * time.Millisecond)
 	if got := r.calls.Load(); got != stopped {
 		t.Fatalf("reaper kept ticking after ctx cancel: %d then %d — it must stop on shutdown", stopped, got)
+	}
+}
+
+// scriptedReaper returns a pre-set sequence of (reaped, err) results, one per tick,
+// then repeats the last. It records every tuple actually returned so a test can assert
+// the observer received exactly them.
+type scriptedReaper struct {
+	mu     sync.Mutex
+	script []struct {
+		n   int
+		err error
+	}
+	idx int
+}
+
+func (r *scriptedReaper) ReapIdle(_ context.Context, _ time.Duration) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	i := r.idx
+	if i >= len(r.script) {
+		i = len(r.script) - 1
+	}
+	r.idx++
+	return r.script[i].n, r.script[i].err
+}
+
+// Test_startIdleReaper_ObserverSeesEachTickOutcome proves the reaper loop REPORTS each
+// tick's (reaped, err) to the observer instead of swallowing it, AND that an error tick
+// is non-fatal (the loop keeps ticking past it). This is the #188 observability fix: a
+// permanently-failing reaper must be alarmable, not silent. Red-probe: revert the tick
+// to `_, _ = r.ReapIdle(...)` (drop the observe call) and this test reddens (the
+// observer never fires).
+func Test_startIdleReaper_ObserverSeesEachTickOutcome(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("reap enumerate failed")
+	r := &scriptedReaper{script: []struct {
+		n   int
+		err error
+	}{
+		{2, nil},
+		{0, sentinel},
+		{1, nil},
+	}}
+
+	var mu sync.Mutex
+	var got []struct {
+		n   int
+		err error
+	}
+	observe := func(reaped int, err error) {
+		mu.Lock()
+		got = append(got, struct {
+			n   int
+			err error
+		}{reaped, err})
+		mu.Unlock()
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if !startIdleReaper(ctx, r, 4*time.Millisecond, observe) {
+		t.Fatal("startIdleReaper must start for a positive window")
+	}
+
+	// Wait for at least the three scripted ticks to be observed.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(got)
+		mu.Unlock()
+		if n >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("observer saw only %d ticks within 2s, want >= 3 (loop did not survive the error tick?)", n)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	// The first three observed tuples must match the script exactly, INCLUDING the
+	// error tick in the middle -- proving the loop reported it and kept going.
+	if got[0].n != 2 || got[0].err != nil {
+		t.Errorf("tick 0 observed (%d, %v), want (2, nil)", got[0].n, got[0].err)
+	}
+	if got[1].n != 0 || !errors.Is(got[1].err, sentinel) {
+		t.Errorf("tick 1 observed (%d, %v), want (0, sentinel) -- the error tick must be reported, not swallowed", got[1].n, got[1].err)
+	}
+	if got[2].n != 1 || got[2].err != nil {
+		t.Errorf("tick 2 observed (%d, %v), want (1, nil) -- the loop must survive the error tick and keep reporting", got[2].n, got[2].err)
 	}
 }
 

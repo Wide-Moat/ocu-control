@@ -435,7 +435,15 @@ func serve(ctx context.Context, cfg config) error {
 		_ = gwListener.Close()
 		return fmt.Errorf("boot: resolve idle-reaper window: %w", err)
 	}
-	startIdleReaper(ctx, mgr, idleTTL)
+	// The observer surfaces each reaper tick's outcome to the metrics collector so a
+	// stuck reaper (e.g. one whose enumerate fails every tick) is alarmable rather than
+	// silent; the tick itself stays best-effort (a failed pass never kills the loop).
+	startIdleReaper(ctx, mgr, idleTTL, func(reaped int, err error) {
+		collector.IncSessionsReaped(reaped)
+		if err != nil {
+			collector.IncReapPassFailed()
+		}
+	})
 
 	// Both listeners are bound. Serve them until the process context is cancelled;
 	// the first serve error (or a clean ctx shutdown returning nil) ends the daemon.
