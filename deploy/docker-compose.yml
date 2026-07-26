@@ -98,24 +98,24 @@ services:
       - ${OCU_STORAGE_ISSUER:-https://control.ocu.internal}
       - -storage-audience
       - ${OCU_STORAGE_AUDIENCE:-ocu-egress}
-      # OPTIONAL — Storage-JWT JWKS artifact (ADR-0019 §35). Uncomment the two
-      # lines below (and the `jwks:` volume + mount) to have Control EMIT the
-      # static JWKS document at this path. Control emits the JWKS artifact at
-      # -jwks-path; the deploy layer serves it over HTTP at the egress edge's
-      # remote_jwks URI (ADR-0019 §35). Control adds no third listener — the
-      # two-listener invariant (§39 / NFR-SEC-52) is unchanged; the file is
-      # served by the deploy layer (the commented jwks-server sidecar below),
-      # not by Control. The artifact re-renders on boot/restart (v1 has no live
-      # rotation hook).
-      # - -jwks-path
-      # - /var/lib/ocu-control/jwks/jwks.json
+      # Storage-JWT JWKS artifact (ADR-0019 §35). ACTIVE in this reference
+      # deployment: the egress trust-edge verifies every Storage-JWT against this
+      # published key set, so a deployment that does not emit it has no working
+      # storage leg at all. Control only EMITS the static document at -jwks-path
+      # (atomic temp+fsync+rename, 0644 public keys only); the deploy layer serves
+      # it over HTTP at the edge's remote_jwks URI — the jwks-server sidecar below.
+      # Control adds no third listener: the two-listener invariant (§39 /
+      # NFR-SEC-52) is unchanged. The artifact re-renders on boot/restart (v1 has
+      # no live rotation hook), so restarting Control republishes the current set.
+      - -jwks-path
+      - /var/lib/ocu-control/jwks/jwks.json
     volumes:
       - audit:/var/log/ocu-control
       - runtime:/run/ocu-control
-      # OPTIONAL — writable volume for the JWKS artifact (paired with -jwks-path
-      # above). The root filesystem is read-only, so the emit needs a writable
-      # mount; this volume is shared read-only with the served-by sidecar below.
-      # - jwks:/var/lib/ocu-control/jwks
+      # Writable volume for the JWKS artifact (paired with -jwks-path above). The
+      # root filesystem is read-only, so the emit needs a writable mount; the same
+      # volume is mounted READ-ONLY into the served-by sidecar below.
+      - jwks:/var/lib/ocu-control/jwks
       # Storage-JWT signing key — a read-only secret mount the deployment
       # supplies. Replace the host path with your own secret source.
       - ${OCU_JWT_SIGNING_KEY:-./deploy/dev-secrets/storage-jwt-signing.key}:/run/secrets/storage-jwt-signing.key:ro
@@ -137,22 +137,31 @@ services:
       retries: 3
       start_period: 5s
 
-  # OPTIONAL — static-file sidecar that SERVES the JWKS artifact (commented
-  # example, not active, so we do not over-engineer). Control only EMITS the
-  # file at -jwks-path; THIS deploy-layer service serves it over HTTP at the
-  # egress edge's remote_jwks URI (ADR-0019 §35). Control adds no third listener
-  # — the two-listener invariant (§39 / NFR-SEC-52) is unchanged. Uncomment this
-  # service, the `-jwks-path` command lines, and the `jwks` volume to enable.
-  # jwks-server:
-  #   image: nginx:alpine
-  #   read_only: true
-  #   volumes:
-  #     # Read-only mount of the same volume Control writes the artifact into.
-  #     - jwks:/usr/share/nginx/html/.well-known:ro
-  #   # The egress edge fetches remote_jwks from, e.g.,
-  #   #   http://jwks-server/.well-known/jwks.json
-  #   ports:
-  #     - "127.0.0.1:9467:80"
+  # Static-file sidecar that SERVES the JWKS artifact Control emits. This is the
+  # DEPLOY LAYER, not Control: Control only writes the file at -jwks-path, and this
+  # service publishes it over HTTP at the egress edge's remote_jwks URI (ADR-0019
+  # §35). Keeping the serving here is what preserves the two-listener invariant
+  # (§39 / NFR-SEC-52) — Control never opens a third listener for public keys.
+  #
+  # The mount is READ-ONLY: the serving layer must never be able to rewrite the key
+  # set it publishes. The port is bound to loopback because the consumer is the
+  # egress edge inside the deployment, not the internet; a deployment whose edge
+  # runs on another host publishes this through its own ingress instead.
+  jwks-server:
+    image: nginx:alpine
+    read_only: true
+    depends_on:
+      - controld
+    volumes:
+      # Read-only mount of the same volume Control writes the artifact into.
+      - jwks:/usr/share/nginx/html/.well-known:ro
+      # nginx:alpine needs writable temp/run surfaces under read_only: true.
+      - jwks-nginx-cache:/var/cache/nginx
+      - jwks-nginx-run:/var/run
+    # The egress edge fetches remote_jwks from:
+    #   http://jwks-server/.well-known/jwks.json
+    ports:
+      - "127.0.0.1:9467:80"
 
 volumes:
   # Fail-closed audit sink: an audit-write failure denies the privileged
@@ -160,6 +169,9 @@ volumes:
   audit:
   # Runtime directory for the operator ingress socket (0700, host-owned).
   runtime:
-  # OPTIONAL — writable volume for the emitted JWKS artifact (paired with the
-  # commented -jwks-path command line and the jwks-server sidecar above).
-  # jwks:
+  # Writable volume for the emitted JWKS artifact: Control writes it, the
+  # jwks-server sidecar mounts the same volume read-only and serves it.
+  jwks:
+  # nginx writable surfaces, needed because the sidecar runs read_only: true.
+  jwks-nginx-cache:
+  jwks-nginx-run:
