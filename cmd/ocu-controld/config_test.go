@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/mcpkeyset"
 	"github.com/Wide-Moat/ocu-control/internal/state"
@@ -264,4 +265,69 @@ func Test_buildMCPKeyEngine_LoadsExistingEntries(t *testing.T) {
 	if eng == nil {
 		t.Fatal("buildMCPKeyEngine returned nil engine")
 	}
+}
+
+// Test_storageTTL_FlagRestoresDeployedSurface covers the -storage-ttl flag recovered
+// from the deployed fleet binary (docs/recovery-fleet-binary-2026-07-26.md). The
+// running stand passes `-storage-ttl 2h`; a build from this tree that did not define
+// the flag would abort on it, because Go's flag package terminates on an undefined
+// flag. So this test is the thing that keeps the tree able to produce the binary that
+// is deployed.
+//
+// It also pins the two decisions the recovery had to make, since neither is
+// observable from the artifact: an unset flag falls back to the short default (a
+// deployment that omits it keeps today's behaviour), and a value well above that
+// default is ACCEPTED (the stand's own 2h must not be refused by its own binary).
+// A negative value is refused pre-bind, because a negative window mints an
+// already-expired token while the daemon looks healthy.
+func Test_storageTTL_FlagRestoresDeployedSurface(t *testing.T) {
+	t.Parallel()
+	base := []string{
+		"-operator-listen", "unix:///tmp/test.sock",
+		"-gateway-listen", "127.0.0.1:0",
+		"-runtime-tier", "runc",
+		"-runtime-provider", "docker",
+		"-workload-profile", "trusted_operator",
+		"-jwt-signing-key", "/tmp/jwt.key",
+		"-audit-sink", "/tmp/audit.jsonl",
+	}
+	withArgs := func(extra ...string) []string {
+		return append(append([]string{}, base...), extra...)
+	}
+
+	t.Run("accepts-the-deployed-value", func(t *testing.T) {
+		t.Parallel()
+		cfg, _, err := parse(withArgs("-storage-ttl", "2h"))
+		if err != nil {
+			t.Fatalf("parse -storage-ttl 2h: %v (the deployed stand passes exactly this)", err)
+		}
+		if err := validate(cfg); err != nil {
+			t.Fatalf("validate with -storage-ttl 2h: %v (the stand's own value must not be refused)", err)
+		}
+		if got := resolveStorageTTL(cfg); got != 2*time.Hour {
+			t.Fatalf("resolveStorageTTL = %v, want 2h", got)
+		}
+	})
+
+	t.Run("unset-falls-back-to-the-short-default", func(t *testing.T) {
+		t.Parallel()
+		cfg, _, err := parse(withArgs())
+		if err != nil {
+			t.Fatalf("parse without -storage-ttl: %v", err)
+		}
+		if got := resolveStorageTTL(cfg); got != defaultStorageTTL {
+			t.Fatalf("resolveStorageTTL with the flag unset = %v, want the %v default", got, defaultStorageTTL)
+		}
+	})
+
+	t.Run("negative-refused-pre-bind", func(t *testing.T) {
+		t.Parallel()
+		cfg, _, err := parse(withArgs("-storage-ttl", "-1s"))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := validate(cfg); !errors.Is(err, errStorageTTLNegative) {
+			t.Fatalf("validate with -storage-ttl -1s = %v, want errStorageTTLNegative", err)
+		}
+	})
 }

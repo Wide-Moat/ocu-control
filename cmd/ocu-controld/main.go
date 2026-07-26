@@ -709,10 +709,31 @@ func defaultLimits() quota.Limits {
 	}
 }
 
-// storageTTL is the fixed, SHORT Storage-JWT window (a deployment parameter, not a
-// sourced value). There is no refresh path; a fresh token before expiry is a new
-// mint, never an exp bump.
-const storageTTL = 15 * time.Minute
+// defaultStorageTTL is the Storage-JWT window a deployment gets when it does not
+// set -storage-ttl. It is SHORT on purpose: there is no refresh path, so a fresh
+// token before expiry is a new mint, never an exp bump, and a wide window is a wide
+// blast radius for a leaked token.
+//
+// This was a bare const until the flag was restored. The comment on that const
+// called it "a deployment parameter", which a compile-time constant is not in any
+// useful sense -- and the deployed fleet binary already defined the flag, so the
+// const was also a divergence from what actually runs. See
+// docs/recovery-fleet-binary-2026-07-26.md.
+const defaultStorageTTL = 15 * time.Minute
+
+// resolveStorageTTL resolves the Storage-JWT window: -storage-ttl when set, the
+// short default when unset. There is deliberately no upper ceiling. The deployed
+// fleet binary accepts a 2h window, so capping below that here would refuse the
+// running stand's own arguments the next time it is rebuilt from this tree; whether
+// a ceiling belongs is a decision to take openly, not one to land inside a recovery.
+// A negative value cannot reach here -- validate() refuses it before any listener
+// binds -- and cred.LoadSignerFromMount independently refuses a non-positive window.
+func resolveStorageTTL(cfg config) time.Duration {
+	if cfg.storageTTL > 0 {
+		return cfg.storageTTL
+	}
+	return defaultStorageTTL
+}
 
 // buildSigner loads the Storage-JWT signer from the -jwt-signing-key MOUNT path,
 // FAIL-CLOSED: a missing or garbage key (or an unknown alg) is an error the caller
@@ -732,7 +753,7 @@ func buildSigner(cfg config, clk state.Clock) (*cred.Signer, *cred.Revoker, erro
 		StorageAudience: cfg.storageAudience,
 		ExecIssuer:      cfg.execIssuer,
 		ExecAudience:    cfg.execAudience,
-		StorageTTL:      storageTTL,
+		StorageTTL:      resolveStorageTTL(cfg),
 	})
 	if err != nil {
 		return nil, nil, err

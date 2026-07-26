@@ -56,6 +56,7 @@ type config struct {
 	mcpKeysetPath   string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
 	mcpKeyFile      string        // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
 	sessionIdleTTL  time.Duration // OPTIONAL idle-session reaper window; 0 = unset (shelf-split resolution in resolveIdleTTL: off on the minimal shelf, ≤15 min ceiling on the full shelf per NFR-SEC-40)
+	storageTTL      time.Duration // OPTIONAL Storage-JWT lifetime; 0 = unset (defaultStorageTTL). Negative is refused pre-bind; there is no ceiling (see docs/recovery-fleet-binary-2026-07-26.md)
 	create          bool          // a create request presented at startup (smoke hook)
 }
 
@@ -75,6 +76,13 @@ var errIdleTTLAboveCeiling = errors.New("session idle-TTL exceeds the full-shelf
 // shelf. A negative window is meaningless (it would reap every session immediately or
 // never), so it is refused rather than coerced.
 var errIdleTTLNegative = errors.New("session idle-TTL must not be negative")
+
+// errStorageTTLNegative is the typed refusal for a negative -storage-ttl. A negative
+// window would mint a Storage-JWT that is already expired, so every mount would fail
+// at the trust edge while the daemon looked healthy. It is refused pre-bind rather
+// than coerced to the default: a deployment that asked for a window must get the one
+// it asked for or a refusal, never a silently different one.
+var errStorageTTLNegative = errors.New("storage TTL must not be negative")
 
 // resolveIdleTTL applies the NFR-SEC-40 shelf split to the raw -session-idle-ttl
 // flag and returns the effective idle window (0 meaning the reaper does not run).
@@ -163,6 +171,11 @@ func parse(args []string) (config, runMode, error) {
 			"shelf (empty -state-dsn) and resolves to the ≤15 min ceiling on the full shelf; a "+
 			"full-shelf value above the ceiling is refused, not clamped. An idle ACTIVE session "+
 			"past its window is force-killed and its concurrency slot returned")
+	fs.DurationVar(&cfg.storageTTL, "storage-ttl", 0,
+		"OPTIONAL Storage-JWT lifetime; unset (0) uses the short built-in default. The token "+
+			"has NO refresh path, so this window is how long a session's storage credential "+
+			"lives -- widening it widens the blast radius of a leaked token, and a session that "+
+			"outlives it loses its mount")
 	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
 	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
 	fs.BoolVar(&healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")
@@ -227,6 +240,9 @@ func validate(cfg config) error {
 	// not enum-checked, so a deployment without storage provisioning still validates.
 	if !knownJWTAlgs[cfg.jwtAlg] {
 		return fmt.Errorf("%w: %q (choose eddsa|es256)", errUnknownJWTAlg, cfg.jwtAlg)
+	}
+	if cfg.storageTTL < 0 {
+		return fmt.Errorf("%w: %v", errStorageTTLNegative, cfg.storageTTL)
 	}
 
 	// Gateway mTLS is ALL-OR-NONE: either all three of -gateway-tls-cert/-key and
