@@ -119,78 +119,93 @@ func resolveIdleTTL(cfg config) (time.Duration, error) {
 // parse reads argv into a config plus the run mode. Unknown -runtime-tier and
 // -runtime-provider values are refused here (not defaulted). flag parse errors
 // are wrapped as a missing/invalid-required-flag refusal.
-func parse(args []string) (config, runMode, error) {
-	var (
-		cfg         config
-		showVersion bool
-		healthCheck bool
-	)
+// flagTargets are the destinations bindFlags registers the flag surface into: the
+// parsed config plus the two mode switches, which are not config fields because they
+// select a run mode rather than configure the daemon.
+type flagTargets struct {
+	cfg         config
+	showVersion bool
+	healthCheck bool
+}
 
-	fs := flag.NewFlagSet("ocu-controld", flag.ContinueOnError)
-	fs.SetOutput(io.Discard) // we render our own typed refusals, not flag's usage dump
-	fs.StringVar(&cfg.operatorListen, "operator-listen", "", "operator/lifecycle ingress endpoint (required)")
-	fs.StringVar(&cfg.gatewayListen, "gateway-listen", "", "gateway service-identity ingress endpoint (required)")
-	fs.StringVar(&cfg.runtimeTier, "runtime-tier", "", "deployment-wide isolation tier: runc|gvisor|firecracker (required)")
-	fs.StringVar(&cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker|k8s (required)")
-	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
-	fs.StringVar(&cfg.guestImage, "guest-image", "", "default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); a body image overrides it; unset + no body image is refused 400")
-	fs.StringVar(&cfg.guestImageAllow, "guest-image-allow", "", "comma-separated exact-match allow-list of images a create body may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only, a non-allowed override is refused 400")
-	fs.StringVar(&cfg.grantedIntents, "granted-intents", "", "comma-separated Storage-JWT intent ceiling the deployment serves: read|write|preview (ADR-0029). Empty = the pinned default (read,write) for the zero-config minimal shelf; the flag NEVER grants, only narrows — a per-mount-derived intent outside the ceiling refuses the create fail-closed. An unknown intent aborts boot")
-	fs.StringVar(&cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
-	fs.StringVar(&cfg.execSigningKey, "exec-signing-key", "", "path to the SEPARATE exec-channel Ed25519 signing key mount (ADR-0013 key separation); unset disables the exec channel")
-	fs.StringVar(&cfg.gatewayTLSCert, "gateway-tls-cert", "", "gateway mTLS server-cert PEM (all-or-none with -gateway-tls-key/-gateway-client-ca); unset keeps the stubbed plain-TCP fail-closed posture")
-	fs.StringVar(&cfg.gatewayTLSKey, "gateway-tls-key", "", "gateway mTLS server-key PEM (all-or-none)")
-	fs.StringVar(&cfg.gatewayClientCA, "gateway-client-ca", "", "gateway mTLS client-CA PEM the verified client SAN is anchored against (all-or-none)")
-	fs.StringVar(&cfg.jwtAlg, "jwt-alg", "eddsa", "Storage-JWT signing algorithm: eddsa|es256 (default eddsa, NFR-SEC-11)")
-	fs.StringVar(&cfg.storageIssuer, "storage-issuer", "", "provisional Storage-JWT issuer (PIN-PENDING; never hardcoded)")
-	fs.StringVar(&cfg.storageAudience, "storage-audience", "", "provisional Storage-JWT audience (PIN-PENDING)")
-	fs.StringVar(&cfg.execIssuer, "exec-issuer", "", "provisional exec-JWT issuer (PIN-PENDING)")
-	fs.StringVar(&cfg.execAudience, "exec-audience", "", "provisional exec-JWT audience (PIN-PENDING)")
-	fs.StringVar(&cfg.serviceURL, "service-url", "", "filestore service_url rendered into every mount-config (https://)")
-	fs.StringVar(&cfg.caCert, "ca-cert", "", "path to the CA certificate PEM rendered into every mount-config")
-	fs.StringVar(&cfg.egressNetwork, "egress-network", "", "OPTIONAL docker network a storage-scoped guest joins to reach the egress edge (edge is multi-homed onto it); unset keeps every session on its per-session Internal deny-all bridge")
-	fs.StringVar(&cfg.edgeHost, "edge-host", "", "OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (a gVisor guest cannot use docker's embedded DNS at 127.0.0.11); unset adds no entry")
-	fs.StringVar(&cfg.auditSink, "audit-sink", "", "OCSF audit fan-in sink (required)")
-	fs.StringVar(&cfg.stateDSN, "state-dsn", "", "Postgres DSN for durable state; empty selects the in-memory store (minimal shelf)")
-	fs.StringVar(&cfg.jwksPath, "jwks-path", "",
+// bindFlags registers the daemon's ENTIRE flag surface on fs and returns the targets
+// it writes into. It is split out of parse so the flag surface has one definition
+// that both the parser and any check of "which flags exist" read -- a shipped
+// manifest naming a flag this tree does not define would otherwise only be caught by
+// a boot that exits, since Go's flag package terminates on an undefined flag.
+func bindFlags(fs *flag.FlagSet) *flagTargets {
+	t := &flagTargets{}
+	fs.StringVar(&t.cfg.operatorListen, "operator-listen", "", "operator/lifecycle ingress endpoint (required)")
+	fs.StringVar(&t.cfg.gatewayListen, "gateway-listen", "", "gateway service-identity ingress endpoint (required)")
+	fs.StringVar(&t.cfg.runtimeTier, "runtime-tier", "", "deployment-wide isolation tier: runc|gvisor|firecracker (required)")
+	fs.StringVar(&t.cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker|k8s (required)")
+	fs.StringVar(&t.cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
+	fs.StringVar(&t.cfg.guestImage, "guest-image", "", "default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); a body image overrides it; unset + no body image is refused 400")
+	fs.StringVar(&t.cfg.guestImageAllow, "guest-image-allow", "", "comma-separated exact-match allow-list of images a create body may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only, a non-allowed override is refused 400")
+	fs.StringVar(&t.cfg.grantedIntents, "granted-intents", "", "comma-separated Storage-JWT intent ceiling the deployment serves: read|write|preview (ADR-0029). Empty = the pinned default (read,write) for the zero-config minimal shelf; the flag NEVER grants, only narrows — a per-mount-derived intent outside the ceiling refuses the create fail-closed. An unknown intent aborts boot")
+	fs.StringVar(&t.cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
+	fs.StringVar(&t.cfg.execSigningKey, "exec-signing-key", "", "path to the SEPARATE exec-channel Ed25519 signing key mount (ADR-0013 key separation); unset disables the exec channel")
+	fs.StringVar(&t.cfg.gatewayTLSCert, "gateway-tls-cert", "", "gateway mTLS server-cert PEM (all-or-none with -gateway-tls-key/-gateway-client-ca); unset keeps the stubbed plain-TCP fail-closed posture")
+	fs.StringVar(&t.cfg.gatewayTLSKey, "gateway-tls-key", "", "gateway mTLS server-key PEM (all-or-none)")
+	fs.StringVar(&t.cfg.gatewayClientCA, "gateway-client-ca", "", "gateway mTLS client-CA PEM the verified client SAN is anchored against (all-or-none)")
+	fs.StringVar(&t.cfg.jwtAlg, "jwt-alg", "eddsa", "Storage-JWT signing algorithm: eddsa|es256 (default eddsa, NFR-SEC-11)")
+	fs.StringVar(&t.cfg.storageIssuer, "storage-issuer", "", "provisional Storage-JWT issuer (PIN-PENDING; never hardcoded)")
+	fs.StringVar(&t.cfg.storageAudience, "storage-audience", "", "provisional Storage-JWT audience (PIN-PENDING)")
+	fs.StringVar(&t.cfg.execIssuer, "exec-issuer", "", "provisional exec-JWT issuer (PIN-PENDING)")
+	fs.StringVar(&t.cfg.execAudience, "exec-audience", "", "provisional exec-JWT audience (PIN-PENDING)")
+	fs.StringVar(&t.cfg.serviceURL, "service-url", "", "filestore service_url rendered into every mount-config (https://)")
+	fs.StringVar(&t.cfg.caCert, "ca-cert", "", "path to the CA certificate PEM rendered into every mount-config")
+	fs.StringVar(&t.cfg.egressNetwork, "egress-network", "", "OPTIONAL docker network a storage-scoped guest joins to reach the egress edge (edge is multi-homed onto it); unset keeps every session on its per-session Internal deny-all bridge")
+	fs.StringVar(&t.cfg.edgeHost, "edge-host", "", "OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (a gVisor guest cannot use docker's embedded DNS at 127.0.0.11); unset adds no entry")
+	fs.StringVar(&t.cfg.auditSink, "audit-sink", "", "OCSF audit fan-in sink (required)")
+	fs.StringVar(&t.cfg.stateDSN, "state-dsn", "", "Postgres DSN for durable state; empty selects the in-memory store (minimal shelf)")
+	fs.StringVar(&t.cfg.jwksPath, "jwks-path", "",
 		"OPTIONAL path to write the static JWKS artifact the deploy layer serves at the "+
 			"egress edge's remote_jwks URI (ADR-0019 §35); unset disables the emit. Control "+
 			"adds NO listener — it writes a file the deploy layer serves")
-	fs.StringVar(&cfg.mcpKeysetPath, "mcp-keyset-path", "",
+	fs.StringVar(&t.cfg.mcpKeysetPath, "mcp-keyset-path", "",
 		"OPTIONAL path to write the static hashed-key-set artifact the deploy layer serves "+
 			"to the gateway's config plane; unset disables the emit. Control adds NO listener — "+
 			"it writes a file atomically (temp+fsync+rename). The artifact is re-rendered on "+
 			"every mcp-key create/revoke. Mirrors -jwks-path (ADR-0027)")
-	fs.StringVar(&cfg.mcpKeyFile, "mcp-key-file", "",
+	fs.StringVar(&t.cfg.mcpKeyFile, "mcp-key-file", "",
 		"OPTIONAL path to the minimal-shelf 0600 root-owned hashed-entries file; unset selects "+
 			"in-memory-only storage (the minimal shelf default). If set and the file exists on boot, "+
 			"it is loaded fail-closed (looser-than-0600 perms abort boot). Written on every "+
 			"mcp-key create/revoke via a full atomic temp+fsync+rename rewrite")
-	fs.DurationVar(&cfg.sessionIdleTTL, "session-idle-ttl", 0,
+	fs.DurationVar(&t.cfg.sessionIdleTTL, "session-idle-ttl", 0,
 		"OPTIONAL idle-session reaper window (NFR-SEC-40). Unset (0) is off on the minimal "+
 			"shelf (empty -state-dsn) and resolves to the ≤15 min ceiling on the full shelf; a "+
 			"full-shelf value above the ceiling is refused, not clamped. An idle ACTIVE session "+
 			"past its window is force-killed and its concurrency slot returned")
-	fs.DurationVar(&cfg.storageTTL, "storage-ttl", 0,
+	fs.DurationVar(&t.cfg.storageTTL, "storage-ttl", 0,
 		"OPTIONAL Storage-JWT lifetime; unset (0) uses the short built-in default. The token "+
 			"has NO refresh path, so this window is how long a session's storage credential "+
 			"lives -- widening it widens the blast radius of a leaked token, and a session that "+
 			"outlives it loses its mount")
-	fs.BoolVar(&cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
-	fs.BoolVar(&showVersion, "version", false, "print the version and exit")
-	fs.BoolVar(&healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")
+	fs.BoolVar(&t.cfg.create, "create-on-start", false, "present a session-create request at startup (kill-switch-first smoke hook)")
+	fs.BoolVar(&t.showVersion, "version", false, "print the version and exit")
+	fs.BoolVar(&t.healthCheck, "health-check", false, "self-probe the ops listener and exit 0 (alive) or non-zero")
+	return t
+}
+
+// parse binds the flag surface, parses args into it, and reports the run mode.
+func parse(args []string) (config, runMode, error) {
+	fs := flag.NewFlagSet("ocu-controld", flag.ContinueOnError)
+	fs.SetOutput(io.Discard) // we render our own typed refusals, not flag's usage dump
+	t := bindFlags(fs)
 
 	if err := fs.Parse(args); err != nil {
 		return config{}, modeServe, fmt.Errorf("%w: %v", errRequiredFlagMissing, err)
 	}
 
 	switch {
-	case showVersion:
-		return cfg, modeVersion, nil
-	case healthCheck:
-		return cfg, modeHealthCheck, nil
+	case t.showVersion:
+		return t.cfg, modeVersion, nil
+	case t.healthCheck:
+		return t.cfg, modeHealthCheck, nil
 	}
-	return cfg, modeServe, nil
+	return t.cfg, modeServe, nil
 }
 
 // validate runs the pre-bind static gates in order: required-flag presence and

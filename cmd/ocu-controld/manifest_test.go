@@ -6,6 +6,8 @@ package main
 import (
 	"bufio"
 	"errors"
+	"flag"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -529,5 +531,56 @@ func runBinary(t *testing.T, bin string, argv []string, timeout time.Duration) (
 		_ = cmd.Process.Kill()
 		<-done
 		return out.String(), errors.New("timeout")
+	}
+}
+
+// Test_Manifests_EveryFlagIsDefinedInThisTree asserts that every flag any shipped
+// manifest passes is one THIS TREE defines. Go's flag package terminates the process
+// on an undefined flag, so a manifest naming a flag the code does not register is not
+// a cosmetic mismatch -- it is a deployment that cannot boot.
+//
+// This is the class that produced docs/recovery-fleet-binary-2026-07-26.md: the
+// running stand passes -storage-ttl, which no ref in this repo defined, so the tree
+// could not build the binary that was deployed. Before that recovery this test would
+// have gone red the moment the flag entered a manifest, which is the whole point.
+//
+// The limit is worth stating: this compares manifests against the flags THIS TREE
+// registers, not against a built artifact. A binary built elsewhere can still define
+// more (or fewer) flags than this tree does; catching that needs the artifact itself
+// and belongs to whoever builds it.
+func Test_Manifests_EveryFlagIsDefinedInThisTree(t *testing.T) {
+	t.Parallel()
+	// Register the real flag set into a throwaway FlagSet, then ask IT what exists --
+	// so the reference is the production registration, never a list restated here.
+	defined := map[string]bool{}
+	fs := flag.NewFlagSet("probe", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	_ = bindFlags(fs)
+	fs.VisitAll(func(f *flag.Flag) { defined[f.Name] = true })
+	if len(defined) == 0 {
+		t.Fatal("probe FlagSet registered no flags; the reflection hook is broken, so this test would pass vacuously")
+	}
+
+	for _, m := range loadManifestArgvs(t) {
+		m := m
+		t.Run(m.name, func(t *testing.T) {
+			t.Parallel()
+			for _, tok := range m.argv {
+				if !strings.HasPrefix(tok, "-") {
+					continue
+				}
+				// Accept both -flag value and -flag=value spellings.
+				name := strings.TrimLeft(tok, "-")
+				if i := strings.IndexByte(name, '='); i >= 0 {
+					name = name[:i]
+				}
+				if name == "" {
+					continue
+				}
+				if !defined[name] {
+					t.Errorf("%s manifest passes -%s, which this tree does not define; Go's flag package exits on an undefined flag, so this deployment would fail to boot", m.name, name)
+				}
+			}
+		})
 	}
 }
