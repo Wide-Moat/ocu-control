@@ -217,6 +217,14 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # A registry reference must be lower-case, and github.repository is not
+      # (Wide-Moat/ocu-control). Workflow expressions have no lower-casing function,
+      # so the name is computed in shell here, exactly as image-scan, sbom-and-sign
+      # and promote already do. Passing the raw expression to the push made buildx
+      # refuse with "repository name must be lowercase" -- every release would have
+      # failed at this job.
+      - name: lower-case the image name
+        run: echo "IMAGE_NAME_LC=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
       - name: derive the OCI labels
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9 # v6.1.0
@@ -237,7 +245,7 @@ jobs:
           build-args: |
             VERSION=${{ github.ref_name }}
           labels: ${{ steps.meta.outputs.labels }}
-          outputs: type=image,name=ghcr.io/${{ github.repository }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.IMAGE_NAME_LC }},push-by-digest=true,name-canonical=true,push=true
 
   # image-scan runs trivy over the JUST-pushed image by digest — CRITICAL
   # blocks, same severity floor as the filesystem scan in security.yml. The
