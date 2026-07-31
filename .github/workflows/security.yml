@@ -218,6 +218,23 @@ jobs:
       - name: trivy red-probe (gate-fires proof)
         run: bash scripts/trivy-redprobe.sh
 
+  # release-path structural gate. The signed-SBOM/provenance gate itself runs on a
+  # tag, so it can never be a required PR check -- and a skipped required check counts
+  # as PASSED, so relocating it behind a PR condition would produce a permanently
+  # green check that blocks nothing. This job is the part that CAN be required: it
+  # reads the workflow files, needs no artifact, and fails the pull request that would
+  # introduce the regression rather than the release that suffers it.
+  release-path:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: install pyyaml
+        run: python3 -m pip install --quiet pyyaml==6.0.2
+      - name: signing precedes any consumable reference
+        run: python3 scripts/check-signing-precedes-publish.py
+      - name: release-path red-probe (gate-fires proof)
+        run: bash scripts/signing-precedes-publish-redprobe.sh
+
   conventional-commits:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
