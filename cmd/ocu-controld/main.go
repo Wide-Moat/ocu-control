@@ -296,7 +296,6 @@ func serve(ctx context.Context, cfg config) error {
 	// loaded further down (boot.New / seq) and gated on the listener-bind hook — no
 	// listener binds before it, and neither the provider nor the audit sink admits a
 	// create.
-<<<<<<< HEAD
 	// Hot-to-cold rotation runs BEFORE the writer opens anything (NFR-COMP-01).
 	// In-process is deliberate: RotateSegment is read-then-truncate by path, so
 	// an external process racing the live writer would destroy any envelope

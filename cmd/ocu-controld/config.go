@@ -28,27 +28,27 @@ const (
 
 // config is the parsed serving invocation — the daemon's full flag surface.
 type config struct {
-	operatorListen  string        // operator/lifecycle ingress endpoint (distinct from gateway)
-	gatewayListen   string        // gateway service-identity ingress endpoint
-	runtimeTier     string        // deployment-wide isolation tier; never per-request
-	runtimeProvider string        // container backend behind the RuntimeProvider seam
-	workloadProfile string        // deployment-declared trust profile feeding the admission matrix; never per-request
-	guestImage      string        // deployment-declared default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); the body image is an override; unset + no body image is a fail-closed 400
-	guestImageAllow string        // comma-separated exact-match allow-list of guest images a create BODY may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only (deny-by-default)
-	grantedIntents  string        // comma-separated Storage-JWT intent ceiling (read|write|preview) the deployment serves (ADR-0029); empty = the pinned default (read,write); a claim outside it is refused fail-closed. The flag never grants, only narrows.
-	jwtSigningKey   string        // path to the Storage-JWT signing key (config/secret mount)
-	execSigningKey  string        // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
-	soarKeyring     string        // OPTIONAL path to the SOAR webhook keyring (ADR-0039: JSON principals with hex Ed25519 keys); unset keeps the SOAR channel fail-closed (no revoke can verify)
-	gatewayTLSCert  string        // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
-	gatewayTLSKey   string        // OPTIONAL gateway mTLS server-key PEM (all-or-none)
-	gatewayClientCA string        // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
-	jwtAlg          string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
-	storageIssuer   string        // REQUIRED Storage-JWT iss, deployment-supplied and never hardcoded; the egress verifier pins it (see requiredFlags)
-	storageAudience string        // REQUIRED Storage-JWT aud, deployment-supplied; the egress verifier pins it
-	serviceURL      string        // filestore service_url rendered into every mount-config
-	caCert          string        // path to the CA certificate PEM rendered into every mount-config
-	egressNetwork   string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
-	edgeHost        string        // OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (gVisor cannot reach docker embedded DNS); unset adds no entry
+	operatorListen   string        // operator/lifecycle ingress endpoint (distinct from gateway)
+	gatewayListen    string        // gateway service-identity ingress endpoint
+	runtimeTier      string        // deployment-wide isolation tier; never per-request
+	runtimeProvider  string        // container backend behind the RuntimeProvider seam
+	workloadProfile  string        // deployment-declared trust profile feeding the admission matrix; never per-request
+	guestImage       string        // deployment-declared default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); the body image is an override; unset + no body image is a fail-closed 400
+	guestImageAllow  string        // comma-separated exact-match allow-list of guest images a create BODY may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only (deny-by-default)
+	grantedIntents   string        // comma-separated Storage-JWT intent ceiling (read|write|preview) the deployment serves (ADR-0029); empty = the pinned default (read,write); a claim outside it is refused fail-closed. The flag never grants, only narrows.
+	jwtSigningKey    string        // path to the Storage-JWT signing key (config/secret mount)
+	execSigningKey   string        // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
+	soarKeyring      string        // OPTIONAL path to the SOAR webhook keyring (ADR-0039: JSON principals with hex Ed25519 keys); unset keeps the SOAR channel fail-closed (no revoke can verify)
+	gatewayTLSCert   string        // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
+	gatewayTLSKey    string        // OPTIONAL gateway mTLS server-key PEM (all-or-none)
+	gatewayClientCA  string        // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
+	jwtAlg           string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
+	storageIssuer    string        // REQUIRED Storage-JWT iss, deployment-supplied and never hardcoded; the egress verifier pins it (see requiredFlags)
+	storageAudience  string        // REQUIRED Storage-JWT aud, deployment-supplied; the egress verifier pins it
+	serviceURL       string        // filestore service_url rendered into every mount-config
+	caCert           string        // path to the CA certificate PEM rendered into every mount-config
+	egressNetwork    string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
+	edgeHost         string        // OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (gVisor cannot reach docker embedded DNS); unset adds no entry
 	auditSink        string        // OCSF audit fan-in sink (the LOCAL durable leg)
 	auditColdDir     string        // OPTIONAL directory sealed audit segments rotate into (NFR-COMP-01 hot->cold); unset = no rotation
 	auditCentralURL  string        // OPTIONAL central audit-ingest origin; unset = local-only (Control publishes nowhere). Set = the F10 fan-in leg is active and fail-closed

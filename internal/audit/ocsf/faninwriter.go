@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 )
@@ -196,13 +197,47 @@ func toPublishWire(env ChainEnvelope) PublishWire {
 	if err := json.Unmarshal(env.Event, &e); err != nil {
 		return w // header fields empty -> server validate() 400s -> fail-closed
 	}
-	w.TraceID = e.Metadata.CorrelationUID
-	w.SessionID = e.Actor.Session.UID
+	// A deployment-wide action (the kill-switch DENY-ALL is the one that matters)
+	// carries an EMPTY Key by design -- audit.Record documents it -- so the OCSF
+	// event has no session uid and no correlation uid. The contract requires those
+	// fields to be present, so projecting the empty string would have the publish
+	// leg refuse the event, and refusing it fail-closed denies the ACTION: the
+	// kill-switch could never be engaged while the central leg was on. A global
+	// action is not a missing scope, it is a scope of everything, so it is named
+	// that way instead.
+	scope := firstNonEmpty(e.Actor.Session.UID, globalScope)
+	w.TraceID = firstNonEmpty(e.Metadata.CorrelationUID, scope)
+	w.SessionID = scope
 	w.ActorID = e.Actor.User.Name
-	w.Resource = e.Actor.Session.UID
+	w.Resource = scope
 	w.Action = firstNonEmpty(e.Metadata.Unmapped.Action, e.ActivityName)
-	w.Outcome = e.Status
+	// The OCSF status label is capitalised ("Success"); the fan-in contract pins a
+	// lower-case enum. They are two different vocabularies for the same fact, and
+	// copying one into the other made EVERY event unpublishable -- and therefore
+	// every audited action denied -- the moment the central leg was switched on.
+	w.Outcome = outcomeFor(e.Status)
 	return w
+}
+
+// globalScope is what a deployment-wide action reports where a per-session action
+// reports its session key. It is a scope, not a placeholder for a missing value.
+const globalScope = "*"
+
+// outcomeFor maps the OCSF status label onto the fan-in contract's outcome enum
+// (contracts/audit/audit-fanin.asyncapi.yaml pins success|failure|unknown). An
+// unrecognised label becomes "unknown" rather than being passed through: an
+// out-of-enum value is refused by both sides, and refusing an audit record is how
+// an action gets denied, so a label this code has not seen must degrade the record
+// rather than block the action.
+func outcomeFor(status string) string {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case "success":
+		return "success"
+	case "failure":
+		return "failure"
+	default:
+		return "unknown"
+	}
 }
 
 func firstNonEmpty(a, b string) string {
