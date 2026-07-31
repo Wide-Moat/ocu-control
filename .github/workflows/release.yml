@@ -415,15 +415,33 @@ jobs:
       - name: tag the signed digest
         env:
           DIGEST: ${{ needs.ghcr-image.outputs.digest }}
+          # Passed through env rather than interpolated into the script body: a
+          # workflow expression expanded inside `run:` is substituted before bash
+          # ever parses it, so its content is script, not data.
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
           name="ghcr.io/${GITHUB_REPOSITORY,,}"
-          # One imagetools create per tag, all pointing at the same signed digest.
+
+          # Both inputs must be non-empty. An empty digest would build `name@` and
+          # fail loudly, but an empty TAGS list would iterate zero times and let this
+          # job exit 0 having attached NOTHING -- a signed image with no consumable
+          # tag, reported as a successful promote. That is the failure this whole
+          # split exists to prevent, so it is asserted rather than assumed.
+          [ -n "$DIGEST" ] || { echo "::error::empty digest from the ghcr-image job; nothing to tag"; exit 1; }
+          [ -n "${TAGS//[[:space:]]/}" ] || { echo "::error::the metadata action produced no tags; promote would attach nothing and still succeed"; exit 1; }
+
+          attached=0
           while IFS= read -r tag; do
             [ -n "$tag" ] || continue
             echo "tagging ${tag} -> ${name}@${DIGEST}"
             docker buildx imagetools create --tag "$tag" "${name}@${DIGEST}"
-          done <<< "${{ steps.meta.outputs.tags }}"
+            attached=$((attached + 1))
+          done <<< "$TAGS"
+
+          # A loop that ran but attached nothing is the same silent success.
+          [ "$attached" -gt 0 ] || { echo "::error::no tags were attached to ${name}@${DIGEST}"; exit 1; }
+          echo "attached ${attached} tag(s) to the signed digest"
 
   release:
     runs-on: ubuntu-latest
