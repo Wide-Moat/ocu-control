@@ -81,8 +81,39 @@ keys jti by session (`Signer.MintStorageJWT` records through `cred.Revoker`).
 
 This path has one hard prerequisite outside this repo: the mount client must
 accept a re-pushed mount config and swap the credential **without remounting**,
-or the swap becomes a visible I/O interruption. That is component-05's answer to
-give, not ours to assume.
+or the swap becomes a visible I/O interruption.
+
+**That prerequisite is not met today.** The mount client's owner answered it
+against `ocu-rclone-filestore` at `origin/main` (ccc1f7c), and the relevant
+citations spot-check clean from here:
+
+- The mount config is read exactly once, at process start, before the mount
+  exists (`internal/mountcfg/mountcfg.go:74`, called from
+  `cmd/ocu-rclone-filestore/run.go:74`).
+- There is no re-read machinery at all: no `fsnotify`, no `SIGHUP`, no `SIGUSR`
+  anywhere in non-test code — verified as a negative grep, not inferred.
+  The only signals handled are `SIGTERM`/`SIGINT`, and both mean teardown.
+- The credential is baked into a long-lived HTTP client: `authToken` is an
+  unexported field assigned once in the constructor
+  (`internal/brokerrpc/client.go:63`), read at one place that sets the bearer
+  header. The code says so itself: "The credential is read once at construction;
+  there is no refresh."
+
+So a re-pushed config changes nothing — the running mount never looks at it.
+Because the mount is served in-process (no child process, no rclone daemon), the
+only way to swap the credential today is to restart the process, which tears the
+FUSE mount down: the guest's open descriptors die and unflushed VFS cache goes
+through teardown drain. That is not a credential rotation, it is an outage.
+
+The same answer named the cheap seam, sized S on their side: `authToken` becomes
+an atomically-swappable value behind the single `setAuthHeader` call every request
+path already funnels through, plus a `SIGHUP` handler that re-reads the config.
+With those two changes, path A works as intended — Control rewrites the config and
+signals; the next request carries the new credential; the mount is never touched.
+
+This does not change the recommendation, but it does change the sequencing: path A
+is blocked on that seam landing, and until it does, Control's side would have
+nowhere to push to.
 
 **B. Documented session ceiling.** Declare that no session may outlive the
 Storage-JWT window and enforce it by tearing the session down at `exp`.
@@ -103,11 +134,27 @@ operator decision instead of a rebuild.
 
 Sequence:
 
-1. Confirm with component-05 whether a re-pushed mount config hot-swaps the
-   credential without remounting.
-2. If yes: implement the pre-`exp` re-mint and push, with a metric for a failed
-   re-push (the same reasoning as the reaper counters in #188 — a silent
+1. ~~Confirm whether a re-pushed mount config hot-swaps the credential without
+   remounting.~~ **Answered: it does not.** See the prerequisite above.
+2. The mount client's hot-swap seam lands first (their side, sized S: an
+   atomically-swappable token behind the single header-setting call, plus a
+   `SIGHUP` re-read). Until then Control has nowhere to push to, so building the
+   Control half first would produce a re-push that silently changes nothing —
+   the same "mechanism present, wiring absent" shape this repo has hit repeatedly.
+3. Then the Control half: the pre-`exp` re-mint and push, with a metric for a
+   failed re-push (the same reasoning as the reaper counters in #188 — a silent
    background failure that only surfaces as a broken session is not observable).
-3. If no: the choice collapses to a widened window plus an enforced ceiling, and
-   the ceiling has to be ratified as a product constraint, not an implementation
-   detail.
+
+The fallback if that seam is refused is NOT "do nothing": it is a widened window
+plus an enforced ceiling, and the ceiling then has to be ratified as a product
+constraint rather than left as an implementation detail. That trade is worse on
+every axis, which is why the seam is worth its S.
+
+## What is still unknown
+
+What the guest actually observes after `exp` — `EIO` versus `EACCES`, how far the
+VFS cache masks it, whether writes are lost or held — is still unanswered. It does
+not change the decision (the credential is dead either way and nothing replaces
+it), so it is not worth a live experiment on its own; it changes only how the
+failure is described to an operator. Worth folding into the first live test of the
+re-push path rather than paying for separately.
