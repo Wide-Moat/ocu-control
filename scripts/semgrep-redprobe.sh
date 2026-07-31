@@ -19,26 +19,59 @@ set -euo pipefail
 # The gate's own ruleset list, kept identical to the CI job's SEMGREP_RULES.
 RULES="${SEMGREP_RULES:-p/security-audit p/owasp-top-ten p/golang p/github-actions p/secrets}"
 
-probe_file="zz_semgrep_redprobe.go"
+probe_dir="zz_semgrep_redprobe"
+probe_file="${probe_dir}/probe.go"
 report="$(mktemp)"
-cleanup() { rm -f "$probe_file" "$report"; }
+cleanup() { rm -rf "$probe_dir"; rm -f "$report"; }
 trap cleanup EXIT
 
-# Weak-hash use: a finding the Go security rules carry, in a file that compiles on its
-# own and touches nothing else in the tree.
-cat >"$probe_file" <<'GO'
-//go:build ignore
+# A scanner container fed a git WORKTREE sees `.git` as a FILE pointing at
+# .git/worktrees/<name>, which does not resolve inside the container; a git-mode scan
+# then reads nothing and reports "0 findings, exit 0". On a clean tree that zero is
+# indistinguishable from success, so refuse to run rather than produce it. CI checks
+# out an ordinary clone, so this only fires during local debugging -- which is exactly
+# when a false green would be believed.
+if [ -e .git ] && [ ! -d .git ]; then
+  echo "::error::this tree is a git worktree (.git is a file). A scanner cannot resolve it from inside a container and would report zero findings. Run the probe from an ordinary clone."
+  exit 1
+fi
 
-package main
+# THE PLANTED DEFECT IS THIS REPO'S OWN IDIOM, NOT THE RULE'S TEXTBOOK SHAPE.
+# A rule can match `md5.Sum(x)` and miss the streaming `h := md5.New(); h.Write(...)`
+# form -- and a probe written in the shape the rule documents proves only that the
+# rule fires on its own documentation. So the plant is a copy of the real hash
+# construction in internal/cred/signer.go (deriveJTI) with sha256 swapped for md5:
+# the exact regression a careless edit there would produce, written the way this
+# codebase actually writes it.
+#
+# It goes in its own directory and package so it never collides with the real one.
+mkdir -p "$probe_dir"
+cat >"$probe_file" <<'GO'
+package probe
 
 import (
 	"crypto/md5"
-	"fmt"
+	"encoding/base64"
+	"time"
 )
 
-func main() {
-	sum := md5.Sum([]byte("probe"))
-	fmt.Println(sum)
+// deriveJTI mirrors internal/cred/signer.go's real construction, with the hash
+// weakened. The shape -- streaming Writes into a hash.Hash, then Sum(nil) -- is this
+// repository's idiom, which is the point: the probe must exercise the code shape the
+// gate will actually meet.
+func deriveJTI(sessionKey, filesystemID string, at time.Time) string {
+	h := md5.New()
+	h.Write([]byte(sessionKey))
+	h.Write([]byte{0})
+	h.Write([]byte(filesystemID))
+	h.Write([]byte{0})
+	var nano [8]byte
+	n := at.UnixNano()
+	for i := 0; i < 8; i++ {
+		nano[i] = byte(n >> (8 * i) & 0xff)
+	}
+	h.Write(nano[:])
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
 }
 GO
 
@@ -71,13 +104,13 @@ try:
 except Exception as exc:  # noqa: BLE001 - an unreadable report is a failed probe
     print(f"could not read the semgrep report: {exc}")
     raise SystemExit(1)
-hits = [r for r in data.get("results", []) if r.get("path", "").endswith(planted)]
+hits = [r for r in data.get("results", []) if planted in r.get("path", "")]
 if not hits:
     raise SystemExit(1)
 print(f"planted file reported by rule(s): {sorted({h.get('check_id','?') for h in hits})}")
 PY
 then
-  echo "::error::semgrep did not report the planted weak-hash use in ${probe_file}. The SAST gate is running with no effective rules -- check SEMGREP_RULES and that each ruleset still resolves."
+  echo "::error::semgrep did not report the planted weak-hash use in ${probe_file}. Either the SAST gate has no effective rules (check SEMGREP_RULES and that each ruleset still resolves), or its Go rules do not match this repository's hashing idiom -- which would mean the gate is blind to the real regression, not that the probe is wrong."
   exit 1
 fi
 echo "ok: gate is RED on a planted finding, and names ${probe_file}"
