@@ -61,10 +61,43 @@ def job_publishes_a_tag(job: dict) -> bool:
         with_block = step.get("with") or {}
         if "docker/build-push-action" in uses and isinstance(with_block, dict):
             tags = str(with_block.get("tags", "")).strip()
-            pushes = str(with_block.get("push", "")).strip().lower() == "true"
             outputs = str(with_block.get("outputs", ""))
-            if tags and (pushes or "push=true" in outputs):
+            pushes = (
+                str(with_block.get("push", "")).strip().lower() == "true"
+                or "push=true" in outputs
+            )
+            if not pushes:
+                continue
+            if tags:
                 return True
+            # The tag can also hide INSIDE the outputs string, as
+            # `type=image,name=ghcr.io/org/repo:v1.2.3,push=true`, with no `tags:`
+            # key and no `push:` key at all. Reading only `with.tags`/`with.push`
+            # misses it, and the miss is a FALSE PASS -- the worse direction, since
+            # it reports a clean release path that is publishing a consumable tag.
+            if outputs_name_carries_tag(outputs):
+                return True
+    return False
+
+
+def outputs_name_carries_tag(outputs: str) -> bool:
+    """True if a build-push-action `outputs` string names a TAGGED image reference.
+
+    `push-by-digest=true` is the digest-only form and is never a consumable tag, so it
+    short-circuits regardless of what `name=` holds.
+    """
+    if "push-by-digest=true" in outputs:
+        return False
+    for field in outputs.split(","):
+        field = field.strip()
+        if not field.startswith("name="):
+            continue
+        ref = field[len("name="):].strip().strip('"')
+        # A tag is a colon in the LAST path segment; a colon earlier is a registry
+        # port (localhost:5000/img), which is not a tag.
+        last = ref.rsplit("/", 1)[-1]
+        if ":" in last:
+            return True
     return False
 
 
