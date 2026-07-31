@@ -202,3 +202,25 @@ jobs:
           context: .
           platforms: linux/amd64
           push: false
+          # Load into the local daemon so the scan below reads the SAME image this
+          # job just built, rather than pulling a published one.
+          load: true
+          tags: ocu-control:pr-scan
+      # Scan the COMPILED ARTIFACT. The filesystem scan in security.yml reads go.mod
+      # and cannot see the Go stdlib that gets linked into the binary -- a HIGH there
+      # (CVE-2026-39822, os.Root traversal) ships silently and no tree-level gate ever
+      # mentions it. Only a scan of the built image reads the binary's own build info.
+      #
+      # This lives in docker-build, which is ALREADY a required check and already
+      # builds the image, so the gate takes effect without adding a new required
+      # context -- and it fails the pull request that would introduce the regression
+      # rather than the release that carries it.
+      - name: trivy image — CRITICAL,HIGH blocks
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ocu-control:pr-scan
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: "false"
+          trivyignores: .trivyignore
