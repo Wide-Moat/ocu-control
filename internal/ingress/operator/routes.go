@@ -79,11 +79,11 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		writeStatus(w, http.StatusOK, "destroyed")
 	})
 
-	mux.HandleFunc("/v1alpha/revoke/one", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	// The three kill-switch verbs are method-scoped for the same reason as the routes
+	// above and the same reason the contract states them as POST operations: the mux
+	// refuses a wrong method before any handler code runs, so a privileged route never
+	// admits a request it does not serve, and the refusal carries the Allow header.
+	mux.HandleFunc("POST /v1alpha/revoke/one", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body revokeOneBody
 		if err := decodeJSON(w, r, &body); err != nil {
@@ -97,11 +97,7 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		writeStatus(w, http.StatusOK, "revoked")
 	})
 
-	mux.HandleFunc("/v1alpha/revoke/all", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	mux.HandleFunc("POST /v1alpha/revoke/all", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body revokeAllBody
 		if err := decodeJSON(w, r, &body); err != nil {
@@ -115,11 +111,7 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		writeStatus(w, http.StatusOK, "deny-all engaged")
 	})
 
-	mux.HandleFunc("/v1alpha/resume/all", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	mux.HandleFunc("POST /v1alpha/resume/all", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body resumeAllBody
 		if err := decodeJSON(w, r, &body); err != nil {
