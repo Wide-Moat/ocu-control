@@ -113,14 +113,16 @@ func newOrphanHarness(t *testing.T) *orphanHarness {
 }
 
 // faultPoints enumerates every create stage that pushes-or-follows a compensator and
-// can be made to fail. S1 (resolveIdentity) and S2 (admit) push no compensator and
-// are covered by their own unit tests; S3 (quotaCharge) refuses before pushing its
-// own compensator, also unit-tested. S6 (mintStorageJWT) pushes no compensator (a
-// minted-but-unused token simply expires; its refusal paths are cred's own tests).
-// The headline no-orphan property is the unwind of S4..S10, where 1..N-1
-// compensators — Release, Receipt.Apply, Unstage, Scrub, ForceKill — must each run
-// exactly once in reverse, leaving no row, counter, sockdir, pushed config, or
-// container.
+// can be made to fail. The stage indices track m.stages 1-based, so inserting a stage
+// (ADR-0030's deriveChatScope at index 6, before mintStorageJWT) shifts the later
+// numbers here in lockstep. S1 (resolveIdentity) and S2 (admit) push no compensator
+// and are covered by their own unit tests; S3 (quotaCharge) refuses before pushing its
+// own compensator, also unit-tested. S6 (deriveChatScope) and S7 (mintStorageJWT) push
+// no compensator (the derive mutates only in-memory state and the mint's token simply
+// expires; their refusal paths are unit-/cred-tested). The headline no-orphan property
+// is the unwind of S4..S11, where 1..N-1 compensators - Release, Receipt.Apply,
+// Unstage, Scrub, ForceKill - must each run exactly once in reverse, leaving no row,
+// counter, sockdir, pushed config, or container.
 func faultPoints() []faultPoint {
 	return []faultPoint{
 		{
@@ -140,28 +142,28 @@ func faultPoints() []faultPoint {
 			},
 		},
 		{
-			stage: 7, name: "renderPushMount",
+			stage: 8, name: "renderPushMount",
 			arm: func(h *orphanHarness) error {
 				h.pusher.failPush = true
 				return errPushInjected
 			},
 		},
 		{
-			stage: 8, name: "materialize",
+			stage: 9, name: "materialize",
 			arm: func(h *orphanHarness) error {
 				h.provider.failMaterialize = true
 				return runtime.ErrMaterialize
 			},
 		},
 		{
-			stage: 9, name: "commit",
+			stage: 10, name: "commit",
 			arm: func(h *orphanHarness) error {
 				h.audit.SetFault(true, errors.New("sink down"))
 				return audit.ErrAuditWriteFailed
 			},
 		},
 		{
-			stage: 10, name: "bindContainerName",
+			stage: 11, name: "bindContainerName",
 			arm: func(h *orphanHarness) error {
 				h.binder.fail = true
 				return state.ErrBindingExists
@@ -238,9 +240,9 @@ func assertNoResidue(rt *rapid.T, h *orphanHarness, fp faultPoint) {
 	// Exact compensator counts per fault point. Reserve(S4) pushes a Release; the
 	// failure path of Reserve itself writes no row, so a fault AT S4 runs no Release.
 	// A fault at S5+ runs S4's Release (the row drops to a RELEASED tombstone, which is
-	// not "live"). Materialize(S8) pushes a ForceKill; a fault at S9/S10 runs it once.
+	// not "live"). Materialize(S9) pushes a ForceKill; a fault at S10/S11 runs it once.
 	wantForceKill := 0
-	if fp.stage >= 9 { // Materialize succeeded only when the fault is at S9 or later.
+	if fp.stage >= 10 { // Materialize succeeded only when the fault is at S10 or later.
 		wantForceKill = 1
 	}
 	if h.provider.forceKillCalls != wantForceKill {
@@ -257,7 +259,7 @@ func assertNoResidue(rt *rapid.T, h *orphanHarness, fp faultPoint) {
 		// Stage attempted and failed closed: it staged nothing on disk and pushed no
 		// compensator, so there is nothing to Unstage.
 		wantStage, wantUnstage = 1, 0
-	default: // S7, S8, S9, S10 — stageHandoff succeeded once
+	default: // S8, S9, S10, S11 - stageHandoff succeeded once
 		// Stage succeeded once; the LIFO unwind Unstaged it exactly once.
 		wantStage, wantUnstage = 1, 1
 	}
@@ -266,16 +268,16 @@ func assertNoResidue(rt *rapid.T, h *orphanHarness, fp faultPoint) {
 			fp.stage, fp.name, stageCalls, unstageCalls, wantStage, wantUnstage)
 	}
 
-	// Render/push (S7) compensator counts: a fault AT S7 means Push was attempted
-	// once and failed (pushing nothing), so no Scrub is owed. A fault at S8+ means
+	// Render/push (S8) compensator counts: a fault AT S8 means Push was attempted
+	// once and failed (pushing nothing), so no Scrub is owed. A fault at S9+ means
 	// Push succeeded once and the unwind Scrubbed it exactly once.
 	var wantPush, wantScrub int
 	switch {
-	case fp.stage < 7:
+	case fp.stage < 8:
 		wantPush, wantScrub = 0, 0
-	case fp.stage == 7:
+	case fp.stage == 8:
 		wantPush, wantScrub = 1, 0
-	default: // S8, S9, S10
+	default: // S9, S10, S11
 		wantPush, wantScrub = 1, 1
 	}
 	if pushCalls != wantPush || scrubCalls != wantScrub {

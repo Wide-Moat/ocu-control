@@ -52,7 +52,7 @@ type Revoker struct {
 	mu   sync.Mutex
 	clk  state.Clock
 	dead map[string]time.Time // jti -> monotonic mark of revocation
-	bind map[string]string    // BindKey(sessionKey) -> jti recorded at mint
+	bind map[string][]string  // BindKey(sessionKey) -> jtis recorded at mint (one per mount)
 }
 
 // NewRevoker builds an empty Revoker on the injected monotonic Clock. A nil
@@ -66,24 +66,33 @@ func NewRevoker(clk state.Clock) *Revoker {
 	return &Revoker{
 		clk:  clk,
 		dead: make(map[string]time.Time),
-		bind: make(map[string]string),
+		bind: make(map[string][]string),
 	}
 }
 
 // Record indexes the jti against BindKey(sessionKey) at mint time, so the
 // finalizer (which re-derives the same session key from the session row) can
-// revoke without the session row carrying the jti. A later Record for the same
-// session key supersedes the binding — the freshest mint is the one a teardown
-// revokes. Empty inputs are ignored (there is nothing to bind). The FIRST
-// argument is the host-derived session key, NOT a FilesystemID; both call sites
-// route through BindKey so record-key ≡ lookup-key by construction.
+// revoke without the session row carrying the jti. Records for the same session
+// key ACCUMULATE: a session mints one weak Storage-JWT per mount (the two-mount
+// layout mints two), and a teardown must revoke every one of them - a
+// last-write-wins binding would leave every earlier mount's jti alive past the
+// session. A duplicate jti is recorded once. Empty inputs are ignored (there is
+// nothing to bind). The FIRST argument is the host-derived session key, NOT a
+// FilesystemID; both call sites route through BindKey so record-key ≡ lookup-key
+// by construction.
 func (r *Revoker) Record(sessionKey, jti string) {
 	if sessionKey == "" || jti == "" {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.bind[BindKey(sessionKey)] = jti
+	key := BindKey(sessionKey)
+	for _, bound := range r.bind[key] {
+		if bound == jti {
+			return
+		}
+	}
+	r.bind[key] = append(r.bind[key], jti)
 }
 
 // Revoke is the finalizer step-1 effect: mark the session's jti dead, keyed off
@@ -103,14 +112,21 @@ func (r *Revoker) Revoke(ctx context.Context, bind runtime.EgressBinding) (runti
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	jti, ok := r.bind[BindKey(string(bind.Name))]
-	if !ok {
+	jtis, ok := r.bind[BindKey(string(bind.Name))]
+	if !ok || len(jtis) == 0 {
 		return runtime.RevokeNoneBound, ErrRevokeUnbound
 	}
-	if _, already := r.dead[jti]; already {
+	marked := false
+	for _, jti := range jtis {
+		if _, already := r.dead[jti]; already {
+			continue
+		}
+		r.dead[jti] = r.clk.Now()
+		marked = true
+	}
+	if !marked {
 		return runtime.RevokeAlreadyDead, nil
 	}
-	r.dead[jti] = r.clk.Now()
 	return runtime.RevokeMarkedDead, nil
 }
 

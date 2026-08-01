@@ -97,26 +97,38 @@ func TestRevokerUnboundSession(t *testing.T) {
 	}
 }
 
-// TestRevokerRebindNewestMint asserts a second mint for the same session key
-// supersedes the binding, so a teardown revokes the freshest jti.
-func TestRevokerRebindNewestMint(t *testing.T) {
+// TestRevokerAccumulatesMountMints asserts every mint recorded for one session
+// key is revoked by the session's teardown: the two-mount layout mints one weak
+// Storage-JWT per mount, and a last-write-wins binding would leave the earlier
+// mount's jti alive past the session (the credential-leak the accumulate
+// semantics closes). A duplicate Record of the same jti stays recorded once.
+func TestRevokerAccumulatesMountMints(t *testing.T) {
 	t.Parallel()
 	r := cred.NewRevoker(state.NewFakeClock(testStart))
-	const sessionKey = "session-rebind"
-	r.Record(sessionKey, "jti-old")
-	r.Record(sessionKey, "jti-new")
+	const sessionKey = "session-two-mounts"
+	r.Record(sessionKey, "jti-uploads")
+	r.Record(sessionKey, "jti-outputs")
+	r.Record(sessionKey, "jti-outputs") // duplicate: recorded once, not twice
 	outcome, err := r.Revoke(context.Background(), runtime.EgressBinding{Name: runtime.SessionName(sessionKey)})
 	if err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
 	if outcome != runtime.RevokeMarkedDead {
-		t.Fatalf("rebind revoke outcome = %v, want RevokeMarkedDead", outcome)
+		t.Fatalf("revoke outcome = %v, want RevokeMarkedDead", outcome)
 	}
-	if !r.IsRevoked("jti-new") {
-		t.Fatal("the newest jti must be revoked")
+	if !r.IsRevoked("jti-uploads") {
+		t.Fatal("the uploads-mount jti must be revoked with the session")
 	}
-	if r.IsRevoked("jti-old") {
-		t.Fatal("the superseded jti was never marked dead by this revoke")
+	if !r.IsRevoked("jti-outputs") {
+		t.Fatal("the outputs-mount jti must be revoked with the session")
+	}
+	// A second revoke of the fully-dead set reports AlreadyDead (idempotent).
+	outcome, err = r.Revoke(context.Background(), runtime.EgressBinding{Name: runtime.SessionName(sessionKey)})
+	if err != nil {
+		t.Fatalf("re-revoke: %v", err)
+	}
+	if outcome != runtime.RevokeAlreadyDead {
+		t.Fatalf("re-revoke outcome = %v, want RevokeAlreadyDead", outcome)
 	}
 }
 

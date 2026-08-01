@@ -117,7 +117,7 @@ func input(hint string) lifecycle.CreateInput {
 		Caller:      testCaller,
 		SessionHint: hint,
 		Image:       testGuestImage,
-		Mount:       runtime.MountIntent{Destination: "/workspace", FilesystemID: "fs-1", ReadOnly: false, CacheSeconds: 5},
+		Mounts:      []runtime.MountIntent{{Destination: "/workspace", FilesystemID: "fs-1", ReadOnly: false, CacheSeconds: 5}},
 		Egress:      runtime.EgressPolicy{DefaultDeny: true, AllowedUpstream: "object-store", FilesystemID: "fs-1"},
 		Resources:   runtime.ResourceCaps{CPUCores: 1, MemoryBytes: 1 << 30},
 	}

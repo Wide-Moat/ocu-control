@@ -166,7 +166,7 @@ func emitCreateRejected(ctx context.Context, m *Manager, st *createState, cause 
 // here. On success it pushes Unstage as the compensator.
 func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compensator, error) {
 	name := runtime.SessionName(st.key.String())
-	mounts := []runtime.MountIntent{st.in.Mount}
+	mounts := st.in.Mounts
 	// The guest's verify key is the DEPLOYMENT-FIXED exec verify key (host-derived,
 	// never a body hint — NFR-SEC-43), so the caller cannot supply the key that
 	// decides who counts as the host. When the exec channel is disabled the key is
@@ -186,13 +186,87 @@ func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compen
 	}, nil
 }
 
-// hasStorageScope reports whether the create requested a storage scope at all. A
-// pure compute/exec session sets neither FilesystemID nor MemoryStoreID (a zero
-// MountIntent), and that is a legitimate first-class case (ADR-0017): the exec
-// lifecycle must not be coupled to the storage leg. The two storage stages share
-// this one predicate so the skip condition has a single source of truth.
+// hasStorageScope reports whether one mount names a storage scope. A pure
+// compute/exec session provisions no scoped mounts, and that is a legitimate
+// first-class case (ADR-0017): the exec lifecycle must not be coupled to the
+// storage leg.
 func hasStorageScope(m runtime.MountIntent) bool {
 	return m.FilesystemID != "" || m.MemoryStoreID != ""
+}
+
+// hasAnyStorageScope is the list form of hasStorageScope: the storage stages
+// run when ANY provisioned mount names a scope. The two storage stages share
+// this one predicate so the skip condition has a single source of truth.
+func hasAnyStorageScope(mounts []runtime.MountIntent) bool {
+	for _, m := range mounts {
+		if hasStorageScope(m) {
+			return true
+		}
+	}
+	return false
+}
+
+// scopeCeiling is the maximum rune length a derived mount FilesystemID may reach.
+// A derived scope is "<base>-<16hex>"; a base near this ceiling plus the suffix
+// could exceed it, and an over-long scope must never silently truncate into a
+// different subtree or reach the edge malformed. stageDeriveChatScope fails the
+// create closed (ErrScopeTooLong) rather than emit a truncated scope.
+const scopeCeiling = 256
+
+// stageDeriveChatScope derives the per-chat storage scope (ADR-0030, D5) and
+// rewrites each provisioned mount's FilesystemID from the deployment base to
+// "<base>-<scopeHandle(owner,handle)>" IN PLACE, so the mint (S6), render (S7),
+// and materialize (S8) stages that follow all read the derived value. It runs
+// IMMEDIATELY BEFORE the mint stage: handoff (S5) has already set st.handle and
+// st.owner (resolveIdentity mints the handle, handoff stages under it), and the
+// mint keys the Storage-JWT claim on the mount FilesystemID, so the rewrite must
+// land before the mint reads it.
+//
+// It is gated on m.deriveChatScope: when false (today's single-scope default) it
+// is a clean no-op returning (nil, nil), leaving every mount on the deployment
+// base. When true it derives ONE suffix from the host-attested owner and the
+// host-minted handle (never a body hint, NFR-SEC-43) and applies it to every
+// non-empty-base storage mount, so the two-mount uploads/outputs pair of one chat
+// share a subtree distinct from any other chat's. A mount with an empty
+// FilesystemID (a pure memory-store mount, or a no-scope compute session) is left
+// untouched: there is no base to suffix. A derived scope exceeding the rune
+// ceiling fails the create closed (ErrScopeTooLong) before any token is minted.
+//
+// It is COMPENSATOR-FREE by construction: the rewrite mutates only the in-memory
+// createState copy of the mounts, so a downstream failure that unwinds the
+// pipeline discards st along with the rewritten mounts. No host state, token, or
+// substrate carries the derived scope at this point (the mint and push stages
+// come AFTER), so there is nothing to reverse. It records st.effectiveScope for
+// the commit stage's out-of-band read-surface write.
+func stageDeriveChatScope(_ context.Context, m *Manager, st *createState) (compensator, error) {
+	if !m.deriveChatScope {
+		return nil, nil
+	}
+	suffix := scopeHandle(st.owner, st.handle)
+	var effective string
+	for i := range st.in.Mounts {
+		base := st.in.Mounts[i].FilesystemID
+		if base == "" {
+			// No base to suffix (a memory-store-only or no-scope mount); leave it.
+			continue
+		}
+		derived := base + "-" + suffix
+		if len([]rune(derived)) > scopeCeiling {
+			// Fail closed before the mint: an over-long scope must not truncate into a
+			// different subtree or reach the edge malformed. Nothing external was
+			// effected (mint/push/materialize all follow), so no compensator is owed.
+			return nil, fmt.Errorf("%w: %q (%d runes > %d)", ErrScopeTooLong, derived, len([]rune(derived)), scopeCeiling)
+		}
+		st.in.Mounts[i].FilesystemID = derived
+		// Record the derived scope for the read-surface write. Every non-empty mount
+		// of one create shares the same base and suffix, so the first derived value is
+		// the session's effective scope.
+		if effective == "" {
+			effective = derived
+		}
+	}
+	st.effectiveScope = effective
+	return nil, nil
 }
 
 // stageMintStorageJWT (S6) mints the weak, edge-only Storage-JWT for the session's
@@ -210,50 +284,57 @@ func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (comp
 	if m.signer == nil {
 		return nil, nil
 	}
-	if !hasStorageScope(st.in.Mount) {
+	if !hasAnyStorageScope(st.in.Mounts) {
 		// A no-scope (pure compute/exec) session legitimately mints no Storage-JWT;
 		// failing closed here would couple exec to storage (ADR-0017). Leave
-		// st.storageToken the zero value and let the create boot without a mount.
+		// st.storageTokens empty and let the create boot without a mount.
 		return nil, nil
 	}
 	scope := m.storageScope
-	// Derive the mint intent from THIS session's mount posture, not the static
-	// deployment scope (ADR-0029): a read-only mount is the uploads input leg (read),
-	// a read-write mount is the outputs sink (write). The posture is host-enforced
-	// (runtime.MountIntent.ReadOnly, the agent cannot flip it), so the derived intent
-	// is host-authoritative, never a body hint (NFR-SEC-43).
-	intent := deriveMountIntent(st.in.Mount.ReadOnly)
-	// The -granted-intents ceiling names the intents the deployment serves; it never
-	// grants. A derived intent the ceiling does not admit refuses the create closed
-	// HERE, before any token is minted or any mount-config reaches the bind — the same
-	// fail-closed shape as the mint's own ErrMintScope refusal below (nothing external
-	// was effected, so no compensator is owed).
-	if !m.grantedIntents.Admits(intent) {
-		return nil, fmt.Errorf("%w: %q", ErrIntentOutsideCeiling, intent)
+	tokens := make([]cred.Token, 0, len(st.in.Mounts))
+	for _, mount := range st.in.Mounts {
+		// Derive the mint intent from THIS mount's posture, not the static
+		// deployment scope (ADR-0029): a read-only mount is the uploads input leg
+		// (read), a read-write mount is the outputs sink (write). The posture is
+		// host-enforced (runtime.MountIntent.ReadOnly, the agent cannot flip it), so
+		// the derived intent is host-authoritative, never a body hint (NFR-SEC-43).
+		intent := deriveMountIntent(mount.ReadOnly)
+		// The -granted-intents ceiling names the intents the deployment serves; it
+		// never grants. A derived intent the ceiling does not admit refuses the create
+		// closed HERE, before any token is minted or any mount-config reaches the
+		// bind — the same fail-closed shape as the mint's own ErrMintScope refusal
+		// below (nothing external was effected, so no compensator is owed).
+		if !m.grantedIntents.Admits(intent) {
+			return nil, fmt.Errorf("%w: %q", ErrIntentOutsideCeiling, intent)
+		}
+		tok, err := m.signer.MintStorageJWT(ctx, cred.StorageMintReq{
+			// SessionKey is the host-derived registry key; it seeds the jti and is the
+			// value the Revoker indexes the binding under (one jti PER MOUNT accumulates
+			// on the same key), so a teardown re-deriving the same key from the session
+			// row revokes every mount's mint. It is NEVER a body hint.
+			SessionKey:   st.key.String(),
+			FilesystemID: mount.FilesystemID,
+			Workspace:    scope.Workspace,
+			Org:          scope.Org,
+			Authz: cred.AuthorizationMetadata{
+				Scope: scope.Scope,
+				// Intent is the per-mount-derived claim (ADR-0029), NOT scope.Intent —
+				// the deployment scope no longer decides the access axis; the mount
+				// posture does.
+				Intent:       intent,
+				Downloadable: scope.Downloadable,
+			},
+		})
+		if err != nil {
+			// A refused mint (missing/invalid scope) fails the create closed before any
+			// mount-config reaches the bind; nothing external was effected, so no
+			// compensator is owed. Earlier tokens from this loop expire unused; the
+			// finalizer's revoke covers any that were already Recorded.
+			return nil, err
+		}
+		tokens = append(tokens, tok)
 	}
-	tok, err := m.signer.MintStorageJWT(ctx, cred.StorageMintReq{
-		// SessionKey is the host-derived registry key; it seeds the jti and is the
-		// value the Revoker indexes the binding under, so a teardown re-deriving the
-		// same key from the session row finds the jti. It is NEVER a body hint.
-		SessionKey:   st.key.String(),
-		FilesystemID: st.in.Mount.FilesystemID,
-		Workspace:    scope.Workspace,
-		Org:          scope.Org,
-		Authz: cred.AuthorizationMetadata{
-			Scope: scope.Scope,
-			// Intent is the per-mount-derived claim (ADR-0029), NOT scope.Intent — the
-			// deployment scope no longer decides the access axis; the mount posture does.
-			Intent:       intent,
-			Downloadable: scope.Downloadable,
-		},
-	})
-	if err != nil {
-		// A refused mint (missing/invalid scope) fails the create closed before any
-		// mount-config reaches the bind; nothing external was effected, so no
-		// compensator is owed.
-		return nil, err
-	}
-	st.storageToken = tok
+	st.storageTokens = tokens
 	return nil, nil
 }
 
@@ -271,14 +352,14 @@ func stageRenderPushMount(ctx context.Context, m *Manager, st *createState) (com
 	if m.signer == nil || m.push == nil {
 		return nil, nil
 	}
-	if !hasStorageScope(st.in.Mount) {
+	if !hasAnyStorageScope(st.in.Mounts) {
 		// No storage scope was requested, so there is no mount-config to render and
 		// nothing to push onto the bind — the matching skip for the no-mint case
 		// above (ADR-0017). The sandbox boots from the handoff binds alone.
 		return nil, nil
 	}
-	mounts := []runtime.MountIntent{st.in.Mount}
-	tokens := []cred.Token{st.storageToken}
+	mounts := st.in.Mounts
+	tokens := st.storageTokens
 	cfg, err := mountcfg.Render(m.serviceURL, m.caCertPEM, mounts, tokens, m.mountDefaults)
 	if err != nil {
 		// A render refusal (bad scope, missing token, malformed service_url/ca_cert)
@@ -317,7 +398,7 @@ func stageMaterialize(ctx context.Context, m *Manager, st *createState) (compens
 		Name:          runtime.SessionName(st.key.String()),
 		Owner:         runtimemap.IdentityFromState(st.owner),
 		Image:         st.in.Image,
-		Mounts:        []runtime.MountIntent{st.in.Mount},
+		Mounts:        st.in.Mounts,
 		Egress:        st.in.Egress,
 		Resources:     st.in.Resources,
 		Handoff:       st.staged.Material,
@@ -388,6 +469,20 @@ func stageCommit(ctx context.Context, m *Manager, st *createState) (compensator,
 	// the read surface simply lacks the enrichment for this row until it is
 	// re-recorded. It MUST NOT unwind the commit.
 	_ = m.reg.RecordActivation(ctx, st.key, runtimemap.CapsToState(st.in.Resources), m.clk.Now())
+
+	// Record the per-chat effective storage scope (ADR-0030) out of band of the
+	// frozen Commit, keyed on the host-derived key, so the caller-scoped status verb
+	// can read it back on the enriched row. It is NON-FATAL exactly as
+	// RecordActivation is: the row is already ACTIVE and correct, and the scope was
+	// already minted into the guest's Storage-JWT claim (the load-bearing isolation
+	// property) BEFORE this write. If this record fails, the read surface simply lacks
+	// the scope for this row until re-recorded; recovery is a re-derivation from the
+	// persisted owner+handle (both durable on the row via DeriveKey's inputs), not a
+	// stored secret. An empty effectiveScope (derivation off, or a no-scope create)
+	// records nothing. It MUST NOT unwind the commit.
+	if st.effectiveScope != "" {
+		_ = m.reg.RecordEffectiveScope(ctx, st.key, st.effectiveScope)
+	}
 
 	// Observe the reserved->active start duration into the admin /metrics histogram
 	// — a MONOTONIC interval (clk.Since), so a wall-clock setback between reserve and

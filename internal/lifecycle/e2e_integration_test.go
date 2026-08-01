@@ -167,7 +167,7 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 		Caller:      caller,
 		SessionHint: "e2e-session",
 		Image:       itImage(),
-		Mount: runtime.MountIntent{
+		Mounts: []runtime.MountIntent{{
 			Destination:  "/workspace",
 			FilesystemID: "e2e-fs",
 			ReadOnly:     false,
@@ -175,7 +175,7 @@ func TestE2E_CreateDestroy_RealBackends(t *testing.T) {
 			// weak Bearer is minted by the Signer and rendered into the mount-config.
 			AuthToken:    "phase4-placeholder",
 			CacheSeconds: 30,
-		},
+		}},
 		Egress: runtime.EgressPolicy{
 			DefaultDeny:     true,
 			AllowedUpstream: "objectstore.internal",

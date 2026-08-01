@@ -45,6 +45,15 @@ ALTER TABLE sessions ADD COLUMN IF NOT EXISTS caps_memory_bytes BIGINT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS caps_pids_limit   BIGINT;
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_at         TIMESTAMPTZ;
 
+-- effective_scope is the per-chat storage scope derived at create when the
+-- deployment runs -derive-chat-scope (ADR-0030, D5): "<base>-<hex>". It is a
+-- DURABLE read-surface column (unlike the in-process last-activity stamp), so a
+-- control restart can surface a chat's isolated subtree on the caller-scoped
+-- status verb without re-deriving. NULL on a row created without derivation, a
+-- no-scope create, or a pre-D5 row. It is recorded data only - the guest's minted
+-- Storage-JWT claim is the load-bearing isolation, never this label.
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS effective_scope   TEXT;
+
 -- A partial unique index over the bound rows enforces global container_name
 -- uniqueness while leaving unbound (NULL) rows unconstrained. A duplicate bind
 -- raises SQLSTATE 23505, which BindContainerName maps to ErrBindingExists.

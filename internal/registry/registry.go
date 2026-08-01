@@ -171,6 +171,25 @@ type ActivationRecorder interface {
 	RecordActivation(ctx context.Context, key string, caps state.Caps, at time.Time) error
 }
 
+// EffectiveScopeRecorder is the optional write capability that records the
+// per-chat effective storage scope onto an already-committed row (ADR-0030, D5).
+// It mirrors ActivationRecorder: the lifecycle commit stage calls it out of band
+// IMMEDIATELY AFTER the frozen Commit (never inside it), keyed on the host-derived
+// key, so the frozen Commit signature is unchanged and the scope is persisted out
+// of band of the state flip. It is NON-FATAL to the create: the scope was already
+// minted into the guest's Storage-JWT before the commit, so a record failure only
+// leaves the read-surface enrichment absent until re-recorded (recovery is a
+// re-derivation from the persisted owner+handle, not a stored secret). A Store
+// without the capability yields ErrEnumerationUnsupported, which the caller treats
+// the same non-fatal way. A transient store failure returns state.ErrStoreUnavailable.
+type EffectiveScopeRecorder interface {
+	// RecordEffectiveScope stamps the per-chat effective storage scope onto an
+	// already-committed (ACTIVE) row, keyed on the host-derived reservation key. It
+	// is idempotent: re-recording the same key overwrites with the same data. A
+	// transient store failure returns state.ErrStoreUnavailable.
+	RecordEffectiveScope(ctx context.Context, key string, scope string) error
+}
+
 // Custodian is the SOLE writer of the session registry (requirement 4): the only
 // type in the tree that calls state.Store.{Reserve,Commit,Release,
 // BindContainerName}. The lifecycle Manager and the kill-switch Engine call these
@@ -330,6 +349,60 @@ func (c *Custodian) RecordActivation(ctx context.Context, key Key, caps state.Ca
 		return ErrEnumerationUnsupported
 	}
 	return recorder.RecordActivation(ctx, key.k, caps, at)
+}
+
+// RecordEffectiveScope routes the per-chat effective-scope record through the sole
+// custodian, keyed on the registry Key (host-derived; a raw request string can
+// never reach this). It is called by the lifecycle commit stage immediately AFTER
+// Commit and is NON-FATAL to the create (ADR-0030): the scope was already minted
+// into the guest's Storage-JWT before this write, so a record failure only leaves
+// the read surface lacking the scope for that row until re-recorded. A Store
+// without the optional EffectiveScopeRecorder yields ErrEnumerationUnsupported,
+// which the caller treats the same non-fatal way.
+func (c *Custodian) RecordEffectiveScope(ctx context.Context, key Key, scope string) error {
+	recorder, ok := c.store.(EffectiveScopeRecorder)
+	if !ok {
+		return ErrEnumerationUnsupported
+	}
+	return recorder.RecordEffectiveScope(ctx, key.k, scope)
+}
+
+// LookupForCallerEnriched returns the caller's OWN enriched row addressed by key,
+// the read-surface complement of LookupForCaller (ADR-0030, D5). It exists because
+// the frozen LookupForCaller returns the FROZEN state.SessionRow, which carries no
+// read-surface enrichment (active-at, caps, effective-scope); the caller-scoped
+// status verb needs the EnrichedSessionRow to surface effective_scope without
+// widening the frozen core. It type-asserts the optional EnrichedLister seam (the
+// same discipline EnrichedLiveSessions uses), enumerates the live enriched rows,
+// and returns the one whose Key matches AND whose Owner matches the caller. It
+// applies the SAME audience scoping as LookupForCaller: a foreign-owned row, an
+// absent row, or a row not in the live (RESERVED+ACTIVE) set all collapse to
+// ErrNotOwned, so "exists but not yours" is indistinguishable from "absent" and a
+// caller can neither read another tenant's scope nor probe existence (NFR-SEC-43).
+// A Store that does not enrich yields ErrEnumerationUnsupported (fail-closed); a
+// transient store failure propagates unchanged.
+func (c *Custodian) LookupForCallerEnriched(ctx context.Context, key Key, owner state.Identity) (state.EnrichedSessionRow, error) {
+	lister, ok := c.store.(EnrichedLister)
+	if !ok {
+		return state.EnrichedSessionRow{}, ErrEnumerationUnsupported
+	}
+	rows, err := lister.LiveSessionsEnriched(ctx)
+	if err != nil {
+		return state.EnrichedSessionRow{}, err
+	}
+	for i := range rows {
+		if rows[i].Key != key.k {
+			continue
+		}
+		if rows[i].Owner != owner {
+			// A foreign-owned row discloses nothing: same refusal as not-found.
+			return state.EnrichedSessionRow{}, ErrNotOwned
+		}
+		return rows[i], nil
+	}
+	// Absent from the live set (never reserved, or already released): collapse to the
+	// same not-addressable refusal a foreign row gets.
+	return state.EnrichedSessionRow{}, ErrNotOwned
 }
 
 // ActivityToucher is the optional write capability that advances a row's

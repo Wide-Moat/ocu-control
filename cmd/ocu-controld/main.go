@@ -574,6 +574,12 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		ExecDriver:     execDriver,
 		ExecVerifyKey:  execVerifyKeyOf(execSigner),
 		Metrics:        collector,
+
+		// Per-chat storage-scope derivation (ADR-0030, D5). When on, the create
+		// pipeline rewrites each storage mount FilesystemID to "<base>-<hex>" before the
+		// mint stage, so two chats mint distinct scopes and a peer chat's guest gets a
+		// different credential. Default off keeps today's single static scope.
+		DeriveChatScope: cfg.deriveChatScope,
 	})
 	// The kill-switch refunds the per-tenant concurrency slot through the SAME
 	// quota.Gate that charged it on create, so a force-kill returns the level counter

@@ -423,3 +423,17 @@ func (s *listerStore) TouchActivity(ctx context.Context, key string, now time.Ti
 	}
 	return registry.ErrEnumerationUnsupported
 }
+
+// RecordEffectiveScope forwards the ADR-0030 per-chat scope write to the wrapped
+// Store so the registry's EffectiveScopeRecorder type assertion sees the capability
+// through this wrapper; without it the wrapper would shadow the embedded interface and
+// the commit's non-fatal scope record would fail closed with ErrEnumerationUnsupported.
+func (s *listerStore) RecordEffectiveScope(ctx context.Context, key string, scope string) error {
+	type scopeRecorder interface {
+		RecordEffectiveScope(context.Context, string, string) error
+	}
+	if r, ok := s.Store.(scopeRecorder); ok {
+		return r.RecordEffectiveScope(ctx, key, scope)
+	}
+	return registry.ErrEnumerationUnsupported
+}

@@ -251,7 +251,8 @@ func (s *store) Reserve(ctx context.Context, key string, owner state.Identity) (
 		         active_at = NULL,
 		         caps_cpu_cores = NULL,
 		         caps_memory_bytes = NULL,
-		         caps_pids_limit = NULL`,
+		         caps_pids_limit = NULL,
+		         effective_scope = NULL`,
 		key, owner.Tenant, owner.Caller, int16(state.StateReserved), now,
 	); err != nil {
 		// A unique violation here can only be the partial container_name index,
@@ -506,7 +507,8 @@ func (s *store) LiveSessions(ctx context.Context) ([]state.SessionRow, error) {
 func (s *store) LiveSessionsEnriched(ctx context.Context) ([]state.EnrichedSessionRow, error) {
 	rows, err := s.pool.Query(ctx,
 		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, ''),
-		        reserved_at, active_at, caps_cpu_cores, caps_memory_bytes, caps_pids_limit
+		        reserved_at, active_at, caps_cpu_cores, caps_memory_bytes, caps_pids_limit,
+		        effective_scope
 		 FROM sessions WHERE state IN ($1, $2)`,
 		int16(state.StateReserved), int16(state.StateActive))
 	if err != nil {
@@ -576,6 +578,25 @@ func (s *store) RecordActivation(ctx context.Context, key string, caps state.Cap
 	s.activityMu.Lock()
 	s.activity[key] = at
 	s.activityMu.Unlock()
+	return nil
+}
+
+// RecordEffectiveScope stamps the per-chat effective storage scope onto an
+// already-committed (ACTIVE) row, out of band of the frozen Commit
+// (registry.EffectiveScopeRecorder seam, ADR-0030). Unlike the in-process
+// last-activity stamp, effective_scope is a DURABLE column so a control restart
+// surfaces a chat's isolated subtree without re-deriving. It is a single idempotent
+// UPDATE keyed on the reservation key - re-recording overwrites with the same data.
+// A row that does not exist (a fast release before the record lands) updates zero
+// rows and is a harmless no-op on the read surface, mirroring the in-memory leg. A
+// transient driver failure wraps state.ErrStoreUnavailable, fail-closed.
+func (s *store) RecordEffectiveScope(ctx context.Context, key string, scope string) error {
+	if _, err := s.pool.Exec(ctx,
+		`UPDATE sessions SET effective_scope = $2 WHERE key = $1`,
+		key, scope,
+	); err != nil {
+		return unavailable("record-effective-scope: update", err)
+	}
 	return nil
 }
 
@@ -836,19 +857,21 @@ func scanRow(row pgx.Row) (state.SessionRow, error) {
 // column presence is the activation witness).
 func scanEnrichedRow(row pgx.Row) (state.EnrichedSessionRow, error) {
 	var (
-		out      state.EnrichedSessionRow
-		st       int16
-		activeAt *time.Time
-		cpuCores *float64
-		memBytes *int64
-		pids     *int64
+		out       state.EnrichedSessionRow
+		st        int16
+		activeAt  *time.Time
+		cpuCores  *float64
+		memBytes  *int64
+		pids      *int64
+		effective *string
 	)
 	if err := row.Scan(
 		&out.Key, &out.Owner.Tenant, &out.Owner.Caller, &st, &out.ContainerName,
-		&out.ReservedAt, &activeAt, &cpuCores, &memBytes, &pids,
+		&out.ReservedAt, &activeAt, &cpuCores, &memBytes, &pids, &effective,
 	); err != nil {
 		return state.EnrichedSessionRow{}, err
 	}
+	out.EffectiveScope = effective
 	decoded, err := sessionStateFromDB(st)
 	if err != nil {
 		return state.EnrichedSessionRow{}, err
