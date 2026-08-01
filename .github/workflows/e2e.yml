@@ -103,7 +103,7 @@ jobs:
       # #50 host/exec landed).
       - name: build the production guest image (ocu-sandbox composite, pinned)
         id: guest
-        uses: Wide-Moat/ocu-sandbox/.github/actions/build-guest-image@6111b8db705f87896bac458234103628b79959a4 # ocu-sandbox main (#47 + #50)
+        uses: Wide-Moat/ocu-sandbox/.github/actions/build-guest-image@77facc6499d3dbed8633f63c610b1d87da557806 # ocu-sandbox main (#47 + #50)
         with:
           tag: prod
       - name: assert the guest image built (non-empty) — a silent build fail must not vacuously skip the legs
