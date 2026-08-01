@@ -28,7 +28,7 @@ jobs:
   lexicon:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: naming denylist
         # The project keeps a denylist of terms that must not appear in the
         # tree (working names, third-party naming). The list is maintained as
@@ -63,7 +63,7 @@ jobs:
   secrets-gitleaks:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -89,7 +89,7 @@ jobs:
   secrets-trufflehog:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -128,7 +128,7 @@ jobs:
     container:
       image: semgrep/semgrep
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: semgrep
         # Emit SARIF for the Security tab AND keep the blocking exit code: run
         # the SARIF pass non-blocking, then a second gating pass. `|| true` on
@@ -159,7 +159,7 @@ jobs:
     # the line below to restore the gate; the job still runs and still reports.
     continue-on-error: true
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: trivy filesystem — CRITICAL,HIGH blocks
         # severity CRITICAL,HIGH (not CRITICAL only): the Go ecosystem's NVD/GHSA
         # advisories are almost entirely HIGH — a firsthand sweep of a dozen
