@@ -122,6 +122,9 @@ jobs:
 
   sast-semgrep:
     runs-on: ubuntu-latest
+    # Temporarily non-blocking by owner direction 2026-08-01. Remove this flag and
+    # the line below to restore the gate; the job still runs and still reports.
+    continue-on-error: true
     container:
       image: semgrep/semgrep
     steps:
@@ -152,6 +155,9 @@ jobs:
 
   sca-trivy-fs:
     runs-on: ubuntu-latest
+    # Temporarily non-blocking by owner direction 2026-08-01. Remove this flag and
+    # the line below to restore the gate; the job still runs and still reports.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: trivy filesystem — CRITICAL,HIGH blocks
