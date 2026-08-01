@@ -412,6 +412,14 @@ func (s *store) BindContainerName(ctx context.Context, key string, owner state.I
 	if row.Owner != owner {
 		return state.SessionRow{}, state.ErrReservationConflict
 	}
+	if row.State == state.StateReleased {
+		// RELEASED is a terminal tombstone: a destroy landing inside the create's
+		// commit->bind window must make this bind REFUSE (the create then fails its
+		// bind stage and unwinds its container) -- a silent bind onto the tombstone
+		// let the create report success for a destroyed session and orphaned the
+		// container. Mirrors Commit's wrong-state refusal.
+		return state.SessionRow{}, state.ErrReservationConflict
+	}
 	if row.ContainerName != "" {
 		// Write-once on the same row: a rebind is refused before any write.
 		return state.SessionRow{}, state.ErrBindingExists

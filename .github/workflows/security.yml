@@ -122,6 +122,9 @@ jobs:
 
   sast-semgrep:
     runs-on: ubuntu-latest
+    # Temporarily non-blocking by owner direction 2026-08-01. Remove this flag and
+    # the line below to restore the gate; the job still runs and still reports.
+    continue-on-error: true
     container:
       image: semgrep/semgrep
     steps:
@@ -145,13 +148,16 @@ jobs:
           SEMGREP_SUPPRESS_ERRORS: "false"
       - name: upload semgrep SARIF to the Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@dd903d2e4f5405488e5ef1422510ee31c8b32357 # v3.36.2
+        uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
         with:
           sarif_file: semgrep.sarif
         continue-on-error: true
 
   sca-trivy-fs:
     runs-on: ubuntu-latest
+    # Temporarily non-blocking by owner direction 2026-08-01. Remove this flag and
+    # the line below to restore the gate; the job still runs and still reports.
+    continue-on-error: true
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: trivy filesystem — CRITICAL,HIGH blocks

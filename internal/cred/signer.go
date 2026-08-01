@@ -158,6 +158,24 @@ func LoadSignerFromMount(path string, clk state.Clock, cfg Config) (*Signer, err
 	if cfg.StorageTTL <= 0 {
 		return nil, fmt.Errorf("%w: storage TTL must be positive", ErrConfig)
 	}
+	// The iss/aud pins are part of a structurally valid config, not decoration. The
+	// egress trust-edge verifier PINS both and rejects a token whose iss/aud do not
+	// match; a Storage-JWT minted with an empty claim is therefore unpinnable and dies
+	// at the edge on live traffic, per session, long after this process booted. Since
+	// the values are deployment-supplied and never hardcoded here, an unset one is a
+	// misconfiguration, and the fail-closed answer is to refuse the custody core rather
+	// than to hand out tokens no verifier will accept.
+	//
+	// This is the ONLY place the fence is needed: LoadSignerFromMount is the sole
+	// constructor of *Signer outside this package (every field is unexported) and cfg is
+	// never reassigned after construction, so a *Signer that exists is provably pinned
+	// and the mint path needs no redundant twin check.
+	if cfg.StorageIssuer == "" {
+		return nil, fmt.Errorf("%w: storage issuer (iss) must be set -- an empty iss mints an unpinnable Storage-JWT the egress verifier rejects", ErrConfig)
+	}
+	if cfg.StorageAudience == "" {
+		return nil, fmt.Errorf("%w: storage audience (aud) must be set -- an empty aud mints an unpinnable Storage-JWT the egress verifier rejects", ErrConfig)
+	}
 
 	raw, err := os.ReadFile(path)
 	if err != nil {

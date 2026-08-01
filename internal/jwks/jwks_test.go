@@ -295,3 +295,34 @@ func TestPublishCarriesNoPrivateMaterial(t *testing.T) {
 		}
 	}
 }
+
+// TestPublishRefusesKidlessKey pins the selector requirement the egress verifier
+// depends on: every published JWK MUST carry a kid. The verifier picks the
+// verification key by matching the token header's kid against the set, so a
+// kid-less entry is unselectable -- and publishing one is worse than refusing,
+// because the document then looks populated while carrying a key no token can ever
+// be matched to, masking a broken keyset.
+//
+// The refusal is a hard error rather than a silent skip, for the same reason
+// ErrUnsupportedKey is: a live token may have been minted under that key, so
+// dropping it from the served set would make those tokens unverifiable with no
+// signal anywhere.
+func TestPublishRefusesKidlessKey(t *testing.T) {
+	t.Parallel()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+	if _, err := jwks.Publish([]cred.PublicKey{{KID: "", Alg: cred.AlgEdDSA, Pub: pub}}); !errors.Is(err, jwks.ErrUnsupportedKey) {
+		t.Fatalf("Publish of a kid-less key = %v, want ErrUnsupportedKey (an unselectable key must never reach the served set)", err)
+	}
+	// A kid-less key must not slip through the artifact writer either -- that is the
+	// path the deploy layer actually serves.
+	path := filepath.Join(t.TempDir(), "jwks.json")
+	if err := jwks.WriteArtifact(path, []cred.PublicKey{{KID: "", Alg: cred.AlgEdDSA, Pub: pub}}); !errors.Is(err, jwks.ErrUnsupportedKey) {
+		t.Fatalf("WriteArtifact with a kid-less key = %v, want ErrUnsupportedKey", err)
+	}
+	if _, statErr := os.Stat(path); !os.IsNotExist(statErr) {
+		t.Fatalf("WriteArtifact wrote a document despite the kid-less refusal (stat: %v)", statErr)
+	}
+}

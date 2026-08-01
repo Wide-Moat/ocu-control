@@ -42,8 +42,8 @@ type config struct {
 	gatewayTLSKey   string        // OPTIONAL gateway mTLS server-key PEM (all-or-none)
 	gatewayClientCA string        // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
 	jwtAlg          string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
-	storageIssuer   string        // provisional Storage-JWT iss (PIN-PENDING; never hardcoded)
-	storageAudience string        // provisional Storage-JWT aud (PIN-PENDING)
+	storageIssuer   string        // REQUIRED Storage-JWT iss, deployment-supplied and never hardcoded; the egress verifier pins it (see requiredFlags)
+	storageAudience string        // REQUIRED Storage-JWT aud, deployment-supplied; the egress verifier pins it
 	serviceURL      string        // filestore service_url rendered into every mount-config
 	caCert          string        // path to the CA certificate PEM rendered into every mount-config
 	egressNetwork   string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
@@ -132,8 +132,12 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.gatewayTLSKey, "gateway-tls-key", "", "gateway mTLS server-key PEM (all-or-none)")
 	fs.StringVar(&cfg.gatewayClientCA, "gateway-client-ca", "", "gateway mTLS client-CA PEM the verified client SAN is anchored against (all-or-none)")
 	fs.StringVar(&cfg.jwtAlg, "jwt-alg", "eddsa", "Storage-JWT signing algorithm: eddsa|es256 (default eddsa, NFR-SEC-11)")
-	fs.StringVar(&cfg.storageIssuer, "storage-issuer", "", "provisional Storage-JWT issuer (PIN-PENDING; never hardcoded)")
-	fs.StringVar(&cfg.storageAudience, "storage-audience", "", "provisional Storage-JWT audience (PIN-PENDING)")
+	fs.StringVar(&cfg.storageIssuer, "storage-issuer", "",
+		"Storage-JWT issuer claim, REQUIRED and deployment-supplied (never hardcoded); the "+
+			"egress verifier pins it, so an empty iss mints a token the edge rejects")
+	fs.StringVar(&cfg.storageAudience, "storage-audience", "",
+		"Storage-JWT audience claim, REQUIRED and deployment-supplied; the egress verifier "+
+			"pins it, so an empty aud mints a token the edge rejects")
 	fs.StringVar(&cfg.serviceURL, "service-url", "", "filestore service_url rendered into every mount-config (https://)")
 	fs.StringVar(&cfg.caCert, "ca-cert", "", "path to the CA certificate PEM rendered into every mount-config")
 	fs.StringVar(&cfg.egressNetwork, "egress-network", "", "OPTIONAL docker network a storage-scoped guest joins to reach the egress edge (edge is multi-homed onto it); unset keeps every session on its per-session Internal deny-all bridge")
@@ -176,6 +180,45 @@ func parse(args []string) (config, runMode, error) {
 	return cfg, modeServe, nil
 }
 
+// requiredFlag is one entry in the required-flag set: the flag's name (without the
+// leading dash, for the operator-facing refusal) and the parsed value to test.
+type requiredFlag struct {
+	name  string
+	value string
+}
+
+// requiredFlags is the SINGLE source of truth for "which flags must a deployment
+// supply". validate() enforces it at boot and the shipped-manifest guard derives its
+// cross-check from it, so a flag added here is automatically demanded of every
+// manifest instead of being mirrored by hand in the test (a hand-mirrored list is how
+// a required flag silently stops being checked in the manifests).
+//
+// -state-dsn is deliberately absent: empty is the valid default (the in-memory
+// minimal shelf).
+//
+// -storage-issuer / -storage-audience ARE required. They were previously optional on
+// the reasoning that a deployment "without storage provisioning" should still boot,
+// but that reasoning does not survive contact with the trust edge: the egress
+// verifier PINS iss and aud, so an unset flag mints a Storage-JWT that is rejected at
+// the edge on live traffic, per session, with nothing wrong at boot. The values stay
+// deployment-supplied and are never hardcoded here; requiring them converts a
+// silent-until-live-traffic misconfiguration into a named-flag boot refusal before
+// any listener binds. cred.LoadSignerFromMount fences the same invariant a layer
+// down, for a library caller that never passes through these flags.
+func requiredFlags(cfg config) []requiredFlag {
+	return []requiredFlag{
+		{"operator-listen", cfg.operatorListen},
+		{"gateway-listen", cfg.gatewayListen},
+		{"runtime-tier", cfg.runtimeTier},
+		{"runtime-provider", cfg.runtimeProvider},
+		{"workload-profile", cfg.workloadProfile},
+		{"jwt-signing-key", cfg.jwtSigningKey},
+		{"audit-sink", cfg.auditSink},
+		{"storage-issuer", cfg.storageIssuer},
+		{"storage-audience", cfg.storageAudience},
+	}
+}
+
 // validate runs the pre-bind static gates in order: required-flag presence and
 // enum membership. These run BEFORE any Store is constructed, so a malformed
 // invocation never builds a Store. It returns the first refusal and touches no
@@ -184,20 +227,8 @@ func parse(args []string) (config, runMode, error) {
 // serve(), so the refusal originates in the Store, not a hardcoded branch.
 func validate(cfg config) error {
 	// 1. Required-flag presence — the first missing flag is named so an
-	//    operator sees exactly what to supply. -state-dsn is deliberately NOT in
-	//    this loop: empty is the valid default (the in-memory minimal shelf).
-	for _, req := range []struct {
-		name  string
-		value string
-	}{
-		{"operator-listen", cfg.operatorListen},
-		{"gateway-listen", cfg.gatewayListen},
-		{"runtime-tier", cfg.runtimeTier},
-		{"runtime-provider", cfg.runtimeProvider},
-		{"workload-profile", cfg.workloadProfile},
-		{"jwt-signing-key", cfg.jwtSigningKey},
-		{"audit-sink", cfg.auditSink},
-	} {
+	//    operator sees exactly what to supply.
+	for _, req := range requiredFlags(cfg) {
 		if req.value == "" {
 			return fmt.Errorf("%w: -%s", errRequiredFlagMissing, req.name)
 		}
@@ -218,9 +249,10 @@ func validate(cfg config) error {
 		return fmt.Errorf("%w: %q (choose trusted_operator|internal_workforce|untrusted)", errUnknownWorkloadProfile, cfg.workloadProfile)
 	}
 	// -jwt-alg is a closed enum with a default of eddsa (NFR-SEC-11); an unknown
-	// alg is refused, never coerced. iss/aud/service-url/ca-cert are PROVISIONAL
-	// (PIN-PENDING) and deliberately NOT required — they default to empty and are
-	// not enum-checked, so a deployment without storage provisioning still validates.
+	// alg is refused, never coerced. -service-url/-ca-cert stay PROVISIONAL
+	// (PIN-PENDING): they default to empty and are not enum-checked, so a deployment
+	// without storage provisioning still validates. The STORAGE iss/aud are no longer
+	// in that class — see requiredFlags.
 	if !knownJWTAlgs[cfg.jwtAlg] {
 		return fmt.Errorf("%w: %q (choose eddsa|es256)", errUnknownJWTAlg, cfg.jwtAlg)
 	}

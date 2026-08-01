@@ -262,18 +262,20 @@ func Test_Manifests_ClearFlagValidation_InProcess(t *testing.T) {
 
 // assertAllRequiredFlagsPresent independently confirms each manifest argv carries
 // every flag in the validator's required set with a non-empty value. validate()
-// already enforces this, but asserting it explicitly documents the cross-check the
-// review asked for and pins exactly which flags a manifest must carry.
+// already enforces this, but asserting it explicitly names WHICH flag a manifest
+// dropped instead of surfacing one generic refusal.
+//
+// The set is DERIVED from requiredFlags (config.go), not restated here. A hand-copied
+// list is what let this cross-check drift: it silently stopped covering any flag added
+// to the validator after the list was written, which is the opposite of what its own
+// comment promised. Deriving it means a new required flag is demanded of every shipped
+// manifest the moment it lands.
 func assertAllRequiredFlagsPresent(t *testing.T, m manifestArgv) {
 	t.Helper()
-	required := []string{
-		"-operator-listen",
-		"-gateway-listen",
-		"-runtime-tier",
-		"-runtime-provider",
-		"-workload-profile",
-		"-jwt-signing-key",
-		"-audit-sink",
+	// The zero config yields the flag NAMES; the values are irrelevant here.
+	var required []string
+	for _, rf := range requiredFlags(config{}) {
+		required = append(required, "-"+rf.name)
 	}
 	present := map[string]string{}
 	for i := 0; i < len(m.argv); i++ {
@@ -529,5 +531,54 @@ func runBinary(t *testing.T, bin string, argv []string, timeout time.Duration) (
 		_ = cmd.Process.Kill()
 		<-done
 		return out.String(), errors.New("timeout")
+	}
+}
+
+// Test_Manifests_StoragePinAgreesAcrossManifests pins the Storage-JWT iss/aud
+// literals to ONE value each across every shipped manifest. The claims are one side
+// of a cross-component agreement: the egress edge's jwt_authn pins the same issuer
+// and audience, and a token whose claims differ by one byte is rejected there, on
+// live traffic, per session. Three manifests that disagree among themselves
+// guarantee at least two of them are wrong.
+//
+// This asserts what this repo can actually see. The other side of the agreement (the
+// edge config) lives in the deployment repo, so the cross-repo half is a documented
+// pairing, not a test -- and the manifests carry that documentation, including which
+// of ADR-0019's two tokens this pair belongs to, because collapsing the two tokens
+// into one is how the wrong literals got chosen once already.
+func Test_Manifests_StoragePinAgreesAcrossManifests(t *testing.T) {
+	t.Parallel()
+	type pin struct{ iss, aud string }
+	seen := map[string]pin{}
+	for _, m := range loadManifestArgvs(t) {
+		got := pin{}
+		for i := 0; i+1 < len(m.argv); i++ {
+			switch m.argv[i] {
+			case "-storage-issuer":
+				got.iss = m.argv[i+1]
+			case "-storage-audience":
+				got.aud = m.argv[i+1]
+			}
+		}
+		if got.iss == "" || got.aud == "" {
+			t.Fatalf("%s manifest does not carry both -storage-issuer and -storage-audience (got %+v)", m.name, got)
+		}
+		seen[m.name] = got
+	}
+	if len(seen) < 2 {
+		t.Fatalf("expected at least two shipped manifests to compare, got %d", len(seen))
+	}
+	var ref string
+	for name := range seen {
+		if ref == "" || name < ref {
+			ref = name // deterministic reference manifest
+		}
+	}
+	want := seen[ref]
+	for name, got := range seen {
+		if got != want {
+			t.Errorf("manifest %s pins iss=%q aud=%q but %s pins iss=%q aud=%q -- every shipped manifest must present the SAME pair to the edge",
+				name, got.iss, got.aud, ref, want.iss, want.aud)
+		}
 	}
 }
