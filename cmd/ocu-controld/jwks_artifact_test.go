@@ -23,7 +23,14 @@ func buildTestSigner(t *testing.T) *cred.Signer {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "jwt.key")
 	writeTestKey(t, keyPath)
-	cfg := config{jwtAlg: "eddsa", jwtSigningKey: keyPath}
+	// iss/aud are REQUIRED for a signer to construct at all (an empty claim would mint
+	// a token the pinning egress verifier rejects), so the fixture supplies them.
+	cfg := config{
+		jwtAlg:          "eddsa",
+		jwtSigningKey:   keyPath,
+		storageIssuer:   "https://control.test/provisional",
+		storageAudience: "egress.test",
+	}
 	signer, _, err := buildSigner(cfg, state.SystemClock())
 	if err != nil {
 		t.Fatalf("buildSigner: %v", err)

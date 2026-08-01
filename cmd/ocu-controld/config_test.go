@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/Wide-Moat/ocu-control/internal/mcpkeyset"
@@ -27,6 +28,8 @@ func Test_parse_MCPKeysetPath_Unset(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", "/tmp/jwt.key",
 		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}
 	cfg, mode, err := parse(args)
 	if err != nil {
@@ -53,6 +56,8 @@ func Test_parse_MCPKeysetPath_Set(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", "/tmp/jwt.key",
 		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 		"-mcp-keyset-path", want,
 	}
 	cfg, _, err := parse(args)
@@ -76,6 +81,8 @@ func Test_parse_MCPKeyFile_Unset(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", "/tmp/jwt.key",
 		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}
 	cfg, _, err := parse(args)
 	if err != nil {
@@ -99,6 +106,8 @@ func Test_parse_MCPKeyFile_Set(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", "/tmp/jwt.key",
 		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 		"-mcp-key-file", want,
 	}
 	cfg, _, err := parse(args)
@@ -263,5 +272,63 @@ func Test_buildMCPKeyEngine_LoadsExistingEntries(t *testing.T) {
 	}
 	if eng == nil {
 		t.Fatal("buildMCPKeyEngine returned nil engine")
+	}
+}
+
+// Test_validate_RequiresStoragePin is the operator-facing half of the W1 Storage-JWT
+// pin guard: an unset -storage-issuer or -storage-audience is refused at the pre-bind
+// validate() gate, naming the flag, so the daemon never binds a listener and never
+// admits a create it would serve an unpinnable credential for.
+//
+// Both layers are load-bearing and neither replaces the other. This one turns the
+// misconfiguration into an operator-legible boot refusal that names the flag to
+// supply; cred.LoadSignerFromMount fences the same invariant for a library caller that
+// never passes through these flags. Without the pin, the mint succeeds, the session
+// starts, and the failure surfaces at the egress trust-edge on live traffic -- the
+// verifier pins iss/aud and rejects a token carrying empty ones.
+//
+// Red-probe: drop either entry from requiredFlags (config.go) and the matching subtest
+// reddens, because validate() then accepts an unpinned config.
+func Test_validate_RequiresStoragePin(t *testing.T) {
+	t.Parallel()
+	base := []string{
+		"-operator-listen", "unix:///tmp/test.sock",
+		"-gateway-listen", "127.0.0.1:0",
+		"-runtime-tier", "runc",
+		"-runtime-provider", "docker",
+		"-workload-profile", "trusted_operator",
+		"-jwt-signing-key", "/tmp/jwt.key",
+		"-audit-sink", "/tmp/audit.jsonl",
+	}
+	for _, tc := range []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "issuer-unset",
+			args: append(append([]string{}, base...), "-storage-audience", "egress.test"),
+			want: "-storage-issuer",
+		},
+		{
+			name: "audience-unset",
+			args: append(append([]string{}, base...), "-storage-issuer", "https://control.test/provisional"),
+			want: "-storage-audience",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg, _, err := parse(tc.args)
+			if err != nil {
+				t.Fatalf("parse: %v", err)
+			}
+			err = validate(cfg)
+			if !errors.Is(err, errRequiredFlagMissing) {
+				t.Fatalf("validate with %s unset = %v, want errRequiredFlagMissing (an unpinnable Storage-JWT must abort boot)", tc.want, err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("validate error %q does not name the missing flag %s", err, tc.want)
+			}
+		})
 	}
 }

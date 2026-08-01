@@ -66,6 +66,8 @@ func validArgs() []string {
 		"-guest-image", "img", // the deployment default; test create bodies naming "img" hit the implicitly-allowed default
 		"-jwt-signing-key", "/tmp/ocu-test-jwt.key",
 		"-audit-sink", "/tmp/ocu-test-audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}
 }
 
@@ -171,6 +173,8 @@ func Test_run_CleanBoot_BindsThenServes(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", keyPath,
 		"-audit-sink", filepath.Join(dir, "audit.jsonl"),
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -238,6 +242,8 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 		guestImage:      "img", // the deployment default; create bodies naming "img" pass the implicitly-allowed image gate
 		jwtSigningKey:   keyPath,
 		jwtAlg:          "eddsa",
+		storageIssuer:   "https://control.test/provisional",
+		storageAudience: "egress.test",
 		auditSink:       filepath.Join(dir, "audit.jsonl"),
 	}
 	clk := state.SystemClock()
@@ -516,6 +522,8 @@ func Test_run_BadSigningKeyFailsClosedBeforeBind(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", filepath.Join(dir, "absent.key"), // never written
 		"-audit-sink", filepath.Join(dir, "audit.jsonl"),
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}
 	err := run(context.Background(), args)
 	if !errors.Is(err, cred.ErrSigningKeyMissing) {
@@ -550,6 +558,8 @@ func Test_run_BadCACertFailsClosedBeforeBind(t *testing.T) {
 		"-jwt-signing-key", keyPath,
 		"-ca-cert", filepath.Join(dir, "absent-ca.pem"), // configured but never written
 		"-audit-sink", filepath.Join(dir, "audit.jsonl"),
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}
 	err := run(context.Background(), args)
 	if !errors.Is(err, errCACertUnreadable) {

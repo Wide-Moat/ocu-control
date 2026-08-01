@@ -25,6 +25,14 @@
 #      booting (the production blocker the readiness review found).
 set -uo pipefail
 
+# The Storage-JWT iss/aud are REQUIRED flags: the daemon refuses to boot without
+# them, because an empty claim mints a token the egress verifier rejects. The smoke
+# only needs them non-empty and well-formed -- it never presents a token to a
+# verifier -- so it uses obviously-local values rather than a deployment's real
+# pair, which must never be baked into a test script.
+SMOKE_STORAGE_ISS="https://control.smoke.invalid"
+SMOKE_STORAGE_AUD="smoke-edge"
+
 BIN="${1:-}"
 if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
   echo "::error::usage: e2e-smoke.sh <path-to-ocu-controld> (executable)"
@@ -49,7 +57,9 @@ valid_args=(
   -workload-profile trusted_operator
   -jwt-signing-key "$tmp/jwt-signing.key"
   -audit-sink "$tmp/audit.ocsf.jsonl"
-)
+  -storage-issuer "$SMOKE_STORAGE_ISS"
+  -storage-audience "$SMOKE_STORAGE_AUD"
+  )
 
 # 1. missing required flag — exit 1, typed error, the first missing flag named.
 #    Supply only -runtime-tier so -operator-listen is the first absent required
@@ -74,7 +84,7 @@ echo "$out" | grep -q -- "-operator-listen" || {
 code=0
 out=$("$BIN" -operator-listen "$opsock" -gateway-listen "$gwsock" \
   -runtime-tier bogus -runtime-provider docker -workload-profile trusted_operator \
-  -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" 2>&1) || code=$?
+  -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" -storage-issuer "$SMOKE_STORAGE_ISS" -storage-audience "$SMOKE_STORAGE_AUD" 2>&1) || code=$?
 echo "$out"
 if [ "$code" -ne 1 ]; then
   echo "::error::expected exit 1 on unknown runtime tier, got $code"
@@ -89,7 +99,7 @@ echo "$out" | grep -q "unknown runtime tier" || {
 code=0
 out=$("$BIN" -operator-listen "$opsock" -gateway-listen "$gwsock" \
   -runtime-tier runc -runtime-provider podman -workload-profile trusted_operator \
-  -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" 2>&1) || code=$?
+  -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" -storage-issuer "$SMOKE_STORAGE_ISS" -storage-audience "$SMOKE_STORAGE_AUD" 2>&1) || code=$?
 echo "$out"
 if [ "$code" -ne 1 ]; then
   echo "::error::expected exit 1 on unknown runtime provider, got $code"
@@ -105,7 +115,7 @@ echo "$out" | grep -q "unknown runtime provider" || {
 code=0
 out=$("$BIN" -operator-listen "$opsock" -gateway-listen "$gwsock" \
   -runtime-tier runc -runtime-provider docker -workload-profile wide-open \
-  -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" 2>&1) || code=$?
+  -jwt-signing-key "$tmp/jwt-signing.key" -audit-sink "$tmp/audit.ocsf.jsonl" -storage-issuer "$SMOKE_STORAGE_ISS" -storage-audience "$SMOKE_STORAGE_AUD" 2>&1) || code=$?
 echo "$out"
 if [ "$code" -ne 1 ]; then
   echo "::error::expected exit 1 on unknown workload profile, got $code"
@@ -163,7 +173,16 @@ fi
 #    Go test (cmd/ocu-controld Test_Manifests_ClearFlagValidation_*) extracts the
 #    SAME argv directly from those files, so a drift between this argv and a manifest
 #    is caught there. Here we assert against the REAL binary: a valid argv must NOT
-#    print a flag-validation sentinel. It is expected to fail LATER on the absent
+#    print a flag-validation sentinel.
+#
+#    NOTE, and it bit once already: the argv blocks below are a HAND-COPY of what
+#    the manifests carry, not a parse of them. They drift silently -- adding a
+#    required flag updates the manifests and the Go guard, and leaves these stale,
+#    which fails this required check for a reason that has nothing to do with the
+#    manifests being wrong. The Go test Test_Manifests_ClearFlagValidation_InProcess
+#    extracts the argv from the real files and is the non-drifting version of this
+#    assertion; this copy earns its place only by driving the REAL BINARY, and
+#    should be re-pointed at the extracted argv rather than maintained by hand. It is expected to fail LATER on the absent
 #    signing key, so we assert on output content, never the exit code.
 flag_sentinels='required flag missing or invalid|unknown runtime tier|unknown runtime provider|unknown workload profile|unknown jwt signing algorithm'
 
@@ -187,7 +206,9 @@ assert_clears_flags "docker-compose" \
   -runtime-tier runc -runtime-provider docker \
   -workload-profile untrusted \
   -jwt-signing-key /run/secrets/storage-jwt-signing.key \
-  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl \
+  -storage-issuer https://control-plane.test \
+  -storage-audience filestore-edge
 
 # k8s control-deployment.yaml args:
 assert_clears_flags "k8s" \
@@ -196,7 +217,9 @@ assert_clears_flags "k8s" \
   -runtime-tier runc -runtime-provider docker \
   -workload-profile untrusted \
   -jwt-signing-key /run/secrets/ocu-control/storage-jwt-signing.key \
-  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl \
+  -storage-issuer https://control-plane.test \
+  -storage-audience filestore-edge
 
 # systemd ocu-controld.service ExecStart=
 assert_clears_flags "systemd" \
@@ -205,7 +228,9 @@ assert_clears_flags "systemd" \
   -runtime-tier runc -runtime-provider docker \
   -workload-profile untrusted \
   -jwt-signing-key /etc/ocu-control/storage-jwt-signing.key \
-  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl
+  -audit-sink /var/log/ocu-control/audit.ocsf.jsonl \
+  -storage-issuer https://control-plane.test \
+  -storage-audience filestore-edge
 
 rm -rf "$tmp"
 
