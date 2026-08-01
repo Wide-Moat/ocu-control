@@ -22,6 +22,31 @@ type idleReaper interface {
 	ReapIdle(ctx context.Context, idleTTL time.Duration) (int, error)
 }
 
+// reapRecorder is the metrics face the per-tick observer writes to: the reaper's
+// throughput counter and its stuck-pass alarm. *metrics.Collector satisfies it, and so
+// does a test fake -- which is the point of naming the seam. serve() binds sockets and
+// is not unit-driven, so a mapping written inline as a closure there would be the one
+// link in this chain no test covers.
+type reapRecorder interface {
+	IncSessionsReaped(n int)
+	IncReapPassFailed()
+}
+
+// newReapObserver builds the observer startIdleReaper calls each tick, mapping one
+// tick's outcome onto the two counters. The reclaimed count is ALWAYS recorded first
+// and the error is checked after, because the two are not exclusive: ReapIdle reclaims
+// row by row and returns (reaped, err) on a mid-pass failure (manager.go), so a tick can
+// both reclaim rows and then fail. Recording only one of the two would lose the reclaims
+// that did happen (throughput undercount) or hide the failure (no alarm).
+func newReapObserver(rec reapRecorder) func(reaped int, err error) {
+	return func(reaped int, err error) {
+		rec.IncSessionsReaped(reaped)
+		if err != nil {
+			rec.IncReapPassFailed()
+		}
+	}
+}
+
 // startIdleReaper launches the idle-session reaper goroutine when the resolved idle
 // window is positive, and returns whether it launched anything. A zero (or negative)
 // window means the reaper is OFF: no goroutine is started, so an off deployment burns
@@ -37,7 +62,15 @@ type idleReaper interface {
 // best-effort background reclaim, and a transient enumerate/teardown failure must not
 // tear down the daemon; the next tick retries. The tick interval never drops below a
 // small floor so a very short (test-scale) window cannot spin.
-func startIdleReaper(ctx context.Context, r idleReaper, idleTTL time.Duration) bool {
+// observe, when non-nil, receives each tick's outcome (reaped count, error). It exists
+// because the loop is best-effort: a failing tick must not kill the daemon, but the
+// per-reclaim durable audit only covers reclaims that HAPPEN -- ReapIdle enumerates
+// first (manager.go), and an enumerate failure returns (0, err) with ZERO audit records
+// and ZERO metrics, so a persistently-broken reaper is otherwise indistinguishable from
+// "nothing is idle" until idle slots pile into the tier cap. observe surfaces the count
+// (throughput) and the error (stuck-reaper alarm) to the daemon's Collector; a nil
+// observe is deliberate silence (the same off-cost as before this param existed).
+func startIdleReaper(ctx context.Context, r idleReaper, idleTTL time.Duration, observe func(reaped int, err error)) bool {
 	if idleTTL <= 0 {
 		return false
 	}
@@ -53,10 +86,13 @@ func startIdleReaper(ctx context.Context, r idleReaper, idleTTL time.Duration) b
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				// Best-effort: swallow a transient reclaim error so one failed pass never
-				// kills the background loop; the next tick retries. The daemon has no logger
-				// in this seam, and the reap path already audits each reclaim durably.
-				_, _ = r.ReapIdle(ctx, idleTTL)
+				// A tick error is non-fatal: one failed pass never kills the loop; the next
+				// tick retries. The outcome is reported to observe (not swallowed) so a
+				// persistently-failing reaper is alarmable instead of silent.
+				n, err := r.ReapIdle(ctx, idleTTL)
+				if observe != nil {
+					observe(n, err)
+				}
 			}
 		}
 	}()

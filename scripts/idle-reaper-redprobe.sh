@@ -56,7 +56,11 @@ restore
 # ---- Neuter 2: remove the concurrency REFUND. The row is released but the tier-cap
 #      slot is never returned, so the keystone's post-reap concurrency==0 assertion
 #      goes RED (slot stuck). Replace the guarded refund with a no-op.
-perl -0777 -i -pe 's/\Qif err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {\E\n\t\treturn fmt\.Errorf\("release reaped concurrency: %w", err\)\n\t}/\/\/ NEUTERED: concurrency refund removed/' "$mgr"
+# The block interior is matched permissively (it now also records the failed-refund
+# metric) but the match can never span into the boot reconciler's block: the interior
+# is forbidden from containing a second ReleaseConcurrency, and the match must end on
+# reapOne's unique error string. The post-neuter grep below still proves it applied.
+perl -0777 -i -pe 's/\Qif err := m.ReleaseConcurrency(ctx, row.Owner); err != nil {\E(?:(?!ReleaseConcurrency).)*?return fmt\.Errorf\("release reaped concurrency: %w", err\)\n\t\}/\/\/ NEUTERED: concurrency refund removed/s' "$mgr"
 # Key the guard on reapOne's UNIQUE error string, not the shared ReleaseConcurrency call
 # line (which the boot reconciler also uses): the neuter is proven applied iff reapOne's
 # "release reaped concurrency" text is gone.

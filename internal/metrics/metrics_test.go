@@ -59,6 +59,33 @@ func TestExposition_CountersAndGauge(t *testing.T) {
 	}
 }
 
+// TestExposition_ReaperCounters asserts the idle-reaper observability counters
+// (#188): IncSessionsReaped sums the reclaimed count across ticks (a zero tick is a
+// no-op), IncReapPassFailed counts failed ticks, and both render in the exposition
+// with their HELP/TYPE lines. These make a stuck reaper alarmable instead of silent.
+func TestExposition_ReaperCounters(t *testing.T) {
+	c := NewCollector(fakeReader{})
+	c.IncSessionsReaped(2)
+	c.IncSessionsReaped(0) // a tick that found nothing idle: must not advance the total
+	c.IncSessionsReaped(1)
+	c.IncReapPassFailed()
+
+	var buf bytes.Buffer
+	c.WritePrometheus(context.Background(), &buf)
+	out := buf.String()
+
+	for _, want := range []string{
+		`ocu_control_sessions_reaped_total 3`,
+		`ocu_control_reap_pass_failed_total 1`,
+		`# TYPE ocu_control_sessions_reaped_total counter`,
+		`# TYPE ocu_control_reap_pass_failed_total counter`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("exposition missing %q\n--- got ---\n%s", want, out)
+		}
+	}
+}
+
 // TestExposition_Histogram asserts the reserved->active histogram records
 // durations into the right cumulative buckets and that _sum/_count drive the
 // average start (sum/count). Three observations: 0.04s, 0.4s, 2s.

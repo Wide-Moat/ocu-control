@@ -60,6 +60,16 @@ type Collector struct {
 	// observable so an operator can alert on it rather than discover it as an opaque
 	// tier-cap wedge.
 	quotaRefundFailedTotal uint64
+	// sessionsReapedTotal / reapPassFailedTotal make the idle-reaper's per-tick outcome
+	// observable. The reaper loop is best-effort (a failing tick never kills the daemon),
+	// so without these a permanently-broken reaper -- e.g. one whose enumerate step fails
+	// every tick, emitting ZERO reclaim-audit records and returning (0, err) -- is
+	// indistinguishable from "nothing is idle" until idle slots pile into the tier cap
+	// and creates 409-cascade. sessionsReapedTotal is the throughput/liveness signal;
+	// reapPassFailedTotal alarms on a stuck reaper. Distinct from quotaRefundFailedTotal,
+	// which fires only on a refund failure AFTER a reclaim already ran.
+	sessionsReapedTotal uint64
+	reapPassFailedTotal uint64
 	// startBucketCounts[i] is the count of start-durations <= buckets[i] (filled
 	// cumulatively at emit). startCount and startSum drive the histogram's _count
 	// and _sum and thus the average (sum/count = avg start seconds).
@@ -92,15 +102,37 @@ func (c *Collector) IncDestroy() {
 	c.mu.Unlock()
 }
 
-// IncQuotaRefundFailed records one quota-refund compensator failure on the create
-// unwind — a refund that could not be applied and was swallowed, leaving the
-// concurrency cell drifted until the boot cell-reconcile heals it. It is the
-// observability half of the create-abort concurrency-leak fix: the boot reconcile
-// self-heals the drift, this counter makes the drift's cause visible so it is never
-// silent.
+// IncQuotaRefundFailed records one quota-refund compensator failure -- a refund that
+// could not be applied, leaving the concurrency cell drifted until the boot cell-
+// reconcile heals it. The condition is path-independent: it fires on the create unwind
+// (stages.go), the idle-reap release (reapOne), and the orphan-reclaim release
+// (reclaimOrphanRow). The boot reconcile self-heals the drift; this counter makes the
+// drift's cause visible so it is never silent (the reap/reclaim paths return the error
+// to a daemon tick that has no logger, so without this the drift would be invisible).
 func (c *Collector) IncQuotaRefundFailed() {
 	c.mu.Lock()
 	c.quotaRefundFailedTotal++
+	c.mu.Unlock()
+}
+
+// IncSessionsReaped records n sessions reclaimed by one idle-reaper tick (n may be 0
+// on a tick that found nothing idle). The running total is the reaper's throughput
+// signal -- a flat line while sessions age past the idle window is a stuck reaper.
+func (c *Collector) IncSessionsReaped(n int) {
+	if n <= 0 {
+		return
+	}
+	c.mu.Lock()
+	c.sessionsReapedTotal += uint64(n)
+	c.mu.Unlock()
+}
+
+// IncReapPassFailed records one idle-reaper tick that returned an error (enumerate or
+// a mid-pass reclaim failure). The tick is non-fatal and the next retries; this counter
+// makes a persistently-failing reaper alarmable rather than silent.
+func (c *Collector) IncReapPassFailed() {
+	c.mu.Lock()
+	c.reapPassFailedTotal++
 	c.mu.Unlock()
 }
 
@@ -177,6 +209,8 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	creates := c.createsTotal
 	destroys := c.destroysTotal
 	quotaRefundFailed := c.quotaRefundFailedTotal
+	sessionsReaped := c.sessionsReapedTotal
+	reapPassFailed := c.reapPassFailedTotal
 	startCount := c.startCount
 	startSum := c.startSum
 	bucketCounts := make([]uint64, len(c.startBucketCounts))
@@ -208,9 +242,15 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	writeln(w, "# HELP ocu_control_session_destroys_total Sessions successfully destroyed.")
 	writeln(w, "# TYPE ocu_control_session_destroys_total counter")
 	fmt.Fprintf(w, "ocu_control_session_destroys_total %d\n", destroys)
-	writeln(w, "# HELP ocu_control_quota_refund_failed_total Quota-refund compensator failures on the create unwind (leaked-counter alarm).")
+	writeln(w, "# HELP ocu_control_quota_refund_failed_total Quota-refund compensator failures on create-unwind, idle-reap, or orphan-reclaim (leaked-counter alarm).")
 	writeln(w, "# TYPE ocu_control_quota_refund_failed_total counter")
 	fmt.Fprintf(w, "ocu_control_quota_refund_failed_total %d\n", quotaRefundFailed)
+	writeln(w, "# HELP ocu_control_sessions_reaped_total Sessions reclaimed by the idle-reaper across all ticks (reaper throughput).")
+	writeln(w, "# TYPE ocu_control_sessions_reaped_total counter")
+	fmt.Fprintf(w, "ocu_control_sessions_reaped_total %d\n", sessionsReaped)
+	writeln(w, "# HELP ocu_control_reap_pass_failed_total Idle-reaper ticks that returned an error (enumerate or mid-pass reclaim failure); non-fatal, next tick retries (stuck-reaper alarm).")
+	writeln(w, "# TYPE ocu_control_reap_pass_failed_total counter")
+	fmt.Fprintf(w, "ocu_control_reap_pass_failed_total %d\n", reapPassFailed)
 
 	// Reserved->active start-duration histogram. Buckets are cumulative le-bounds;
 	// +Inf equals _count. avg start = _sum / _count.

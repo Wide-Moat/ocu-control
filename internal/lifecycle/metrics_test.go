@@ -5,6 +5,7 @@ package lifecycle_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -102,5 +103,59 @@ func TestMetricsNilRecorderIsCleanNoOp(t *testing.T) {
 	}
 	if err := mgr.Destroy(ctx, testCaller, "sess"); err != nil {
 		t.Fatalf("Destroy with nil recorder: %v", err)
+	}
+}
+
+// newErrManagerWithRecorder builds a Manager over the fault-injecting errStore (so a
+// concurrency release/refund can be armed to fail) AND a recording Recorder, so a test
+// can assert the reclaim/reap paths fire IncQuotaRefundFailed on a release failure.
+func newErrManagerWithRecorder(t *testing.T, rec lifecycle.Recorder) (*lifecycle.Manager, *errStore) {
+	t.Helper()
+	clk := state.NewFakeClock(lifeStart)
+	inner := newListerStore(state.NewInMemory(clk))
+	store := &errStore{listerStore: inner}
+	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+		Custodian:     registry.NewCustodian(store),
+		Provider:      newRecordingProvider(),
+		Clock:         clk,
+		Quota:         quota.NewGate(store, clk, quota.Limits{ConcurrentSessionsPerTenant: 100, CreateRatePerCallerPerMin: 100}),
+		Handoff:       newFaultStager(t.TempDir()),
+		Audit:         audit.NewRecordingFake(),
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
+		ExecVerifyKey: pub32(),
+		Metrics:       rec,
+	})
+	return mgr, store
+}
+
+// TestMetricsRecordedOnReclaimReleaseFailure proves the reclaim/reap concurrency-
+// release-failure path fires IncQuotaRefundFailed, mirroring the create-unwind path
+// (#188): a RESERVED row's slot refund fails (failChargeNeg) during Reconcile, so
+// reclaimOrphanRow returns the error -- which would otherwise reach a loggerless daemon
+// tick and be silent. The metric is the ONLY signal, so it must fire. A count of 0
+// means the drift is invisible (the bug this closes); the emit-then-return is preserved
+// (Reconcile still surfaces the injected fault).
+func TestMetricsRecordedOnReclaimReleaseFailure(t *testing.T) {
+	t.Parallel()
+	rec := &recordingRecorder{}
+	mgr, store := newErrManagerWithRecorder(t, rec)
+	ctx := context.Background()
+
+	stranded := state.Identity{Tenant: "tenant-r", Caller: "caller-r"}
+	key := registry.DeriveKey(stranded, "stranded-reap")
+	cust := registry.NewCustodian(store)
+	if _, err := cust.Reserve(ctx, key, stranded); err != nil {
+		t.Fatalf("seed reserve: %v", err)
+	}
+
+	store.failChargeNeg = true // the reclaim's concurrency refund is a negative-delta Charge
+	if err := mgr.Reconcile(ctx); !errors.Is(err, errLcInjected) {
+		t.Fatalf("Reconcile with a failing reclaim refund = %v; want the injected fault", err)
+	}
+	if rec.quotaRefundFailed != 1 {
+		t.Errorf("IncQuotaRefundFailed count on a reclaim release failure = %d; want 1 "+
+			"(#188: the reap/reclaim drift must not be silent)", rec.quotaRefundFailed)
 	}
 }
