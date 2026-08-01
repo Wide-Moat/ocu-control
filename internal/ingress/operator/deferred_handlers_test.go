@@ -164,6 +164,15 @@ func mountedHandlers(t *testing.T) map[string]bool {
 // (a handler or a route in any file is in scope).
 func parsePackageFiles(t *testing.T) []*ast.File {
 	t.Helper()
+	_, files := parsePackageFilesWithFset(t)
+	return files
+}
+
+// parsePackageFilesWithFset is parsePackageFiles plus the FileSet the files were
+// parsed into, for a guard that reports a file:line position rather than only the
+// fact that something is wrong somewhere in the package.
+func parsePackageFilesWithFset(t *testing.T) (*token.FileSet, []*ast.File) {
+	t.Helper()
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(".")
 	if err != nil {
@@ -184,7 +193,7 @@ func parsePackageFiles(t *testing.T) []*ast.File {
 	if len(files) == 0 {
 		t.Fatal("parsed no package .go files; the AST walk is broken")
 	}
-	return files
+	return fset, files
 }
 
 // receiverTypeName returns the bare type name of a method receiver (stripping a

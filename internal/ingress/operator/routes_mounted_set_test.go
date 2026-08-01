@@ -23,9 +23,9 @@ import (
 var expectedMountedRoutes = map[string]bool{
 	"POST /v1alpha/sessions":         true,
 	"POST /v1alpha/sessions/destroy": true,
-	"/v1alpha/revoke/one":            true,
-	"/v1alpha/revoke/all":            true,
-	"/v1alpha/resume/all":            true,
+	"POST /v1alpha/revoke/one":       true,
+	"POST /v1alpha/revoke/all":       true,
+	"POST /v1alpha/resume/all":       true,
 	"POST /v1alpha/mcp-keys":         true,
 	"POST /v1alpha/mcp-keys/revoke":  true,
 	// Conditional on a configured read surface (l.read != nil), but statically
