@@ -119,6 +119,30 @@ jobs:
           # nothing) — see that file's header. The detector still runs on all
           # non-test source.
           extra_args: --no-verification --exclude-paths /tmp/.trufflehog-exclude.txt
+      # RED-when-neutered proof. The gate above can go quiet without failing: one
+      # over-broad exclude entry removes the tree from the scan and the job stays
+      # green. The probe plants a credential and requires the scan to NAME that file.
+      # The binary is pinned to the same version the action runs, so the probe proves
+      # the gate, not a different scanner.
+      - name: install trufflehog binary (for the red-probe)
+        # Fetch the RELEASE TARBALL at a pinned version and verify its checksum,
+        # rather than piping an installer script from a moving branch into a shell.
+        # An installer fetched from `main` is unpinned by construction: the SHA-pinned
+        # action above buys nothing if the next step executes whatever that branch
+        # holds today, inside a job that gates every push and tag.
+        env:
+          TH_VERSION: 3.95.5
+          # sha256 of trufflehog_3.95.5_linux_amd64.tar.gz, from the release checksums.
+          TH_SHA256: 8d151a19465973bec226be5992a2a11b053f4ab92c77861f642089892ae9aa58
+        run: |
+          set -euo pipefail
+          url="https://github.com/trufflesecurity/trufflehog/releases/download/v${TH_VERSION}/trufflehog_${TH_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL "$url" -o /tmp/trufflehog.tgz
+          echo "${TH_SHA256}  /tmp/trufflehog.tgz" | sha256sum -c -
+          tar -xzf /tmp/trufflehog.tgz -C /usr/local/bin trufflehog
+          trufflehog --version
+      - name: trufflehog red-probe (gate-fires proof)
+        run: bash scripts/trufflehog-redprobe.sh
 
   sast-semgrep:
     runs-on: ubuntu-latest
@@ -126,7 +150,13 @@ jobs:
     # the line below to restore the gate; the job still runs and still reports.
     continue-on-error: true
     container:
-      image: semgrep/semgrep
+      # Pin the SCANNER IMAGE by DIGEST, not by a floating tag. `semgrep/semgrep`
+      # with no tag resolves to :latest, so the job's own findings could change
+      # under a frozen workflow -- the same class the trufflehog step already
+      # guards against by pinning its scanner version, and the reason a
+      # SHA-pinned action is not by itself a pinned scanner. The version tag is
+      # kept alongside the digest for readability; the digest is what binds.
+      image: semgrep/semgrep:1.144.0@sha256:10301f060aacf84078f9704fb1ba3a321df4ac46b009fd29c1c66880d1db8e77
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: semgrep
@@ -146,6 +176,16 @@ jobs:
             p/security-audit p/owasp-top-ten p/golang
             p/github-actions p/secrets
           SEMGREP_SUPPRESS_ERRORS: "false"
+      # RED-when-neutered proof. A trimmed SEMGREP_RULES or a ruleset that stops
+      # resolving leaves semgrep exiting 0 with no findings, which looks exactly like
+      # clean code. The probe plants a finding the configured rules carry and requires
+      # semgrep to NAME the planted file.
+      - name: semgrep red-probe (gate-fires proof)
+        run: bash scripts/semgrep-redprobe.sh
+        env:
+          SEMGREP_RULES: >-
+            p/security-audit p/owasp-top-ten p/golang
+            p/github-actions p/secrets
       - name: upload semgrep SARIF to the Security tab
         if: always()
         uses: github/codeql-action/upload-sarif@54f647b7e1bb85c95cddabcd46b0c578ec92bc1a # v4.36.3
@@ -177,6 +217,44 @@ jobs:
           exit-code: "1"
           ignore-unfixed: "false"
           trivyignores: .trivyignore
+      # RED-when-neutered proof. An SCA gate goes quiet through its severity floor or
+      # through a .trivyignore that grows to cover findings instead of documenting
+      # them; both leave a green job. The probe plants a dependency with known
+      # CRITICAL/HIGH advisories and requires trivy to NAME that file, scanning with
+      # the same floor and ignore file as the gate above.
+      - name: install trivy binary (for the red-probe)
+        # Same reasoning as the trufflehog step: a release tarball at a pinned
+        # version with a verified checksum, not an installer script from a branch.
+        env:
+          TRIVY_VERSION: 0.72.0
+          # sha256 of trivy_0.72.0_Linux-64bit.tar.gz, from the release checksums.
+          TRIVY_SHA256: bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea
+        run: |
+          set -euo pipefail
+          url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL "$url" -o /tmp/trivy.tgz
+          echo "${TRIVY_SHA256}  /tmp/trivy.tgz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy
+          trivy --version
+      - name: trivy red-probe (gate-fires proof)
+        run: bash scripts/trivy-redprobe.sh
+
+  # release-path structural gate. The signed-SBOM/provenance gate itself runs on a
+  # tag, so it can never be a required PR check -- and a skipped required check counts
+  # as PASSED, so relocating it behind a PR condition would produce a permanently
+  # green check that blocks nothing. This job is the part that CAN be required: it
+  # reads the workflow files, needs no artifact, and fails the pull request that would
+  # introduce the regression rather than the release that suffers it.
+  release-path:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - name: install pyyaml
+        run: python3 -m pip install --quiet pyyaml==6.0.2
+      - name: signing precedes any consumable reference
+        run: python3 scripts/check-signing-precedes-publish.py
+      - name: release-path red-probe (gate-fires proof)
+        run: bash scripts/signing-precedes-publish-redprobe.sh
 
   conventional-commits:
     runs-on: ubuntu-latest
