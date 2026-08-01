@@ -148,11 +148,12 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 	h := l.handlers
 	scope := l.scope
 
-	mux.HandleFunc("/v1alpha/sessions", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	// Every route is method-scoped: the mux refuses a wrong method before any handler
+	// code runs, so this service-identity surface never admits a request it does not
+	// serve, and the refusal carries the Allow header RFC 9110 requires on a 405. Two
+	// universal negatives in routes_method_scoped_test.go keep it that way -- no
+	// verbless mount, and no hand-rolled 405 anywhere in the package.
+	mux.HandleFunc("POST /v1alpha/sessions", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body createBody
 		if err := decodeJSON(w, r, &body); err != nil {
@@ -174,11 +175,7 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusCreated, sessionResponse{Key: row.Key, State: int(row.State)})
 	})
 
-	mux.HandleFunc("/v1alpha/sessions/destroy", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	mux.HandleFunc("POST /v1alpha/sessions/destroy", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body hintBody
 		if err := decodeJSON(w, r, &body); err != nil {
@@ -192,11 +189,7 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		writeStatus(w, http.StatusOK, "destroyed")
 	})
 
-	mux.HandleFunc("/v1alpha/sessions/status", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	mux.HandleFunc("POST /v1alpha/sessions/status", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body hintBody
 		if err := decodeJSON(w, r, &body); err != nil {
@@ -211,11 +204,7 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, sessionResponse{Key: row.Key, State: int(row.State)})
 	})
 
-	mux.HandleFunc("/v1alpha/sessions/exec", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
+	mux.HandleFunc("POST /v1alpha/sessions/exec", func(w http.ResponseWriter, r *http.Request) {
 		conn := connInfoFromRequest(r)
 		var body execBody
 		if err := decodeJSON(w, r, &body); err != nil {

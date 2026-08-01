@@ -302,6 +302,12 @@ func TestGatewayTransportRouteEdges(t *testing.T) {
 		if resp.StatusCode != http.StatusMethodNotAllowed {
 			t.Fatalf("GET %s = %d; want 405", path, resp.StatusCode)
 		}
+		// The refusal names the verb the path does serve. RFC 9110 requires Allow on a
+		// 405; the mux sets it because the route is mounted method-scoped, and a
+		// hand-rolled refusal in the handler body does not.
+		if allow := resp.Header.Get("Allow"); allow != "POST" {
+			t.Errorf("GET %s: Allow = %q, want %q", path, allow, "POST")
+		}
 		// Malformed body -> 400.
 		resp2, err := client.Post("https://"+addr+path, "application/json", bytes.NewReader([]byte("{bad")))
 		if err != nil {
