@@ -81,6 +81,15 @@ func toJWK(p cred.PublicKey) (JWK, error) {
 	if !p.Alg.Valid() {
 		return JWK{}, fmt.Errorf("%w: alg %v", ErrUnsupportedKey, p.Alg)
 	}
+	// A kid is the SELECTOR: the egress verifier matches the token header's kid
+	// against the published set to pick a verification key, so a kid-less entry can
+	// never be selected. Publishing one is worse than refusing -- the document looks
+	// populated while carrying a key no token can be matched to, which masks a broken
+	// keyset. Refused, not skipped, for the same reason as an unrenderable key below:
+	// a live token may have been minted under it.
+	if p.KID == "" {
+		return JWK{}, fmt.Errorf("%w: key has no kid, so no token could select it", ErrUnsupportedKey)
+	}
 	base := JWK{
 		Kty: p.Alg.JWKKty(),
 		Crv: p.Alg.JWKCrv(),
