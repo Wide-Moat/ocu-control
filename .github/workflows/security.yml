@@ -125,9 +125,21 @@ jobs:
       # The binary is pinned to the same version the action runs, so the probe proves
       # the gate, not a different scanner.
       - name: install trufflehog binary (for the red-probe)
+        # Fetch the RELEASE TARBALL at a pinned version and verify its checksum,
+        # rather than piping an installer script from a moving branch into a shell.
+        # An installer fetched from `main` is unpinned by construction: the SHA-pinned
+        # action above buys nothing if the next step executes whatever that branch
+        # holds today, inside a job that gates every push and tag.
+        env:
+          TH_VERSION: 3.95.5
+          # sha256 of trufflehog_3.95.5_linux_amd64.tar.gz, from the release checksums.
+          TH_SHA256: 8d151a19465973bec226be5992a2a11b053f4ab92c77861f642089892ae9aa58
         run: |
-          curl -sSfL https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/scripts/install.sh \
-            | sh -s -- -b /usr/local/bin v3.95.5
+          set -euo pipefail
+          url="https://github.com/trufflesecurity/trufflehog/releases/download/v${TH_VERSION}/trufflehog_${TH_VERSION}_linux_amd64.tar.gz"
+          curl -sSfL "$url" -o /tmp/trufflehog.tgz
+          echo "${TH_SHA256}  /tmp/trufflehog.tgz" | sha256sum -c -
+          tar -xzf /tmp/trufflehog.tgz -C /usr/local/bin trufflehog
           trufflehog --version
       - name: trufflehog red-probe (gate-fires proof)
         run: bash scripts/trufflehog-redprobe.sh
@@ -211,9 +223,18 @@ jobs:
       # CRITICAL/HIGH advisories and requires trivy to NAME that file, scanning with
       # the same floor and ignore file as the gate above.
       - name: install trivy binary (for the red-probe)
+        # Same reasoning as the trufflehog step: a release tarball at a pinned
+        # version with a verified checksum, not an installer script from a branch.
+        env:
+          TRIVY_VERSION: 0.72.0
+          # sha256 of trivy_0.72.0_Linux-64bit.tar.gz, from the release checksums.
+          TRIVY_SHA256: bbb64b9695866ce4a7a8f5c9592002c5961cab378577fa3f8a040df362b9b2ea
         run: |
-          curl -sSfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin v0.72.0
+          set -euo pipefail
+          url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfL "$url" -o /tmp/trivy.tgz
+          echo "${TRIVY_SHA256}  /tmp/trivy.tgz" | sha256sum -c -
+          tar -xzf /tmp/trivy.tgz -C /usr/local/bin trivy
           trivy --version
       - name: trivy red-probe (gate-fires proof)
         run: bash scripts/trivy-redprobe.sh
