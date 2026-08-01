@@ -753,11 +753,30 @@ func (m *Manager) Destroy(ctx context.Context, caller ingress.AuthenticatedCalle
 
 	// Release the reservation to the RELEASED tombstone, then return the per-tenant
 	// concurrent level counter through the shared decrement path.
-	if _, err := m.reg.Release(ctx, key, owner); err != nil {
+	released, err := m.reg.Release(ctx, key, owner)
+	if err != nil {
 		return fmt.Errorf("lifecycle: destroy release: %w", err)
 	}
-	if err := m.ReleaseConcurrency(ctx, owner); err != nil {
-		return fmt.Errorf("lifecycle: destroy release concurrency: %w", err)
+	// Slot ownership: the concurrency slot belongs to the CREATE from admission
+	// until its bind succeeds (then the session owns it and THE destroy that
+	// tears it down returns it) or its unwind refunds it. Two destroys therefore
+	// return no slot here:
+	//   - a destroy that released a row still UNBOUND (empty ContainerName on
+	//     the released row) landed mid-create, before the bind -- that slot is
+	//     still the create's to refund via its own unwind (its bind now refuses
+	//     the tombstone, so the unwind is guaranteed to run);
+	//   - a REPEAT destroy of an already-RELEASED row (the lookup snapshot was
+	//     the tombstone; Release above was an idempotent no-op) tore nothing
+	//     down -- the destroy that did already returned the slot.
+	// Decrementing on either would double-credit the tenant's cell and let a
+	// later create over-admit. The released row is the authoritative bind
+	// snapshot: Release and the bind serialize on the same per-key stripe, so
+	// exactly one of bound-then-released / released-then-bind-refused holds,
+	// never a torn middle.
+	if row.State != state.StateReleased && released.ContainerName != "" {
+		if err := m.ReleaseConcurrency(ctx, owner); err != nil {
+			return fmt.Errorf("lifecycle: destroy release concurrency: %w", err)
+		}
 	}
 	// The destroy succeeded (released and capacity returned). Record it for the
 	// admin /metrics surface — observational, after the fact.

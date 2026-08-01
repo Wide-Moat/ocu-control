@@ -25,7 +25,15 @@ import (
 func TestLoadSignerFailClosed(t *testing.T) {
 	t.Parallel()
 	clk := state.NewFakeClock(testStart)
-	okCfg := cred.Config{Alg: cred.AlgEdDSA, StorageTTL: time.Minute}
+	// A structurally VALID config: the iss/aud pins are part of that validity now,
+	// so the mount/key subtests below reach their own fences instead of tripping the
+	// unpinned-config refusal.
+	okCfg := cred.Config{
+		Alg:             cred.AlgEdDSA,
+		StorageIssuer:   "https://control.example/provisional",
+		StorageAudience: "egress.provisional",
+		StorageTTL:      time.Minute,
+	}
 
 	t.Run("missing-mount", func(t *testing.T) {
 		t.Parallel()
@@ -51,7 +59,9 @@ func TestLoadSignerFailClosed(t *testing.T) {
 		t.Parallel()
 		// An Ed25519 key offered to an ES256 deployment must be rejected.
 		edPath := writeKeyMount(t, cred.AlgEdDSA)
-		_, err := cred.LoadSignerFromMount(edPath, clk, cred.Config{Alg: cred.AlgES256, StorageTTL: time.Minute})
+		cfg := okCfg
+		cfg.Alg = cred.AlgES256
+		_, err := cred.LoadSignerFromMount(edPath, clk, cfg)
 		if !errors.Is(err, cred.ErrSigningKeyInvalid) {
 			t.Fatalf("wrong family: want ErrSigningKeyInvalid, got %v", err)
 		}
@@ -59,15 +69,48 @@ func TestLoadSignerFailClosed(t *testing.T) {
 
 	t.Run("nonpositive-ttl", func(t *testing.T) {
 		t.Parallel()
-		_, err := cred.LoadSignerFromMount(writeKeyMount(t, cred.AlgEdDSA), clk, cred.Config{Alg: cred.AlgEdDSA, StorageTTL: 0})
+		cfg := okCfg
+		cfg.StorageTTL = 0
+		_, err := cred.LoadSignerFromMount(writeKeyMount(t, cred.AlgEdDSA), clk, cfg)
 		if !errors.Is(err, cred.ErrConfig) {
 			t.Fatalf("zero TTL: want ErrConfig, got %v", err)
 		}
 	})
 
+	// The two unpinned-config subtests below are the W1 fail-closed guard. A
+	// Storage-JWT minted with an empty iss or aud is UNPINNABLE at the trust edge:
+	// the egress verifier pins both, so an empty claim is rejected there -- on live
+	// traffic, per session, long after boot. Since the deployment supplies iss/aud
+	// (they are never hardcoded here), an unset flag must abort at CONSTRUCTION, not
+	// produce a custody core that mints tokens no verifier will accept. LoadSignerFromMount
+	// is the only constructor of *Signer outside this package (its fields are
+	// unexported) and cfg is never reassigned after it, so a *Signer that EXISTS is
+	// provably pinned -- which is why the fence lives here and needs no mint-time twin.
+	t.Run("empty-storage-issuer", func(t *testing.T) {
+		t.Parallel()
+		cfg := okCfg
+		cfg.StorageIssuer = ""
+		_, err := cred.LoadSignerFromMount(writeKeyMount(t, cred.AlgEdDSA), clk, cfg)
+		if !errors.Is(err, cred.ErrConfig) {
+			t.Fatalf("empty storage iss: want ErrConfig, got %v (an unpinnable token must never be mintable)", err)
+		}
+	})
+
+	t.Run("empty-storage-audience", func(t *testing.T) {
+		t.Parallel()
+		cfg := okCfg
+		cfg.StorageAudience = ""
+		_, err := cred.LoadSignerFromMount(writeKeyMount(t, cred.AlgEdDSA), clk, cfg)
+		if !errors.Is(err, cred.ErrConfig) {
+			t.Fatalf("empty storage aud: want ErrConfig, got %v (an unpinnable token must never be mintable)", err)
+		}
+	})
+
 	t.Run("es256-loads", func(t *testing.T) {
 		t.Parallel()
-		s, err := cred.LoadSignerFromMount(writeKeyMount(t, cred.AlgES256), clk, cred.Config{Alg: cred.AlgES256, StorageTTL: time.Minute})
+		cfg := okCfg
+		cfg.Alg = cred.AlgES256
+		s, err := cred.LoadSignerFromMount(writeKeyMount(t, cred.AlgES256), clk, cfg)
 		if err != nil {
 			t.Fatalf("es256 load: %v", err)
 		}
@@ -75,6 +118,46 @@ func TestLoadSignerFailClosed(t *testing.T) {
 			t.Fatal("es256 signer has empty kid")
 		}
 	})
+}
+
+// TestMintedStorageJWTCarriesPinnedIssAud closes the loop the construction fence
+// opens: a signer that loaded MUST put the configured iss/aud into the token body,
+// because that is what the egress verifier pins on. The fence would be worthless if
+// the mint dropped the claims on the floor. It asserts against the DECODED payload,
+// not the struct, so a wire-name change (iss/aud) is caught too.
+func TestMintedStorageJWTCarriesPinnedIssAud(t *testing.T) {
+	t.Parallel()
+	signer, _ := newTestSigner(t, cred.AlgEdDSA, time.Minute)
+	tok, err := signer.MintStorageJWT(context.Background(), cred.StorageMintReq{
+		SessionKey:   "tenant/sess",
+		FilesystemID: "fs-1",
+		Authz:        cred.AuthorizationMetadata{Intent: cred.IntentRead},
+	})
+	if err != nil {
+		t.Fatalf("MintStorageJWT: %v", err)
+	}
+	parts := strings.Split(tok.Reveal(), ".")
+	if len(parts) != 3 {
+		t.Fatalf("minted token is not a 3-part JWS: %d parts", len(parts))
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatalf("decode payload: %v", err)
+	}
+	var body struct {
+		Iss string `json:"iss"`
+		Aud string `json:"aud"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	// newTestSigner's fixture values (helpers_test.go).
+	if body.Iss != "https://control.example/provisional" {
+		t.Errorf("minted iss = %q, want the configured issuer -- an empty or wrong iss is rejected by the pinning verifier at the edge", body.Iss)
+	}
+	if body.Aud != "egress.provisional" {
+		t.Errorf("minted aud = %q, want the configured audience", body.Aud)
+	}
 }
 
 // TestMintStorageScopeRefusals asserts the weak Storage-JWT mint fail-closes on a

@@ -274,6 +274,8 @@ func Test_parse_SessionIdleTTL_Unset(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", "/tmp/jwt.key",
 		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}
 	cfg, _, err := parse(args)
 	if err != nil {
@@ -295,6 +297,8 @@ func Test_parse_SessionIdleTTL_Set(t *testing.T) {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", "/tmp/jwt.key",
 		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 		"-session-idle-ttl", "10m",
 	}
 	cfg, _, err := parse(args)

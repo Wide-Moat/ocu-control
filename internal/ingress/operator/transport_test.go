@@ -651,7 +651,10 @@ func TestOperatorTransportRouteEdges(t *testing.T) {
 
 	postOnly := []string{"/v1alpha/sessions/destroy", "/v1alpha/revoke/one", "/v1alpha/revoke/all"}
 
-	// Wrong method -> 405 on each POST-only route.
+	// Wrong method -> 405 on each POST-only route, and the refusal names the verb the
+	// path does serve. The Allow header is the observable difference between a route
+	// whose method is decided by the mux pattern and one that decides it in the handler
+	// body: RFC 9110 requires Allow on a 405, and a hand-rolled refusal does not set it.
 	for _, path := range postOnly {
 		resp, err := client.Get("http://unix" + path)
 		if err != nil {
@@ -661,6 +664,9 @@ func TestOperatorTransportRouteEdges(t *testing.T) {
 		_ = resp.Body.Close()
 		if resp.StatusCode != http.StatusMethodNotAllowed {
 			t.Fatalf("GET %s = %d; want 405", path, resp.StatusCode)
+		}
+		if allow := resp.Header.Get("Allow"); allow != "POST" {
+			t.Errorf("GET %s: Allow = %q, want %q", path, allow, "POST")
 		}
 	}
 
