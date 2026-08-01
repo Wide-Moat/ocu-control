@@ -62,6 +62,16 @@ jobs:
 
   secrets-gitleaks:
     runs-on: ubuntu-latest
+    # One version literal for the whole job: the scanner the gate runs and the
+    # scanner the red-probe runs MUST be the same, or the probe proves a different
+    # scanner than the one guarding the tree. Two separately-maintained literals
+    # drift silently and nothing fails; one variable removes the class instead of
+    # guarding it. The checksum is bound to this version, so a bump that forgets to
+    # update it fails the install step loudly rather than installing unverified bytes.
+    env:
+      GL_VERSION: 8.30.1
+      # sha256 of gitleaks_8.30.1_linux_x64.tar.gz, from the release checksums.
+      GL_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -72,16 +82,25 @@ jobs:
       # auto-discovered and (via [extend] useDefault) extends the default ruleset.
       - name: gitleaks (docker)
         run: |
-          docker run --rm -v "$PWD:/repo" -w /repo zricethezav/gitleaks:v8.30.1 \
+          docker run --rm -v "$PWD:/repo" -w /repo "zricethezav/gitleaks:v${GL_VERSION}" \
             detect --source=/repo --redact --no-banner
       # RED-when-neutered proof: a config without [extend]/useDefault scans with no
       # rules (a vacuous gate). This plants a secret and asserts gitleaks fires, so a
       # regression that drops the default ruleset cannot pass review. It runs a real
       # gitleaks binary on PATH so the probe's `command -v gitleaks` check is honest.
       - name: install gitleaks binary (for the red-probe)
+        # The version was already pinned, but the BYTES were not verified: the tarball
+        # streamed straight into tar, so a substituted or truncated artifact would be
+        # unpacked and run. Download first, verify the sha256 from the release
+        # checksums, then extract. `set -euo pipefail` so a failed download or a
+        # checksum mismatch fails the step instead of falling through to a `version`
+        # call on whatever is already on PATH.
         run: |
-          curl -sSL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            | tar -xz -C /usr/local/bin gitleaks
+          set -euo pipefail
+          url="https://github.com/gitleaks/gitleaks/releases/download/v${GL_VERSION}/gitleaks_${GL_VERSION}_linux_x64.tar.gz"
+          curl -sSfL "$url" -o /tmp/gitleaks.tgz
+          echo "${GL_SHA256}  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /usr/local/bin gitleaks
           gitleaks version
       - name: gitleaks red-probe (gate-fires proof)
         run: bash scripts/gitleaks-redprobe.sh
