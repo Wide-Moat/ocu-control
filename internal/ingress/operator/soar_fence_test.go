@@ -51,15 +51,18 @@ func TestNoSOARRouteMountedBefore205(t *testing.T) {
 	// POSITIVE pin: registerRoutes mounts EXACTLY these five operator routes. Pinning
 	// the set means any NEW mount (a SOAR route or anything else) that registerRoutes
 	// grows is caught here, because each known path must match its own pinned pattern.
-	// The destroy route is method-scoped ("POST /v1alpha/sessions/destroy") so the
-	// literal segment outranks the read surface's GET /v1alpha/sessions/{key} wildcard;
-	// the probe POSTs to it, so the matched pattern carries the POST method prefix and
-	// the pin reflects that exact registered shape, not a bare literal. /healthz is
-	// intentionally NOT in this set — it is mounted in Serve, not in registerRoutes — so
-	// this is precisely the registerRoutes surface. Do not "fix" this test by adding
-	// /healthz.
+	// The create and destroy routes are method-scoped ("POST /v1alpha/sessions",
+	// "POST /v1alpha/sessions/destroy") so the literal segment outranks the read
+	// surface's GET /v1alpha/sessions/{key} wildcard; the probe POSTs to them, so the
+	// matched pattern carries the POST method prefix and the pin reflects that exact
+	// registered shape, not a bare literal. Every row here is therefore a POST pin —
+	// the GET half of /v1alpha/sessions needs a probe of its own and a Listener with a
+	// reader configured, which is routes_sessions_verbs_test.go's job, not this
+	// fence's. /healthz is intentionally NOT in this set — it is mounted in Serve, not
+	// in registerRoutes — so this is precisely the registerRoutes surface. Do not
+	// "fix" this test by adding /healthz.
 	knownPatterns := []struct{ path, pattern string }{
-		{"/v1alpha/sessions", "/v1alpha/sessions"},
+		{"/v1alpha/sessions", "POST /v1alpha/sessions"},
 		{"/v1alpha/sessions/destroy", "POST /v1alpha/sessions/destroy"},
 		{"/v1alpha/revoke/one", "/v1alpha/revoke/one"},
 		{"/v1alpha/revoke/all", "/v1alpha/revoke/all"},
