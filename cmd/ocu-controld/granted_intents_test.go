@@ -21,6 +21,8 @@ func grantedIntentsBaseArgs(extra ...string) []string {
 		"-workload-profile", "trusted_operator",
 		"-jwt-signing-key", "/tmp/jwt.key",
 		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
 	}, extra...)
 }
 

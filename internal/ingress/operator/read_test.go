@@ -254,3 +254,32 @@ func TestReadHandlers_HoldNoMutatingCapability(t *testing.T) {
 		}
 	}
 }
+
+// TestReadList_UnmountedWithoutAReaderIsMethodNotAllowed is the over-the-wire half
+// of the method-scoped split, on a REAL bound operator socket rather than a mux
+// probe: a deployment that configures no reader mounts the create verb only, so a
+// GET to the same path is refused by the mux with 405 and the Allow header naming
+// the verb that IS served.
+//
+// The status is unchanged from the hand-rolled branch this replaces; the Allow
+// header is new (RFC 9110 requires it on a 405, and the branch never set it), and
+// it is what makes the refusal self-describing: a caller learns the path exists for
+// POST and that the read surface is simply absent here.
+func TestReadList_UnmountedWithoutAReaderIsMethodNotAllowed(t *testing.T) {
+	t.Parallel()
+	// boundOperator configures no Reader, so the read surface is not mounted.
+	_, client, _ := boundOperator(t, fixedResolver{id: state.Identity{Tenant: "ocu-operator", Caller: "uid:1000"}}, nil)
+
+	resp, err := client.Get("http://unix/v1alpha/sessions")
+	if err != nil {
+		t.Fatalf("GET sessions: %v", err)
+	}
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET with no read surface: want 405, got %d", resp.StatusCode)
+	}
+	if allow := resp.Header.Get("Allow"); allow != "POST" {
+		t.Errorf("405 Allow header = %q, want %q: the refusal must name the verb the path does serve", allow, "POST")
+	}
+}
