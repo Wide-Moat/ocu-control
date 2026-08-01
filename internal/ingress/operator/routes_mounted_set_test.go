@@ -21,7 +21,7 @@ import (
 // not registerRoutes, so this is precisely the registerRoutes surface (matching the
 // scope soar_fence_test documents).
 var expectedMountedRoutes = map[string]bool{
-	"/v1alpha/sessions":              true,
+	"POST /v1alpha/sessions":         true,
 	"POST /v1alpha/sessions/destroy": true,
 	"/v1alpha/revoke/one":            true,
 	"/v1alpha/revoke/all":            true,
@@ -30,6 +30,10 @@ var expectedMountedRoutes = map[string]bool{
 	"POST /v1alpha/mcp-keys/revoke":  true,
 	// Conditional on a configured read surface (l.read != nil), but statically
 	// present in registerRoutes, so the AST scan sees them regardless of runtime.
+	// This scan is a SOURCE fence, not a runtime one: it cannot tell a conditional
+	// mount from an unconditional one, which is exactly why the runtime half is
+	// pinned separately in routes_sessions_verbs_test.go.
+	"GET /v1alpha/sessions":       true,
 	"GET /v1alpha/sessions/{key}": true,
 	"GET /v1alpha/deployment":     true,
 }

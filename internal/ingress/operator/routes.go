@@ -32,40 +32,33 @@ import (
 // mounted on the gateway listener.
 func (l *Listener) registerRoutes(mux *http.ServeMux) {
 	h := l.handlers
-	mux.HandleFunc("/v1alpha/sessions", func(w http.ResponseWriter, r *http.Request) {
-		switch r.Method {
-		case http.MethodPost:
-			conn := connInfoFromRequest(r)
-			var body createBody
-			if err := decodeJSON(w, r, &body); err != nil {
-				writeDecodeError(w, err)
-				return
-			}
-			req, err := body.toRequest()
-			if err != nil {
-				// A malformed mount_intent is an invalid argument: deny -> 400,
-				// refused before any host state (no admission, quota, or reserve).
-				writeStatus(w, http.StatusBadRequest, err.Error())
-				return
-			}
-			row, err := h.Create(r.Context(), conn, req)
-			if err != nil {
-				writeCreateError(w, err)
-				return
-			}
-			writeJSON(w, http.StatusCreated, sessionResponse{Key: row.Key, State: int(row.State)})
-		case http.MethodGet:
-			// GET is the admin list endpoint, but only when a read surface is
-			// mounted. Without one the route is POST-only, so GET is 405 (method not
-			// allowed) — the same contract as before the read surface existed.
-			if l.read == nil {
-				writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
-				return
-			}
-			l.handleListSessions(w, r)
-		default:
-			writeStatus(w, http.StatusMethodNotAllowed, "method not allowed")
+	// Method-scoped, matching the two operations the frozen operator-REST contract
+	// declares on this path: createSession (POST) and listSessions (GET). The GET half
+	// is mounted with the rest of the read surface below, so a deployment without a
+	// reader mounts the mutating verb ONLY — the absence of the admin list is then
+	// visible in the route table itself rather than hidden inside a handler body that
+	// answers 405. A non-POST request with no read surface stays 405 (now from the mux
+	// pattern, which also supplies the Allow header the hand-rolled branch omitted).
+	mux.HandleFunc("POST /v1alpha/sessions", func(w http.ResponseWriter, r *http.Request) {
+		conn := connInfoFromRequest(r)
+		var body createBody
+		if err := decodeJSON(w, r, &body); err != nil {
+			writeDecodeError(w, err)
+			return
 		}
+		req, err := body.toRequest()
+		if err != nil {
+			// A malformed mount_intent is an invalid argument: deny -> 400,
+			// refused before any host state (no admission, quota, or reserve).
+			writeStatus(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		row, err := h.Create(r.Context(), conn, req)
+		if err != nil {
+			writeCreateError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusCreated, sessionResponse{Key: row.Key, State: int(row.State)})
 	})
 
 	// Method-scoped so the literal /v1alpha/sessions/destroy segment is more
@@ -195,11 +188,13 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 
 	// The admin read-surface (ADR-0022) is mounted only when a reader was supplied.
 	// These are GET-only, read-only, and reach ONLY the ReadHandlers (which holds no
-	// seam and no mutating surface) — never the mutating Handlers above. The
-	// per-key route uses a method+path pattern so it cannot shadow the literal
-	// /v1alpha/sessions/destroy POST (a literal segment outranks the {key} wildcard,
-	// and the methods differ regardless).
+	// seam and no mutating surface) — never the mutating Handlers above. The list
+	// route shares its path with the create POST above and is distinguished by the
+	// method, so the two never collide; the per-key route uses a method+path pattern
+	// so it cannot shadow the literal /v1alpha/sessions/destroy POST (a literal
+	// segment outranks the {key} wildcard, and the methods differ regardless).
 	if l.read != nil {
+		mux.HandleFunc("GET /v1alpha/sessions", l.handleListSessions)
 		mux.HandleFunc("GET /v1alpha/sessions/{key}", l.handleGetSession)
 		mux.HandleFunc("GET /v1alpha/deployment", l.handleDeployment)
 	}
