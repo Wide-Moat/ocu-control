@@ -48,8 +48,6 @@ func newTestSigner(t *testing.T, clk state.Clock) (*cred.Signer, *cred.Revoker) 
 		Alg:             cred.AlgEdDSA,
 		StorageIssuer:   "https://control.example/provisional",
 		StorageAudience: "egress.provisional",
-		ExecIssuer:      "https://control.example/exec-provisional",
-		ExecAudience:    "guest.exec.provisional",
 		StorageTTL:      15 * time.Minute,
 	})
 	if err != nil {

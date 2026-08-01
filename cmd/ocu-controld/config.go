@@ -44,8 +44,6 @@ type config struct {
 	jwtAlg          string        // Storage-JWT signing algorithm: eddsa|es256 (default eddsa)
 	storageIssuer   string        // REQUIRED Storage-JWT iss, deployment-supplied and never hardcoded; the egress verifier pins it (see requiredFlags)
 	storageAudience string        // REQUIRED Storage-JWT aud, deployment-supplied; the egress verifier pins it
-	execIssuer      string        // provisional exec-JWT iss (PIN-PENDING); the keyless exec JWT carries no iss, so nothing reads this yet
-	execAudience    string        // provisional exec-JWT aud (PIN-PENDING); the keyless exec JWT carries no aud, so nothing reads this yet
 	serviceURL      string        // filestore service_url rendered into every mount-config
 	caCert          string        // path to the CA certificate PEM rendered into every mount-config
 	egressNetwork   string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
@@ -140,8 +138,6 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.storageAudience, "storage-audience", "",
 		"Storage-JWT audience claim, REQUIRED and deployment-supplied; the egress verifier "+
 			"pins it, so an empty aud mints a token the edge rejects")
-	fs.StringVar(&cfg.execIssuer, "exec-issuer", "", "provisional exec-JWT issuer (PIN-PENDING)")
-	fs.StringVar(&cfg.execAudience, "exec-audience", "", "provisional exec-JWT audience (PIN-PENDING)")
 	fs.StringVar(&cfg.serviceURL, "service-url", "", "filestore service_url rendered into every mount-config (https://)")
 	fs.StringVar(&cfg.caCert, "ca-cert", "", "path to the CA certificate PEM rendered into every mount-config")
 	fs.StringVar(&cfg.egressNetwork, "egress-network", "", "OPTIONAL docker network a storage-scoped guest joins to reach the egress edge (edge is multi-homed onto it); unset keeps every session on its per-session Internal deny-all bridge")
@@ -209,10 +205,6 @@ type requiredFlag struct {
 // silent-until-live-traffic misconfiguration into a named-flag boot refusal before
 // any listener binds. cred.LoadSignerFromMount fences the same invariant a layer
 // down, for a library caller that never passes through these flags.
-//
-// The EXEC iss/aud are NOT required: the per-dial exec JWT is minted by *ExecSigner
-// in a keyless {sub,iat,exp} shape that carries neither claim, so -exec-issuer /
-// -exec-audience currently reach cred.Config and are read by nothing.
 func requiredFlags(cfg config) []requiredFlag {
 	return []requiredFlag{
 		{"operator-listen", cfg.operatorListen},
