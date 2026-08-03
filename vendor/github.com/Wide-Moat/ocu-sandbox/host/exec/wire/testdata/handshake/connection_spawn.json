@@ -1,0 +1,13 @@
+{
+  "process_id": "task-001",
+  "expected_container_name": "ocu-session-abc123",
+  "want_trace_events": false,
+  "accept_compression": false,
+  "create_req": {
+    "cmd": "/bin/echo",
+    "args": ["hello", "world"],
+    "cwd": "/work",
+    "env": { "PATH": "/usr/bin:/bin" },
+    "clear_env": false
+  }
+}

@@ -5,15 +5,18 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
+	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/runtimemap"
+	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
 // stageResolveIdentity (S1) takes the host-derived identity from the resolved
@@ -73,7 +76,7 @@ func stageQuotaCharge(ctx context.Context, m *Manager, st *createState) (compens
 		// failure supersedes the typed error but the create is STILL denied either way.
 		// ErrStoreUnavailable also flows through here — it is faithfully audited, still a
 		// refused create.
-		if emitErr := emitCreateRejected(ctx, m, st, "quota-rejection"); emitErr != nil {
+		if emitErr := emitCreateRejected(ctx, m, st, quotaRejectionReason(err)); emitErr != nil {
 			return nil, fmt.Errorf("lifecycle: quota rejection audit: %w", emitErr)
 		}
 		return nil, err
@@ -176,6 +179,31 @@ func stageFailureReason(stage string, err error) string {
 		msg = msg[:reasonErrCap] + "..."
 	}
 	return base + ": " + msg
+}
+
+// quotaRejectionReason names WHICH cap refused the create, not merely that a
+// quota path did. Three unrelated facts reached this stage under one label: the
+// per-caller create-rate window, the per-tenant concurrent-session level, and a
+// store that was unavailable and is not a quota fact at all. An operator reading
+// "quota-rejection" and finding the concurrency counter at zero concludes it was
+// not quota -- and is wrong, because the exhausted dimension was the other one.
+//
+// The wire is unchanged: the ingress still answers a bare 409 with no detail.
+// This is the operator-only sink, which is exactly where the caller is told the
+// reason lives.
+func quotaRejectionReason(err error) string {
+	const base = "quota-rejection"
+	switch {
+	case errors.Is(err, state.ErrStoreUnavailable):
+		// Not a cap at all. Naming it as one sends the reader to a counter that
+		// will look healthy, because nothing was ever charged.
+		return base + ":store-unavailable"
+	case errors.Is(err, quota.ErrCreateRateDimension):
+		return base + ":create-rate"
+	case errors.Is(err, quota.ErrConcurrentDimension):
+		return base + ":concurrent-sessions"
+	}
+	return base
 }
 
 func emitCreateRejected(ctx context.Context, m *Manager, st *createState, cause string) error {

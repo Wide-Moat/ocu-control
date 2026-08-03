@@ -1,0 +1,11 @@
+{
+  "process_id": "task-003",
+  "expected_container_name": "ocu-session-abc123",
+  "create_req": {
+    "cmd": "/bin/true",
+    "args": [],
+    "clear_env": false,
+    "allow_process_id_reuse": false,
+    "reattachable": false
+  }
+}

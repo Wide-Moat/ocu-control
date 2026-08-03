@@ -43,8 +43,16 @@ func TestCreateHostStageFailureEmitsAuditWithStageName(t *testing.T) {
 	// Exactly one ActionCreateRejected (same Action as the deny stages), carrying the
 	// host-attested identity and the failing stage name in the Reason.
 	rec := onlyRejection(t, h.audit)
-	if rec.Reason != "stage-failed:materialize" {
-		t.Fatalf("rejection Reason = %q, want stage-failed:materialize", rec.Reason)
+	// The stage name AND the cause. Naming only the stage answers where and never
+	// why: a create refused by a missing guest image and one refused by a full disk
+	// wrote the identical line. This assertion held the stage-only form and went red
+	// when the cause started riding along; it now pins what the trail must carry.
+	if !strings.HasPrefix(rec.Reason, "stage-failed:materialize") {
+		t.Fatalf("rejection Reason = %q, want it to name the failing stage", rec.Reason)
+	}
+	if rec.Reason == "stage-failed:materialize" {
+		t.Fatalf("rejection Reason = %q names the stage and drops the cause - the "+
+			"operator sink is the one artifact told to carry why", rec.Reason)
 	}
 	if rec.Key == "" {
 		t.Fatal("host-side stage-fail audit has a blank correlation key")
@@ -88,7 +96,15 @@ func TestCreateDenyStageDoesNotDoubleEmit(t *testing.T) {
 	if strings.HasPrefix(rejectReason, "stage-failed:") {
 		t.Fatalf("deny stage got a generic runner stage-fail record (%q); it must keep its own specific cause", rejectReason)
 	}
-	if rejectReason != "quota-rejection" {
-		t.Fatalf("quota deny Reason = %q, want quota-rejection (its own cause, not doubled)", rejectReason)
+	if !strings.HasPrefix(rejectReason, "quota-rejection:") {
+		t.Fatalf("quota deny Reason = %q, want quota-rejection:<dimension> (its own cause, "+
+			"naming which cap refused, not doubled and not flat)", rejectReason)
+	}
+	// Which cap, specifically. The concurrent-sessions level is what this fixture
+	// exhausts; a reason that named the rate window here would be the mislabel the
+	// dimension marker exists to prevent.
+	if !strings.HasSuffix(rejectReason, ":concurrent-sessions") &&
+		!strings.HasSuffix(rejectReason, ":create-rate") {
+		t.Fatalf("quota deny Reason = %q names no known dimension", rejectReason)
 	}
 }

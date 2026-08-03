@@ -1,0 +1,9 @@
+{
+  "process_id": "task-002",
+  "expected_container_name": "ocu-session-abc123",
+  "create_req": {
+    "cmd": "/bin/sleep",
+    "args": ["30"],
+    "bound_pid": null
+  }
+}
