@@ -27,6 +27,10 @@ type wireMount struct {
 	VfsCacheMaxSize string `json:"vfs_cache_max_size"`
 	DirPerms        string `json:"dir_perms"`
 	FilePerms       string `json:"file_perms"`
+	// VfsWriteBack is the one OPTIONAL member: omitempty so a deployment that
+	// leaves it unset renders the byte-identical config it rendered before the
+	// field existed. The schema lists it outside required for the same reason.
+	VfsWriteBack string `json:"vfs_write_back,omitempty"`
 }
 
 // wireConfig is the PRIVATE marshaled top-level shape, field-identical to the

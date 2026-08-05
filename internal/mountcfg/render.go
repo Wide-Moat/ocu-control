@@ -51,6 +51,10 @@ type MountDefaults struct {
 	VfsCacheMaxSize ByteSize
 	DirPerms        Octal
 	FilePerms       Octal
+	// VfsWriteBack is OPTIONAL, unlike the four above. Zero means the key is
+	// omitted and the guest keeps its own registered default, so a MountDefaults
+	// built before this field existed renders byte-identically.
+	VfsWriteBack WriteBackDelay
 }
 
 // validate confirms the defaults were built through the validating constructors
@@ -68,6 +72,12 @@ func (d MountDefaults) validate() error {
 	}
 	if !octalPattern.MatchString(string(d.FilePerms)) {
 		return fmt.Errorf("%w: file_perms %q", ErrBadOctal, d.FilePerms)
+	}
+	// Checked only when set: the empty value is the documented "omit the key"
+	// state, so an untouched MountDefaults must stay valid. A non-empty value
+	// that bypassed NewWriteBackDelay is still refused.
+	if d.VfsWriteBack != "" && !writeBackPattern.MatchString(string(d.VfsWriteBack)) {
+		return fmt.Errorf("%w: %q", ErrBadWriteBackDelay, d.VfsWriteBack)
 	}
 	return nil
 }
@@ -89,6 +99,7 @@ type mountInput struct {
 	vfsCacheMaxSize ByteSize
 	dirPerms        Octal
 	filePerms       Octal
+	vfsWriteBack    WriteBackDelay
 }
 
 // Config is the rendered, ready-to-push mount-config a caller holds. It carries
@@ -214,6 +225,7 @@ func renderMount(m runtime.MountIntent, tok cred.Token, defaults MountDefaults) 
 		vfsCacheMaxSize: defaults.VfsCacheMaxSize,
 		dirPerms:        defaults.DirPerms,
 		filePerms:       defaults.FilePerms,
+		vfsWriteBack:    defaults.VfsWriteBack,
 	}, nil
 }
 
@@ -237,6 +249,7 @@ func (c Config) Marshal() ([]byte, error) {
 			VfsCacheMaxSize: string(in.vfsCacheMaxSize),
 			DirPerms:        string(in.dirPerms),
 			FilePerms:       string(in.filePerms),
+			VfsWriteBack:    string(in.vfsWriteBack),
 		})
 	}
 	wc := wireConfig{

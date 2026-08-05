@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"time"
 )
 
 // ErrBadOctal is returned when a permission value is not the frozen Octal shape
@@ -39,14 +40,22 @@ var ErrBadCacheDuration = errors.New("mountcfg: cache_duration_s must be a non-n
 // (the frozen destination pattern is ^/.+).
 var ErrBadDestination = errors.New("mountcfg: destination must be an absolute guest path matching ^/.+")
 
+// ErrBadWriteBackDelay is returned when a write-back delay is not the frozen
+// WriteBackDelay shape (^[0-9]+(\.[0-9]+)?(ms|s|m|h)$), e.g. 500ms or 1s. The
+// pattern is deliberately NARROWER than what the guest mounter itself accepts: a
+// producer that cannot express a value is a config we never send, whereas a value
+// the guest rejects is a mount that fails to come up.
+var ErrBadWriteBackDelay = errors.New(`mountcfg: vfs_write_back must match ^[0-9]+(\.[0-9]+)?(ms|s|m|h)$`)
+
 // The compiled mirrors of the frozen $defs patterns. They are anchored exactly as
 // the schema anchors them, so a value this package accepts is a value the schema
 // accepts; the go:embed schema-validation test is the cross-check that the two
 // never drift.
 var (
-	octalPattern    = regexp.MustCompile(`^0[0-7]{3}$`)
-	byteSizePattern = regexp.MustCompile(`^[0-9]+(B|K|M|G|T)?$`)
-	destPattern     = regexp.MustCompile(`^/.+`)
+	octalPattern     = regexp.MustCompile(`^0[0-7]{3}$`)
+	byteSizePattern  = regexp.MustCompile(`^[0-9]+(B|K|M|G|T)?$`)
+	destPattern      = regexp.MustCompile(`^/.+`)
+	writeBackPattern = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(ms|s|m|h)$`)
 )
 
 // Octal is a host-set POSIX permission string mirroring the frozen Octal $def.
@@ -74,6 +83,42 @@ func NewByteSize(s string) (ByteSize, error) {
 		return "", fmt.Errorf("%w: %q", ErrBadByteSize, s)
 	}
 	return ByteSize(s), nil
+}
+
+// WriteBackDelay is how long the guest VFS holds a dirty file before writing it
+// back to the broker. It is OPTIONAL: the empty value omits the key entirely and
+// the guest keeps its own registered default.
+//
+// The value is bounded from above by something outside this repo. A session's
+// guest agent forwards SIGTERM to the mount boot-child but stops waiting for it
+// after roughly two seconds, so whatever is still queued when a session is torn
+// down is discarded. A delay at or above that ceiling means the most recent write
+// of every session is lost on teardown; a delay well below it leaves the upload
+// room to finish inside the window. Raising this value without re-measuring that
+// teardown window reintroduces the loss.
+type WriteBackDelay string
+
+// NewWriteBackDelay validates s against the frozen WriteBackDelay pattern and
+// returns it, or ErrBadWriteBackDelay. The empty string is NOT accepted here: an
+// omitted delay is expressed by leaving the field zero, never by constructing one.
+//
+// A pattern-shaped ZERO ("0s", "0ms") is refused as well. The pattern alone cannot
+// express "positive", and the guest mounter rejects a non-positive delay outright —
+// emitting one would not degrade the mount, it would stop the mount coming up at
+// all. Refusing here keeps that failure on the host, at construction, where it is
+// a startup panic with a name instead of a session that never gets its storage.
+func NewWriteBackDelay(s string) (WriteBackDelay, error) {
+	if !writeBackPattern.MatchString(s) {
+		return "", fmt.Errorf("%w: %q", ErrBadWriteBackDelay, s)
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return "", fmt.Errorf("%w: %q", ErrBadWriteBackDelay, s)
+	}
+	if d <= 0 {
+		return "", fmt.Errorf("%w: %q must be positive", ErrBadWriteBackDelay, s)
+	}
+	return WriteBackDelay(s), nil
 }
 
 // VfsCacheMode is the page-cache policy mirroring the frozen VfsCacheMode enum.
