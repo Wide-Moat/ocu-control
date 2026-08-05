@@ -1107,7 +1107,27 @@ func defaultMountDefaults() mountcfg.MountDefaults {
 	if err != nil {
 		panic(fmt.Sprintf("ocu-controld: invalid default file_perms: %v", err))
 	}
-	return mountcfg.MountDefaults{VfsCacheMode: mode, VfsCacheMaxSize: size, DirPerms: dir, FilePerms: file}
+	// The guest agent forwards SIGTERM to the mount boot-child but stops waiting for
+	// it after roughly two seconds. A boot-child that drains in one or two seconds
+	// finishes; one that needs three is killed mid-drain, and the container stop
+	// grace never binds because the cap is the agent's, not the runtime's. The agent
+	// still exits 0 in both cases, so a truncated drain raises nothing on its own.
+	// Left unset, the guest VFS holds a dirty file for its
+	// own registered default of five seconds — longer than the window it will ever
+	// get — so the most recent write of every session is discarded at teardown. This
+	// value sits well below the window so the upload has room to finish inside it.
+	// Raising it without re-measuring that window reintroduces the loss.
+	writeBack, err := mountcfg.NewWriteBackDelay("500ms")
+	if err != nil {
+		panic(fmt.Sprintf("ocu-controld: invalid default vfs_write_back: %v", err))
+	}
+	return mountcfg.MountDefaults{
+		VfsCacheMode:    mode,
+		VfsCacheMaxSize: size,
+		DirPerms:        dir,
+		FilePerms:       file,
+		VfsWriteBack:    writeBack,
+	}
 }
 
 // defaultStorageScope is the minimal-shelf, deployment-fixed Storage-JWT scope. It
