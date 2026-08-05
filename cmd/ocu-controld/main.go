@@ -1107,26 +1107,29 @@ func defaultMountDefaults() mountcfg.MountDefaults {
 	if err != nil {
 		panic(fmt.Sprintf("ocu-controld: invalid default file_perms: %v", err))
 	}
-	// The guest agent forwards SIGTERM to the mount boot-child but stops waiting for
-	// it after roughly two seconds. A boot-child that drains in one or two seconds
-	// finishes; one that needs three is killed mid-drain, and the container stop
-	// grace never binds because the cap is the agent's, not the runtime's. The agent
-	// still exits 0 in both cases, so a truncated drain raises nothing on its own.
-	// Left unset, the guest VFS holds a dirty file for its
-	// own registered default of five seconds — longer than the window it will ever
-	// get — so the most recent write of every session is discarded at teardown. This
-	// value sits well below the window so the upload has room to finish inside it.
-	// Raising it without re-measuring that window reintroduces the loss.
-	writeBack, err := mountcfg.NewWriteBackDelay("500ms")
-	if err != nil {
-		panic(fmt.Sprintf("ocu-controld: invalid default vfs_write_back: %v", err))
-	}
+	// VfsWriteBack is deliberately LEFT UNSET, and it must stay unset until a guest
+	// image ships whose mount binary parses the key.
+	//
+	// The delay matters: the guest agent forwards SIGTERM to the mount boot-child but
+	// stops waiting after roughly two seconds, while the guest VFS holds a dirty file
+	// for its own registered default of five seconds. The window is shorter than the
+	// hold, so the most recent write of a session is discarded at teardown, and the
+	// agent exits 0 either way. Setting a delay below the window is the fix.
+	//
+	// But the mount config is STRICT-DECODED in the guest. A mount binary that predates
+	// the key refuses the whole config with `unknown field "vfs_write_back"`, the mount
+	// never comes up, the session never reaches a state that accepts exec, and every
+	// call is refused — the deployment loses sessions entirely rather than losing the
+	// last write. Emitting the key is therefore only safe once the consuming image is
+	// in place: consumer first, producer second.
+	//
+	// The field and NewWriteBackDelay stay available so a deployment running a capable
+	// guest can set it; only the unconditional default is withheld.
 	return mountcfg.MountDefaults{
 		VfsCacheMode:    mode,
 		VfsCacheMaxSize: size,
 		DirPerms:        dir,
 		FilePerms:       file,
-		VfsWriteBack:    writeBack,
 	}
 }
 
