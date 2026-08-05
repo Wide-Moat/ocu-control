@@ -49,6 +49,21 @@ const dialWaitBudget = 5 * time.Second
 // sub-second), long enough not to busy-spin connect(2).
 const redialInterval = 75 * time.Millisecond
 
+// dialAttemptBudget bounds ONE dial attempt, so a peer that accepts and then goes
+// silent cannot spend the whole dialWaitBudget by itself. Without it the re-dial
+// poll below is reachable only by errors that return instantly — a connect(2)
+// ENOENT or ECONNREFUSED — because any failure that consumes time consumes the
+// entire budget, leaving nothing to retry into.
+//
+// The value sits far above every latency this dial legitimately incurs: a warm
+// exec hop through the gateway completes in single-digit milliseconds, and a full
+// cold create — guest materialization, mount, bind and handshake included — lands
+// near a quarter second. 1.5s is two orders of magnitude above the former and
+// several times the latter, so a slow-but-progressing upgrade finishes well inside
+// one attempt and is never cut. It divides dialWaitBudget into three full attempts
+// plus a partial, which is enough for a guest that binds late to be caught.
+const dialAttemptBudget = 1500 * time.Millisecond
+
 // defaultStdioCap bounds each captured output stream: bytes past the cap are
 // discarded with the truncated flag set (prefix-preserving), so a flooding guest
 // cannot balloon host memory through an exec result. At 64 KiB it is BOTH the
@@ -297,14 +312,23 @@ func (d *Driver) Exec(ctx context.Context, sockDir, containerName string, req Re
 }
 
 // dialWithColdWait dials the exec socket, re-dialling across the sub-second cold
-// window where the guest is materialized but has not yet bound exec.sock. A dial
-// that fails with a PROVABLY-TRANSIENT connect(2) error (ENOENT: the socket file
-// is not there yet; ECONNREFUSED: it is bound but the listener is not accepting
-// yet) is retried on redialInterval until the socket comes up or the wait budget
-// expires. Any OTHER dial error — a handshake failure, a context cancellation, an
-// unexpected syscall — is returned at once: only the not-yet-ready shape is
-// transient, everything else is terminal and re-dialling it would only burn the
-// budget.
+// window where the guest is materialized but has not yet bound exec.sock. Two
+// outcomes are retried on redialInterval until the socket comes up or the wait
+// budget expires:
+//
+//   - a PROVABLY-TRANSIENT connect(2) error — ENOENT (the socket file is not there
+//     yet) or ECONNREFUSED (bound, listener not accepting yet);
+//   - an attempt that exhausts dialAttemptBudget while the overall wait budget
+//     still has room — the accepting-but-silent peer, which is a guest that bound
+//     the socket before its handler was ready.
+//
+// Any OTHER dial error — a caller cancellation, an unexpected syscall — is
+// returned at once: re-dialling it would only burn the budget.
+//
+// The two exhaustions are NOT interchangeable. An expired ATTEMPT means this dial
+// took too long and another may still fit; an expired WAIT budget means the whole
+// cold window is spent and nothing further can be attempted, so it is checked
+// first and always terminal.
 //
 // The wait is bounded by min(dialWaitBudget, the caller's ctx deadline): the cold
 // wait never outlives the exec's own deadline, and a genuinely dead guest fails a
@@ -319,15 +343,25 @@ func dialWithColdWait(ctx context.Context, socketPath string, minter dial.Minter
 	defer cancel()
 
 	for {
-		// Each dial is bounded by waitCtx so a single hanging connect/handshake cannot
-		// outlive the cold-wait budget; the returned channel keeps no reference to this
-		// ctx — the handshake and drive that follow use the exec's own full deadline.
-		ch, err := dial.DialUDS(waitCtx, socketPath, minter)
+		// Each dial is bounded twice: by its own attempt budget, so one silent peer
+		// cannot spend the whole window, and by waitCtx, so the total wait never
+		// outlives the cold-wait budget. The returned channel keeps no reference to
+		// either — the handshake and drive that follow use the exec's own deadline.
+		attemptCtx, cancelAttempt := context.WithTimeout(waitCtx, dialAttemptBudget)
+		ch, err := dial.DialUDS(attemptCtx, socketPath, minter)
+		// Read the attempt's own expiry BEFORE cancelling it: after cancel, a context
+		// that had not yet expired reports Canceled and the two become indistinguishable.
+		attemptExpired := attemptCtx.Err() == context.DeadlineExceeded
+		cancelAttempt()
 		if err == nil {
 			return ch, nil
 		}
-		// Terminal error, or the wait budget / caller deadline is spent: surface it.
-		if !isTransientDialError(err) || waitCtx.Err() != nil {
+		// The whole cold window is spent: nothing can be attempted, whatever the shape.
+		if waitCtx.Err() != nil {
+			return nil, err
+		}
+		// Terminal shape, and the attempt did not simply run out of its own time.
+		if !attemptExpired && !isTransientDialError(err) {
 			return nil, err
 		}
 		// Provably-transient: the socket is not up yet. Sleep a poll tick (or bail

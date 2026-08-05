@@ -60,29 +60,29 @@ func startStallingGuest(t *testing.T, sockDir string) *atomic.Int64 {
 	return &accepts
 }
 
-// TestDriverExecStalledHandshakeIsBoundedByDialBudget pins what a silent-but-
-// accepting guest costs, and which of the two clocks in play stops it.
+// TestDriverExecRetriesAStalledHandshakeWithinTheDialBudget pins that a guest which
+// accepts and then goes silent is re-dialled rather than allowed to spend the whole
+// cold window in one attempt, and that the re-dialling stays bounded.
+//
+// The accept count is the load-bearing assertion. Without dialAttemptBudget the
+// stall produced exactly ONE accept: a single dial consumed the entire budget, so
+// the re-dial poll was unreachable for any failure that takes time — it could only
+// ever fire for errors that return instantly. More than one accept is the proof
+// that the poll now runs for this shape. The count is bounded above as well,
+// because a dial that stopped honouring the attempt budget would spin and show a
+// far larger number.
 //
 // Two clocks bound this exec: the caller's exec deadline (TimeoutS, 30s here) and
-// the cold-wait budget dialWithColdWait imposes on the dial (dialWaitBudget, 5s).
-// The test sets them an order of magnitude apart on purpose. With TimeoutS at 3s —
-// the shape this test first took — both clocks fire at nearly the same moment and a
-// pass proves nothing about which one did the bounding. Separating them is the
-// whole point: only the dial budget can explain a return near 5s.
+// the cold-wait budget (dialWaitBudget, 5s). They are set an order of magnitude
+// apart on purpose — with both near 3s a pass proves nothing about which one did
+// the bounding, and only the dial budget can explain a return near 5s.
 //
-// The upper bound is written as an absolute 15s rather than a multiple of
-// dialWaitBudget. A bound expressed in terms of the constant under test moves with
-// it, so raising the budget to a minute would keep such a test green; 15s is fixed
+// The elapsed upper bound is an absolute 15s rather than a multiple of
+// dialWaitBudget: a bound expressed in terms of the constant under test moves with
+// it, so raising the budget to a minute would keep such a test green. 15s is fixed
 // well below the 30s exec deadline, so it reddens if the dial ever stops being
 // bounded separately from the caller's deadline.
-//
-// The accept count is a characterisation, not an aspiration. It records that the
-// stall consumes the ENTIRE budget in one attempt, which is why no re-dial follows:
-// by the time the error surfaces there is no budget left to retry into. Widening
-// isTransientDialError alone therefore cannot produce a second attempt — verified
-// by neutering both the classification and the waitCtx guard, which still yielded
-// exactly one accept. A retry for this shape needs a per-attempt dial bound first.
-func TestDriverExecStalledHandshakeIsBoundedByDialBudget(t *testing.T) {
+func TestDriverExecRetriesAStalledHandshakeWithinTheDialBudget(t *testing.T) {
 	t.Parallel()
 	signer, _ := newTestSigner(t)
 	sockDir := shortSockDir(t)
@@ -93,6 +93,7 @@ func TestDriverExecStalledHandshakeIsBoundedByDialBudget(t *testing.T) {
 	_, err := d.Exec(context.Background(), sockDir, "ocu-session-stalled-hs",
 		Request{Argv: []string{"true"}, TimeoutS: 30})
 	elapsed := time.Since(start)
+	n := accepts.Load()
 
 	if err == nil {
 		t.Fatal("Exec against a guest that accepts and never speaks = nil error; want a refusal")
@@ -101,16 +102,27 @@ func TestDriverExecStalledHandshakeIsBoundedByDialBudget(t *testing.T) {
 	// stalling peer at all (a failed bind surfaces as ENOENT in milliseconds), and
 	// every assertion below would then be measuring the wrong thing.
 	if elapsed < 4*time.Second {
-		t.Fatalf("Exec returned in %v; too fast to have stalled — the dial cannot have "+
-			"reached the accepting-but-silent peer, so this test proved nothing", elapsed)
+		t.Fatalf("Exec returned in %v after %d accepts; too fast to have spent the cold "+
+			"window on a stalling peer, so this test proved nothing", elapsed, n)
 	}
 	if elapsed > 15*time.Second {
 		t.Errorf("Exec took %v against a stalling handshake; the dial must stay bounded by "+
 			"its own cold-wait budget rather than running to the caller's exec deadline", elapsed)
 	}
-	if n := accepts.Load(); n != 1 {
-		t.Errorf("stalling listener saw %d accepts; want exactly 1 — the single attempt "+
-			"consumes the whole cold-wait budget, leaving nothing to re-dial into", n)
+	if n < 2 {
+		t.Errorf("stalling listener saw %d accepts; want more than 1 — one attempt that "+
+			"consumes the whole budget leaves nothing to re-dial into, which is exactly "+
+			"what dialAttemptBudget exists to prevent", n)
 	}
-	t.Logf("stalled handshake: err=%v elapsed=%v accepts=%d", err, elapsed, accepts.Load())
+	// Absolute, not dialWaitBudget/dialAttemptBudget: a ceiling computed from the
+	// constants under test moves with them, so shrinking the attempt budget would
+	// raise the ceiling by exactly as much and the spin would stay green. The
+	// shipped pair yields three full attempts plus a partial; 8 leaves room for
+	// scheduling jitter and still sits far below any spin.
+	const maxAttempts = 8
+	if n > maxAttempts {
+		t.Errorf("stalling listener saw %d accepts; want at most %d — more means an attempt "+
+			"is no longer bounded by dialAttemptBudget and the poll is spinning", n, maxAttempts)
+	}
+	t.Logf("stalled handshake: err=%v elapsed=%v accepts=%d", err, elapsed, n)
 }
