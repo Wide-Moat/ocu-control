@@ -310,12 +310,14 @@ jobs:
         with:
           repository: Wide-Moat/open-computer-use
           # Kept in sync with scripts/check-contract-identity.sh's pinned revision:
-          # 099d3d7 (next/v1 after PR #318 — the mcp-key-set A2 freeze), which the
-          # newly vendored contracts/mcp/mcp-key-set.schema.json requires. All five
+          # 54fcc1c (next/v1 after PR #375 — ADR-0031, which adds the optional
+          # vfs_write_back property to the mount-config Mount object). All five
           # vendored contracts (control-rpc, exec-channel, mount-config,
-          # audit-fanin, mcp-key-set) are byte-identical to canon @099d3d7
-          # (verified by cmp). The prior pin was 5100e14 (PR #303 exec-uplift).
-          ref: 099d3d76d6d8a8e5bec6f46b989c6b9a9246c375
+          # audit-fanin, mcp-key-set) are byte-identical to canon @54fcc1c
+          # (verified by cmp). The prior pin was 099d3d7 (PR #318 mcp-key-set A2
+          # freeze); the four contracts this change does not touch are unchanged
+          # across that bump.
+          ref: 54fcc1c6deb26bb6396d3a323f9b7e6637c5f477
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh

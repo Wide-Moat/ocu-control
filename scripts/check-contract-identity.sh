@@ -7,7 +7,7 @@
 # byte-identical copies so any Go parity test (and any future embed) always
 # builds against the pinned wire surface.
 #
-# Pinned canon revision (next/v1): 099d3d7 — next/v1 after PR #318,
+# Pinned canon revision (next/v1): 54fcc1c — next/v1 after PR #375,
 # "feat(contracts): freeze the mcp-key-set artifact and operator mcp-key verbs
 # (ADR-0027)". All five declared contracts are byte-identical to canon at this
 # rev (verified by cmp): mcp/mcp-key-set.schema.json enters at this pin (git
@@ -44,7 +44,7 @@ cd "$(dirname "$0")/.."
 readonly CANON_DIR="${OCU_CANON_DIR:-../open-computer-use}"
 # Pinned canon revision; keep in sync with the header above and with go.yml's
 # canon checkout `ref:`.
-readonly CANON_REV="${OCU_CANON_REV:-099d3d76d6d8a8e5bec6f46b989c6b9a9246c375}"
+readonly CANON_REV="${OCU_CANON_REV:-54fcc1c6deb26bb6396d3a323f9b7e6637c5f477}"
 
 # The declared set of vendored contracts, by path under contracts/ on both
 # sides. Add a path here when a contract is vendored; the loop below fails
