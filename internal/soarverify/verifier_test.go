@@ -23,8 +23,9 @@ func mustKey(t *testing.T) (ed25519.PublicKey, ed25519.PrivateKey) {
 }
 
 // sign produces the wire signature a conforming SOAR platform would send.
-func sign(priv ed25519.PrivateKey, scope, target, issuedAt string) []byte {
-	return ed25519.Sign(priv, canonicalPayload(scope, target, issuedAt))
+func sign(t *testing.T, priv ed25519.PrivateKey, scope, target, issuedAt string) []byte {
+	t.Helper()
+	return ed25519.Sign(priv, mustCanonical(t, scope, target, issuedAt))
 }
 
 func TestVerifyAcceptsAConformingSignature(t *testing.T) {
@@ -34,8 +35,8 @@ func TestVerifyAcceptsAConformingSignature(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	payload := canonicalPayload("one", "sess-1", "2026-08-07T10:00:00Z")
-	got, err := v.Verify(context.Background(), payload, sign(priv, "one", "sess-1", "2026-08-07T10:00:00Z"))
+	payload := mustCanonical(t, "one", "sess-1", "2026-08-07T10:00:00Z")
+	got, err := v.Verify(context.Background(), payload, sign(t, priv, "one", "sess-1", "2026-08-07T10:00:00Z"))
 	if err != nil {
 		t.Fatalf("Verify rejected a conforming signature: %v", err)
 	}
@@ -57,7 +58,7 @@ func TestVerifyRejects(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	payload := canonicalPayload("one", "sess-1", "2026-08-07T10:00:00Z")
+	payload := mustCanonical(t, "one", "sess-1", "2026-08-07T10:00:00Z")
 
 	cases := []struct {
 		name    string
@@ -67,12 +68,12 @@ func TestVerifyRejects(t *testing.T) {
 		{
 			name:    "signature from a key outside the keyring",
 			payload: payload,
-			sig:     sign(otherPriv, "one", "sess-1", "2026-08-07T10:00:00Z"),
+			sig:     sign(t, otherPriv, "one", "sess-1", "2026-08-07T10:00:00Z"),
 		},
 		{
 			name:    "signature over different fields than the payload presents",
 			payload: payload,
-			sig:     sign(priv, "one", "sess-2", "2026-08-07T10:00:00Z"),
+			sig:     sign(t, priv, "one", "sess-2", "2026-08-07T10:00:00Z"),
 		},
 		{
 			name:    "empty signature",
@@ -82,12 +83,12 @@ func TestVerifyRejects(t *testing.T) {
 		{
 			name:    "truncated signature",
 			payload: payload,
-			sig:     sign(priv, "one", "sess-1", "2026-08-07T10:00:00Z")[:32],
+			sig:     sign(t, priv, "one", "sess-1", "2026-08-07T10:00:00Z")[:32],
 		},
 		{
 			name:    "valid signature presented over a tampered payload",
-			payload: canonicalPayload("all", "", "2026-08-07T10:00:00Z"),
-			sig:     sign(priv, "one", "sess-1", "2026-08-07T10:00:00Z"),
+			payload: mustCanonical(t, "all", "", "2026-08-07T10:00:00Z"),
+			sig:     sign(t, priv, "one", "sess-1", "2026-08-07T10:00:00Z"),
 		},
 	}
 	for _, tc := range cases {
@@ -122,7 +123,7 @@ func TestMalformedSignatureIsDistinguishableFromAForgedOne(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	payload := canonicalPayload("all", "", "2026-08-07T10:00:00Z")
+	payload := mustCanonical(t, "all", "", "2026-08-07T10:00:00Z")
 
 	_, malformed := v.Verify(context.Background(), payload, []byte{1, 2, 3})
 	// A well-formed signature from a key that is simply not on the keyring.
@@ -155,7 +156,7 @@ func TestVerifySelectsThePrincipalWhoseKeyVerified(t *testing.T) {
 		t.Fatalf("New: %v", err)
 	}
 
-	payload := canonicalPayload("all", "", "2026-08-07T10:00:00Z")
+	payload := mustCanonical(t, "all", "", "2026-08-07T10:00:00Z")
 	got, err := v.Verify(context.Background(), payload, ed25519.Sign(privB, payload))
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
@@ -181,7 +182,7 @@ func TestVerifyAcceptsEitherKeyDuringRotation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	payload := canonicalPayload("all", "", "2026-08-07T10:00:00Z")
+	payload := mustCanonical(t, "all", "", "2026-08-07T10:00:00Z")
 
 	for name, priv := range map[string]ed25519.PrivateKey{"outgoing": oldPriv, "incoming": newPriv} {
 		t.Run(name, func(t *testing.T) {

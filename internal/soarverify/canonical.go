@@ -13,6 +13,8 @@ package soarverify
 
 import (
 	"encoding/binary"
+	"fmt"
+	"math"
 )
 
 // domainTag prefixes every canonical payload. It scopes a signature to this
@@ -23,8 +25,40 @@ import (
 // bytes.
 const domainTag = "ocu.soar.revoke.v1"
 
+// A field longer than this cannot be encoded: the uint32 prefix would wrap, and
+// two fields whose lengths differ by exactly 2^32 would then carry the SAME
+// prefix — destroying the injectivity the whole scheme rests on. The frozen
+// schema bounds every one of these fields far below this, so a payload reaching
+// it is a caller bug rather than a legitimate revoke.
+//
+// Typed uint64 and compared in that domain: as an untyped constant this
+// overflows int on a 32-bit build, and widening the length instead of narrowing
+// the bound keeps the comparison meaningful on every architecture.
+const maxFieldLen uint64 = 1<<32 - 1
+
+// appendField writes one length-prefixed field, refusing a length the prefix
+// cannot express. It takes the bound as a parameter so the refusal can be
+// exercised without allocating a 4 GiB string; canonicalPayload always passes
+// maxFieldLen, and nothing else calls it.
+func appendField(out []byte, name, value string, bound uint64) ([]byte, error) {
+	n64 := uint64(len(value))
+	// Both bounds are checked, not just the caller's: a caller passing a bound
+	// above the prefix ceiling would otherwise wrap the conversion below, which
+	// is the failure this function exists to prevent.
+	if n64 > bound || n64 > math.MaxUint32 {
+		return nil, fmt.Errorf("soarverify: %s is %d bytes, beyond the %d-byte "+
+			"encoding bound; the length prefix would wrap and two different field "+
+			"sets could share one canonical form", name, n64, min(bound, math.MaxUint32))
+	}
+	var n [4]byte
+	// Safe by the guard above: n64 is at or below MaxUint32.
+	binary.BigEndian.PutUint32(n[:], uint32(n64))
+	out = append(out, n[:]...)
+	return append(out, value...), nil
+}
+
 // canonicalPayload builds the exact bytes an Ed25519 SOAR signature covers
-// (ADR-0039):
+// (ADR-0039), or reports the field that cannot be encoded:
 //
 //	canonical = domainTag || LP(scope) || LP(target) || LP(issuedAt)
 //	LP(s)     = uint32 big-endian byte-length of s, then the UTF-8 bytes of s
@@ -43,14 +77,19 @@ const domainTag = "ocu.soar.revoke.v1"
 // is arbitrary text up to the schema bound, so under any separator scheme two
 // distinct field triples can serialize to one byte string, and a signature over
 // one would verify the other.
-func canonicalPayload(scope, target, issuedAt string) []byte {
+func canonicalPayload(scope, target, issuedAt string) ([]byte, error) {
+	fields := [...]struct {
+		name  string
+		value string
+	}{{"scope", scope}, {"target_session_id", target}, {"issued_at", issuedAt}}
+
 	out := make([]byte, 0, len(domainTag)+12+len(scope)+len(target)+len(issuedAt))
 	out = append(out, domainTag...)
-	for _, field := range [...]string{scope, target, issuedAt} {
-		var n [4]byte
-		binary.BigEndian.PutUint32(n[:], uint32(len(field)))
-		out = append(out, n[:]...)
-		out = append(out, field...)
+	for _, f := range fields {
+		var err error
+		if out, err = appendField(out, f.name, f.value, maxFieldLen); err != nil {
+			return nil, err
+		}
 	}
-	return out
+	return out, nil
 }
