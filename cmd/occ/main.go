@@ -104,13 +104,15 @@ func run(ctx context.Context, args []string, out io.Writer, dial dialFunc) error
 // runAudit dispatches the audit subcommand family.
 func runAudit(args []string, out io.Writer) error {
 	if len(args) < 1 {
-		return usageError("expected an audit verb: verify")
+		return usageError("expected an audit verb: verify | head")
 	}
 	switch args[0] {
 	case "verify":
 		return runAuditVerify(args[1:], out)
+	case "head":
+		return runAuditHead(args[1:], out)
 	default:
-		return usageError(fmt.Sprintf("unknown audit verb %q: expected verify", args[0]))
+		return usageError(fmt.Sprintf("unknown audit verb %q: expected verify | head", args[0]))
 	}
 }
 
