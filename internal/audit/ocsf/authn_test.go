@@ -181,6 +181,67 @@ func TestAuthnEmitRidesTheSameChain(t *testing.T) {
 	}
 }
 
+// TestAuthnUnknownActivityIsSelfDescribing pins the fallback label. An
+// activity value outside the enum still produces a readable record rather
+// than an empty name — the same posture activityFor takes with Other(99).
+func TestAuthnUnknownActivityIsSelfDescribing(t *testing.T) {
+	clk := state.NewFakeClock(fixedStart)
+	rec := testAuthnLogon()
+	rec.Activity = AuthnActivity(42)
+	ev := buildAuthnEvent(clk, rec)
+	if ev.ActivityName != "authn_activity_unknown" {
+		t.Errorf("activity 42 reports name %q; an unknown value must say so rather "+
+			"than carry an empty or wrong label", ev.ActivityName)
+	}
+}
+
+// TestAuthnEmitRefusesACancelledContext matches Emit's own fail-closed deny on
+// a dead context: no work, no sequence consumed.
+func TestAuthnEmitRefusesACancelledContext(t *testing.T) {
+	clk := state.NewFakeClock(fixedStart)
+	w := &authnCollectWriter{}
+	sink := NewChainSink(clk, w, "control")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := sink.EmitAuthn(ctx, testAuthnLogon()); err == nil {
+		t.Fatal("a cancelled context was accepted")
+	}
+	if len(w.envelopes) != 0 {
+		t.Errorf("a cancelled emit still wrote %d envelope(s)", len(w.envelopes))
+	}
+}
+
+// TestAuthnEmitSurfacesAWriterFault keeps the caller informed: the
+// fail-open/fail-closed decision is the caller's, and it cannot decide on an
+// error it never sees. The failed emit must not advance the chain.
+func TestAuthnEmitSurfacesAWriterFault(t *testing.T) {
+	clk := state.NewFakeClock(fixedStart)
+	sink := NewChainSink(clk, &authnFaultWriter{}, "control")
+
+	if err := sink.EmitAuthn(context.Background(), testAuthnLogon()); err == nil {
+		t.Fatal("a writer fault was swallowed; the caller cannot count a loss it " +
+			"never sees")
+	}
+
+	// The failed emit consumed no sequence: the next successful emit starts at 1.
+	w := &authnCollectWriter{}
+	sink2 := NewChainSink(clk, w, "control")
+	if err := sink2.EmitAuthn(context.Background(), testAuthnLogon()); err != nil {
+		t.Fatalf("emit: %v", err)
+	}
+	if w.envelopes[0].Sequence != 1 {
+		t.Errorf("first envelope carries sequence %d, want 1", w.envelopes[0].Sequence)
+	}
+}
+
+// authnFaultWriter always refuses.
+type authnFaultWriter struct{}
+
+func (authnFaultWriter) Write(context.Context, ChainEnvelope) error {
+	return context.DeadlineExceeded
+}
+
 // TestExistingEventsCarryNoAuthnKeys keeps the pre-existing event kinds
 // byte-identical: every new field is omitempty, so the chain hash of every
 // already-shipped record shape is unchanged. This is the same discipline
