@@ -58,7 +58,7 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 			writeCreateError(w, err)
 			return
 		}
-		writeJSON(w, http.StatusCreated, sessionResponse{Key: row.Key, State: int(row.State)})
+		writeJSON(w, http.StatusCreated, sessionResponse{SessionKey: row.Key, State: sessionStateWire(row.State)})
 	})
 
 	// Method-scoped so the literal /v1alpha/sessions/destroy segment is more
@@ -386,9 +386,31 @@ type resumeAllBody struct {
 // sessionResponse is the minimal create success body: the host-derived key and the
 // numeric lifecycle state. The container name is intentionally omitted — it is
 // recorded data, never returned as addressable authority.
+// sessionResponse is the wire shape of the frozen SessionHandle
+// (operator-rest.openapi.yaml). The field names and the state's string enum are
+// the contract's, not a convenience: a client generated from the document reads
+// session_key and validates state against [reserved, active, released], so a
+// numeric state or a `key` field is a response it rejects outright. ADR-0040
+// binds this struct to that schema in CI.
 type sessionResponse struct {
-	Key   string `json:"key"`
-	State int    `json:"state"`
+	SessionKey string `json:"session_key"`
+	State      string `json:"state"`
+}
+
+// sessionStateWire maps a store state onto the contract's enum. The default is
+// deliberately absent: a state added to the store without a wire name fails the
+// contract-binding test rather than silently serializing as the empty string,
+// which a conforming client would reject with no indication of why.
+func sessionStateWire(s state.SessionState) string {
+	switch s {
+	case state.StateReserved:
+		return "reserved"
+	case state.StateActive:
+		return "active"
+	case state.StateReleased:
+		return "released"
+	}
+	return ""
 }
 
 // mcpKeyCreateBody is the mcp-key create request. Tenant and Deployment are the
@@ -465,11 +487,59 @@ func writeDecodeError(w http.ResponseWriter, err error) {
 	writeStatus(w, http.StatusBadRequest, "invalid request body")
 }
 
-// writeStatus writes a plain-text status line with the given code.
+// boundedReason is the frozen deny envelope (operator-rest.openapi.yaml). Every
+// non-2xx response the contract declares refs the Denied response, which carries
+// this shape as application/json — so a refusal written as a text line is one a
+// conforming client cannot read the reason from (NFR-SEC-51).
+type boundedReason struct {
+	ReasonCode string `json:"reason_code"`
+	Message    string `json:"message,omitempty"`
+}
+
+// reasonCodeFor derives the contract's reason_code from the HTTP status. The
+// contract constrains it to ^[A-Z][A-Z0-9_]{1,63}$ and the status is the one
+// classification every refusal already carries, so deriving keeps the code
+// stable without threading a second vocabulary through 30 call sites.
+func reasonCodeFor(code int) string {
+	switch code {
+	case http.StatusBadRequest:
+		return "INVALID_ARGUMENT"
+	case http.StatusUnauthorized:
+		return "UNAUTHENTICATED"
+	case http.StatusForbidden:
+		return "PERMISSION_DENIED"
+	case http.StatusNotFound:
+		return "NOT_FOUND"
+	case http.StatusConflict:
+		return "CONFLICT"
+	case http.StatusServiceUnavailable:
+		return "UNAVAILABLE"
+	}
+	return "INTERNAL"
+}
+
+// writeStatus writes a status line. A 2xx keeps the plain-text body the
+// contract leaves without declared content; anything else is a refusal and
+// carries the BoundedReason envelope the Denied response declares.
+//
+// The split is the contract's, not a convenience: several success operations
+// declare no response content at all, so wrapping those in an envelope would
+// invent a body the document does not describe — the same class of divergence
+// this change removes on the deny side.
 func writeStatus(w http.ResponseWriter, code int, msg string) {
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(code)
-	_, _ = w.Write([]byte(msg))
+	if code < 400 {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(code)
+		_, _ = w.Write([]byte(msg))
+		return
+	}
+	// The message is bounded to the contract's maxLength rather than truncated
+	// silently at the client: an over-long reason is a schema violation, and the
+	// cut happens where the limit is known.
+	if len(msg) > 256 {
+		msg = msg[:256]
+	}
+	writeJSON(w, code, boundedReason{ReasonCode: reasonCodeFor(code), Message: msg})
 }
 
 // writeJSON writes v as a JSON body with the given code.
