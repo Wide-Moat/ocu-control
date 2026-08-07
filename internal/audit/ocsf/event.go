@@ -15,11 +15,13 @@
 // ocsf, so the leaf property holds: a layer that only needs the AuditSink contract
 // never drags the OCSF mapping into its import graph.
 //
-// The OCSF class chosen for control-plane actions is "API Activity" (class_uid 6003)
-// from the Application Activity (6) category of the public OCSF v1.x schema. The
-// class is referenced by its numeric uid here, never by inlining vendor schema text
-// — the same $ref discipline the audit-fanin AsyncAPI uses to reference the OCSF
-// event class rather than copying it.
+// The OCSF class follows what the record IS (ADR-0044): changes to an entity this
+// plane manages are Entity Management (class_uid 3004), and the executed tool call
+// is API Activity (6003). Each event carries its own class's required object — an
+// entity for 3004, an api for 6003 — so the record's discriminator is a
+// schema-defined field rather than a metadata.unmapped entry. Classes are
+// referenced by numeric uid, never by inlining vendor schema text — the same $ref
+// discipline the audit-fanin AsyncAPI uses.
 package ocsf
 
 import (
@@ -31,10 +33,21 @@ import (
 
 const (
 	// classUIDAPIActivity is the OCSF v1.x "API Activity" class uid (Application
-	// Activity category 6, class 003 → 6003). Every control-plane privileged action
-	// maps onto this single class; the specific verb is carried in activity_id. The
-	// uid is the public-schema reference (by id, never by inlined text).
+	// Activity category 6, class 003 → 6003). It carries the executed tool call,
+	// the one API-shaped record this plane emits; the operation rides the class's
+	// own api object. The uid is the public-schema reference (by id, never by
+	// inlined text).
 	classUIDAPIActivity uint32 = 6003
+
+	// classUIDEntityManagement is the OCSF v1.x "Entity Management" class uid
+	// (Identity & Access Management category 3, class 004 -> 3004). It carries
+	// changes to a managed entity, which is what every control-plane record
+	// except the executed tool call is (ADR-0044).
+	classUIDEntityManagement uint32 = 3004
+
+	// categoryUIDIdentityAndAccess is the OCSF category uid (3) the Entity
+	// Management class belongs to.
+	categoryUIDIdentityAndAccess uint32 = 3
 
 	// categoryUIDApplicationActivity is the OCSF category uid (6) the API Activity
 	// class belongs to. It is the category_uid field on every emitted event.
@@ -110,6 +123,21 @@ type Product struct {
 	Name string `json:"name"`
 }
 
+// API is the OCSF api object an API Activity (6003) event carries. The operation
+// is the class's primary discriminator; an event of this class without it leaves
+// the verb in metadata.unmapped, where no schema promises anything.
+type API struct {
+	Operation string `json:"operation"`
+}
+
+// Entity is the OCSF entity object an Entity Management (3004) event carries. The
+// type says WHICH kind of thing changed (denylist, quota, session...), so a
+// detection keys on a schema-defined field rather than parsing unmapped.
+type Entity struct {
+	Type string `json:"type"`
+	UID  string `json:"uid,omitempty"`
+}
+
 // Unmapped carries the control-plane fields that have no first-class OCSF slot: the
 // action label, the operator-supplied reason text, and — on a destroy record only —
 // the teardown revoke outcome. Reason is free-form trail context, never part of any
@@ -159,6 +187,8 @@ type OCSFEvent struct {
 	StatusID     uint8    `json:"status_id"`
 	Status       string   `json:"status"`
 	SeverityID   uint8    `json:"severity_id"`
+	API          *API     `json:"api,omitempty"`
+	Entity       *Entity  `json:"entity,omitempty"`
 	Actor        Actor    `json:"actor"`
 	Metadata     Metadata `json:"metadata"`
 	// ChainBreak is present ONLY on a system-emitted chain-break marker (a daemon
@@ -284,16 +314,81 @@ func statusName(id uint8) string {
 // actor is the host-attested identity copied straight from the Record; no field is
 // ever populated from a body hint, and no field is a token. The sequence and chain
 // link are NOT set here — they are the sink's out-of-band ChainEnvelope.
+// classFor picks the OCSF class from what the record IS (ADR-0044).
+//
+// Everything the control plane audits except the executed tool call is a change
+// to an entity this plane manages — the session, the denylist, the quota, the
+// retention policy, the API key — which is Entity Management. The executed tool
+// call is the one genuinely API-shaped record and stays API Activity.
+//
+// A new action has to answer this question rather than inherit a class, which
+// is the whole point: every record used to be API Activity, including records
+// that are not API activity at all.
+func classFor(a audit.Action) uint32 {
+	if a == audit.ActionExec {
+		return classUIDAPIActivity
+	}
+	return classUIDEntityManagement
+}
+
+// categoryFor returns the OCSF category the class belongs to. The category is
+// not free-standing — a mismatched pair describes an event in no schema — so it
+// is derived here rather than set alongside the class at each call site.
+func categoryFor(class uint32) uint32 {
+	switch class {
+	case classUIDAPIActivity:
+		return categoryUIDApplicationActivity
+	case classUIDEntityManagement:
+		return categoryUIDIdentityAndAccess
+	}
+	// An unmapped class would otherwise emit category 0, which reads as a valid
+	// OCSF category rather than as an error. Derive it from the uid instead: the
+	// class uid is category*1000 + class, by OCSF construction.
+	return class / 1000
+}
+
+// entityTypeFor names the entity a 3004 record acts on. It is what discriminates
+// a denylist edit from a quota override inside the class, so a detection can key
+// on it instead of parsing metadata.unmapped.
+func entityTypeFor(a audit.Action) string {
+	switch a {
+	case audit.ActionEditDenylist:
+		return "denylist"
+	case audit.ActionOverrideQuota:
+		return "quota"
+	case audit.ActionRetentionPolicy:
+		return "retention_policy"
+	case audit.ActionMCPKeyCreate, audit.ActionMCPKeyRevoke:
+		return "mcp_api_key"
+	}
+	// The remaining 3004 actions all act on a session: create, destroy, resume,
+	// reclaim, refused-create, and the two revokes (which terminate sessions).
+	return "session"
+}
+
 func buildEvent(clk state.Clock, rec audit.Record) OCSFEvent {
 	now := clk.Now()
 	activityID, activityName := activityFor(rec.Action)
-	typeUID := uint64(classUIDAPIActivity)*100 + uint64(activityID)
+	class := classFor(rec.Action)
+	typeUID := uint64(class)*100 + uint64(activityID)
 	sid := statusFor(rec.Action)
 
+	var api *API
+	var entity *Entity
+	if class == classUIDAPIActivity {
+		// OCSF carries the operation here. Without it the verb has nowhere to go
+		// but metadata.unmapped, and the event is not conformant to its own class.
+		api = &API{Operation: rec.Action.String()}
+	} else {
+		entity = &Entity{Type: entityTypeFor(rec.Action), UID: rec.Key}
+	}
+
 	return OCSFEvent{
-		ClassUID:     classUIDAPIActivity,
-		CategoryUID:  categoryUIDApplicationActivity,
+		ClassUID:     class,
+		CategoryUID:  categoryFor(class),
 		TypeUID:      typeUID,
+		API:          api,
+		Entity:       entity,
 		ActivityID:   activityID,
 		ActivityName: activityName,
 		Time:         now.UnixMilli(),
