@@ -33,13 +33,16 @@ func TestBuildEventMapsRecordFaithfully(t *testing.T) {
 
 	ev := buildEvent(clk, rec)
 
-	if ev.ClassUID != classUIDAPIActivity {
-		t.Fatalf("class_uid = %d, want %d", ev.ClassUID, classUIDAPIActivity)
+	// A session create is a change to an entity the control plane manages, so it
+	// is Entity Management (ADR-0044). It used to be API Activity, along with
+	// every other record this source emits.
+	if ev.ClassUID != classUIDEntityManagement {
+		t.Fatalf("class_uid = %d, want %d", ev.ClassUID, classUIDEntityManagement)
 	}
-	if ev.CategoryUID != categoryUIDApplicationActivity {
-		t.Fatalf("category_uid = %d, want %d", ev.CategoryUID, categoryUIDApplicationActivity)
+	if ev.CategoryUID != categoryUIDIdentityAndAccess {
+		t.Fatalf("category_uid = %d, want %d", ev.CategoryUID, categoryUIDIdentityAndAccess)
 	}
-	wantType := uint64(classUIDAPIActivity)*100 + uint64(activityCreate)
+	wantType := uint64(classUIDEntityManagement)*100 + uint64(activityCreate)
 	if ev.TypeUID != wantType {
 		t.Fatalf("type_uid = %d, want %d (class*100+activity)", ev.TypeUID, wantType)
 	}
@@ -194,9 +197,9 @@ func TestBuildEventRejectionHasFailureStatus(t *testing.T) {
 	if ev.ActivityName != "create_rejected" {
 		t.Fatalf("activity_name = %q, want create_rejected", ev.ActivityName)
 	}
-	wantType := uint64(classUIDAPIActivity)*100 + uint64(activityOther)
+	wantType := uint64(classUIDEntityManagement)*100 + uint64(activityOther)
 	if ev.TypeUID != wantType {
-		t.Fatalf("type_uid = %d, want %d (class*100+Other = 600399)", ev.TypeUID, wantType)
+		t.Fatalf("type_uid = %d, want %d (class*100+Other)", ev.TypeUID, wantType)
 	}
 	if ev.Actor.User.Name != "op" || ev.Actor.User.UIDAlt != "t9" {
 		t.Fatalf("actor.user = %+v, want {op t9} (host-attested, non-blank)", ev.Actor.User)
