@@ -49,6 +49,7 @@ type config struct {
 	egressNetwork   string        // OPTIONAL docker network a storage-scoped guest joins to reach the egress edge; unset keeps every session on its per-session Internal bridge
 	edgeHost        string        // OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (gVisor cannot reach docker embedded DNS); unset adds no entry
 	auditSink       string        // OCSF audit fan-in sink
+	auditColdDir    string        // OPTIONAL directory sealed audit segments rotate into (NFR-COMP-01 hot->cold); unset = no rotation
 	stateDSN        string        // Postgres DSN for durable state; empty selects the in-memory store
 	jwksPath        string        // OPTIONAL path to the static JWKS artifact the deploy layer serves at the egress edge's remote_jwks URI
 	mcpKeysetPath   string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
@@ -143,6 +144,10 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.egressNetwork, "egress-network", "", "OPTIONAL docker network a storage-scoped guest joins to reach the egress edge (edge is multi-homed onto it); unset keeps every session on its per-session Internal deny-all bridge")
 	fs.StringVar(&cfg.edgeHost, "edge-host", "", "OPTIONAL IP the storage guest's static `edge` ExtraHosts entry resolves to (a gVisor guest cannot use docker's embedded DNS at 127.0.0.11); unset adds no entry")
 	fs.StringVar(&cfg.auditSink, "audit-sink", "", "OCSF audit fan-in sink (required)")
+	fs.StringVar(&cfg.auditColdDir, "audit-cold-dir", "",
+		"OPTIONAL directory sealed audit segments rotate into once they outlive the 90d hot tier "+
+			"(NFR-COMP-01). Unset disables rotation: a deployment that names no cold tier has nowhere "+
+			"to put a segment. The WORM substrate is the customer's; this names where OCU writes.")
 	fs.StringVar(&cfg.stateDSN, "state-dsn", "", "Postgres DSN for durable state; empty selects the in-memory store (minimal shelf)")
 	fs.StringVar(&cfg.jwksPath, "jwks-path", "",
 		"OPTIONAL path to write the static JWKS artifact the deploy layer serves at the "+

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/Wide-Moat/ocu-control/internal/audit/retention"
 	"github.com/Wide-Moat/ocu-control/internal/mcpkeyset"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
@@ -138,7 +139,7 @@ func Test_buildMCPKeyEngine_NoFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink, retention.Result{})
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
@@ -179,7 +180,7 @@ func Test_buildMCPKeyEngine_LoosePermAbortsBoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink, retention.Result{})
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
@@ -213,7 +214,7 @@ func Test_buildMCPKeyEngine_AbsentFileIsCleanStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink, retention.Result{})
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
@@ -260,7 +261,7 @@ func Test_buildMCPKeyEngine_LoadsExistingEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink)
+	sink, err := buildResumedChainSink(context.Background(), clk, aw, cfg.auditSink, retention.Result{})
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
