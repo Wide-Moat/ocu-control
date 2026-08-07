@@ -19,8 +19,8 @@
 #   BASE_REF defaults to origin/main; in CI the workflow passes the PR base.
 #
 # Detection (any one present switches the gate from skip to enforce):
-#   - a buf module:           buf.yaml | buf.gen.yaml  (proto surface → buf breaking)
-#   - an OpenAPI surface:     contracts/operator/openapi.yaml (→ oasdiff breaking)
+#   - a buf module:           any tracked buf.yaml | buf.gen.yaml (proto surface → buf breaking)
+#   - an OpenAPI surface:     any tracked contracts/**/*.openapi.yaml (→ oasdiff breaking)
 #
 # When a surface IS present the gate runs the matching breaking-change tool against
 # BASE_REF and FAILS on a breaking delta that is not accompanied by a MAJOR bump.
@@ -35,21 +35,30 @@ err() { echo "::error::rpc-version-check: $*"; }
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 cd "$ROOT" || { err "cannot cd to repo root"; exit 2; }
 
+# Detection walks the tree rather than naming one blessed path. The original
+# probed `buf.yaml` at the repo root and `contracts/operator/openapi.yaml`; the
+# contracts landed at `contracts/proto/buf.yaml` and `contracts/openapi/*.yaml`,
+# so the gate reported "no wire surface present yet" with three diffable
+# surfaces committed beside it — a green that measured nothing. Globbing means a
+# surface cannot hide by sitting one directory over.
 BUF_MODULE=""
-for f in buf.yaml buf.gen.yaml; do
-  if [ -f "$f" ]; then BUF_MODULE="$f"; break; fi
-done
+while IFS= read -r f; do
+  BUF_MODULE="$f"
+  break
+done < <(git ls-files 'buf.yaml' 'buf.gen.yaml' '*/buf.yaml' '*/buf.gen.yaml' 2>/dev/null)
 
-OPENAPI_SURFACE=""
-if [ -f "contracts/operator/openapi.yaml" ]; then
-  OPENAPI_SURFACE="contracts/operator/openapi.yaml"
-fi
+# redocly.yaml is tooling config, not a wire surface; oasdiff would fail on it.
+OPENAPI_SURFACES=()
+while IFS= read -r f; do
+  case "$(basename "$f")" in redocly.yaml) continue ;; esac
+  OPENAPI_SURFACES+=("$f")
+done < <(git ls-files 'contracts/**/*.openapi.yaml' 'contracts/**/openapi.yaml' 2>/dev/null)
 
-if [ -z "$BUF_MODULE" ] && [ -z "$OPENAPI_SURFACE" ]; then
+if [ -z "$BUF_MODULE" ] && [ "${#OPENAPI_SURFACES[@]}" -eq 0 ]; then
   note "no operator proto/OpenAPI wire surface present yet (deferred follow-up #205)."
   note "the v1 wire surface is the frozen JSON-Schema contracts under contracts/; there is"
   note "nothing for buf/oasdiff to breaking-diff. SKIPPING (no-op-until-schemas), exit 0."
-  note "this gate begins enforcing automatically when buf.yaml or contracts/operator/openapi.yaml lands."
+  note "this gate begins enforcing automatically when a buf module or a *.openapi.yaml lands."
   exit 0
 fi
 
@@ -68,23 +77,28 @@ if [ -n "$BUF_MODULE" ]; then
   fi
 fi
 
-if [ -n "$OPENAPI_SURFACE" ]; then
+if [ "${#OPENAPI_SURFACES[@]}" -gt 0 ]; then
   if ! command -v oasdiff >/dev/null 2>&1; then
-    err "OpenAPI surface $OPENAPI_SURFACE present but the oasdiff CLI is not installed in CI."
+    err "OpenAPI surface(s) ${OPENAPI_SURFACES[*]} present but the oasdiff CLI is not installed in CI."
     exit 2
   fi
-  note "OpenAPI surface detected ($OPENAPI_SURFACE); running oasdiff breaking against $BASE_REF."
-  BASE_TMP="$(mktemp)"
-  if git show "$BASE_REF:$OPENAPI_SURFACE" >"$BASE_TMP" 2>/dev/null; then
-    if ! oasdiff breaking "$BASE_TMP" "$OPENAPI_SURFACE" --fail-on ERR; then
-      err "oasdiff detected a BREAKING change to the OpenAPI RPC surface against $BASE_REF."
-      err "a breaking change requires a MAJOR version bump + a deprecation header (NFR-IC-04)."
-      rc=1
+  note "OpenAPI surfaces detected (${#OPENAPI_SURFACES[@]}); running oasdiff breaking against $BASE_REF."
+  # EVERY surface is diffed, not the first one found: a repo with two contracts
+  # would otherwise leave the second unguarded while the gate still reported a
+  # pass, which is the same shape of green this fix removes.
+  for surface in "${OPENAPI_SURFACES[@]}"; do
+    BASE_TMP="$(mktemp)"
+    if git show "$BASE_REF:$surface" >"$BASE_TMP" 2>/dev/null; then
+      if ! oasdiff breaking "$BASE_TMP" "$surface" --fail-on ERR; then
+        err "oasdiff detected a BREAKING change to $surface against $BASE_REF."
+        err "a breaking change requires a MAJOR version bump + a deprecation header (NFR-IC-04)."
+        rc=1
+      fi
+    else
+      note "$surface is new at this ref (no base to diff); first introduction is not a breaking change."
     fi
-  else
-    note "$OPENAPI_SURFACE is new at this ref (no base to diff); first introduction is not a breaking change."
-  fi
-  rm -f "$BASE_TMP"
+    rm -f "$BASE_TMP"
+  done
 fi
 
 if [ "$rc" -eq 0 ]; then
