@@ -138,6 +138,18 @@ type Entity struct {
 	UID  string `json:"uid,omitempty"`
 }
 
+// Service is the OCSF service object naming the authenticating service — the
+// at_least_one(service, dst_endpoint) half a socket transport can satisfy.
+type Service struct {
+	Name string `json:"name"`
+}
+
+// Certificate is the OCSF certificate sub-object for an mTLS logon, named by
+// its verified SAN. It never carries key material.
+type Certificate struct {
+	SubjectAltName string `json:"subject_alt_name"`
+}
+
 // Unmapped carries the control-plane fields that have no first-class OCSF slot: the
 // action label, the operator-supplied reason text, and — on a destroy record only —
 // the teardown revoke outcome. Reason is free-form trail context, never part of any
@@ -177,20 +189,26 @@ type Metadata struct {
 // contract that keeps sequence + chain metadata out-of-band from the OCSF $ref
 // payload.
 type OCSFEvent struct {
-	ClassUID     uint32   `json:"class_uid"`
-	CategoryUID  uint32   `json:"category_uid"`
-	TypeUID      uint64   `json:"type_uid"`
-	ActivityID   uint8    `json:"activity_id"`
-	ActivityName string   `json:"activity_name"`
-	Time         int64    `json:"time"`
-	TimeDT       string   `json:"time_dt"`
-	StatusID     uint8    `json:"status_id"`
-	Status       string   `json:"status"`
-	SeverityID   uint8    `json:"severity_id"`
-	API          *API     `json:"api,omitempty"`
-	Entity       *Entity  `json:"entity,omitempty"`
-	Actor        Actor    `json:"actor"`
-	Metadata     Metadata `json:"metadata"`
+	ClassUID     uint32       `json:"class_uid"`
+	CategoryUID  uint32       `json:"category_uid"`
+	TypeUID      uint64       `json:"type_uid"`
+	ActivityID   uint8        `json:"activity_id"`
+	ActivityName string       `json:"activity_name"`
+	Time         int64        `json:"time"`
+	TimeDT       string       `json:"time_dt"`
+	StatusID     uint8        `json:"status_id"`
+	Status       string       `json:"status"`
+	SeverityID   uint8        `json:"severity_id"`
+	API          *API         `json:"api,omitempty"`
+	Entity       *Entity      `json:"entity,omitempty"`
+	StatusDetail string       `json:"status_detail,omitempty"`
+	User         *User        `json:"user,omitempty"`
+	Service      *Service     `json:"service,omitempty"`
+	LogonTypeID  uint8        `json:"logon_type_id,omitempty"`
+	AuthProtocol string       `json:"auth_protocol,omitempty"`
+	Certificate  *Certificate `json:"certificate,omitempty"`
+	Actor        Actor        `json:"actor"`
+	Metadata     Metadata     `json:"metadata"`
 	// ChainBreak is present ONLY on a system-emitted chain-break marker (a daemon
 	// start whose resume tip was unreadable). It is a pointer with omitempty so a
 	// normal privileged-action event omits it ENTIRELY — the field adds no bytes to
