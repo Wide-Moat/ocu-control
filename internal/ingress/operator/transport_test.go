@@ -248,7 +248,7 @@ func TestOperatorTransportCreateThenDestroy(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("create over the wire = %d; want 201", code)
 	}
-	if body["key"] == nil || body["key"].(string) == "" {
+	if body["session_key"] == nil || body["session_key"].(string) == "" {
 		t.Fatalf("create response missing host-derived key: %v", body)
 	}
 
@@ -320,7 +320,7 @@ func TestOperatorTransportRevokeOneAndAll(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("create = %d; want 201", code)
 	}
-	key, _ := body["key"].(string)
+	key, _ := body["session_key"].(string)
 	if key == "" {
 		t.Fatalf("create response missing key: %v", body)
 	}
@@ -509,7 +509,7 @@ func TestOperatorTransportResumeAll(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("create after resume/all = %d; want 201", code)
 	}
-	if body["key"] == nil || body["key"].(string) == "" {
+	if body["session_key"] == nil || body["session_key"].(string) == "" {
 		t.Fatalf("create-after-resume response missing host-derived key: %v", body)
 	}
 }

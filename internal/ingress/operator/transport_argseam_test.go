@@ -129,7 +129,7 @@ func TestOperatorTransportRevokeOneDeniesTheAddressedKey(t *testing.T) {
 	if code != http.StatusCreated {
 		t.Fatalf("create = %d; want 201", code)
 	}
-	key, _ := body["key"].(string)
+	key, _ := body["session_key"].(string)
 	if key == "" {
 		t.Fatalf("create response missing key: %v", body)
 	}
