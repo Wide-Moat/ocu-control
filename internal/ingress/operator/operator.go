@@ -40,6 +40,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
@@ -73,6 +74,16 @@ type Deps struct {
 	// Verifier gates the SOAR channel (verify-then-mint). When nil the SOAR path
 	// refuses fail-closed (no verifier configured).
 	Verifier killswitch.SOARVerifier
+	// SOARReplayWindow is the issued_at acceptance window either side of host
+	// time (ADR-0039). A revoke outside it, or one whose signature was already
+	// presented inside it, is refused. Zero selects the contract's
+	// x-ocu-anti-replay-window-seconds-default of 300s; it is a deployment
+	// tunable because it trades tolerance for peer clock skew against how long a
+	// captured revoke stays presentable.
+	SOARReplayWindow time.Duration
+	// Clock stamps the replay window. Defaults to the real clock; tests inject a
+	// fake so a window can be crossed without sleeping.
+	Clock state.Clock
 	// Seam is the single operator capability this adapter holds. cmd mints exactly
 	// one OperatorSeam and hands it here alone; the gateway adapter is given none.
 	Seam ingress.OperatorSeam
@@ -116,6 +127,7 @@ type Handlers struct {
 	mcpKeyEngine *mcpkey.Engine
 	resolver     ingress.IdentityResolver
 	verifier     killswitch.SOARVerifier
+	replay       *replayGuard
 	seam         ingress.OperatorSeam
 }
 
@@ -128,11 +140,23 @@ func NewHandlers(deps Deps) *Handlers {
 	if resolver == nil {
 		resolver = NewPeerCredResolver(nil)
 	}
+	// The contract's x-ocu-anti-replay-window-seconds-default. A deployment that
+	// says nothing gets the documented default rather than a zero window, which
+	// would refuse every revoke whose issued_at is not the host's exact instant.
+	window := deps.SOARReplayWindow
+	if window <= 0 {
+		window = defaultSOARReplayWindow
+	}
+	clock := deps.Clock
+	if clock == nil {
+		clock = state.SystemClock()
+	}
 	return &Handlers{
 		manager:      deps.Manager,
 		engine:       deps.Engine,
 		mcpKeyEngine: deps.MCPKeyEngine,
 		resolver:     resolver,
+		replay:       newReplayGuard(clock, window),
 		verifier:     deps.Verifier,
 		seam:         deps.Seam,
 	}

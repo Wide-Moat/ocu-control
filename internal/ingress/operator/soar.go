@@ -30,6 +30,36 @@ import (
 // The seam is the single OperatorSeam this operator adapter holds: only a holder
 // of the seam can mint, so the mint path lives here, behind the verify, and
 // nowhere a gateway-shaped caller could reach it.
+// verifyThenAdmit runs the SOAR trust gate in the one order that is safe
+// (ADR-0039): the signature is verified FIRST, and only a verified issuance is
+// offered to the replay guard.
+//
+// The order is the whole point. If an unverified issuance could enter the seen
+// set, anyone able to reach the operator socket would present a forged
+// signature carrying a future-dated issued_at, poison the cache, and have the
+// legitimate revoke that follows refused as a replay — a denial of service on
+// the kill path, mounted without holding any key. So a refused verify leaves no
+// trace, and the guard only ever remembers calls that were authentic.
+//
+// The window refusal is likewise decided after the signature check: deciding it
+// first would let an unauthenticated caller probe the host's clock skew by
+// reading which error came back.
+func verifyThenAdmit(ctx context.Context, verifier killswitch.SOARVerifier, guard *replayGuard, issuedAt string, payload, sig []byte) error {
+	if verifier == nil {
+		return fmt.Errorf("%w: no SOAR verifier configured", killswitch.ErrSOARUnverified)
+	}
+	if _, err := verifier.Verify(ctx, payload, sig); err != nil {
+		return fmt.Errorf("soar verify: %w", err)
+	}
+	if guard == nil {
+		// No guard wired: a revoke would be replayable for the life of its
+		// window, so it is refused rather than served without the protection the
+		// contract's 409 promises.
+		return fmt.Errorf("%w: no replay guard configured", killswitch.ErrSOARUnverified)
+	}
+	return guard.admit(issuedAt, sig)
+}
+
 func verifyThenMint(ctx context.Context, verifier killswitch.SOARVerifier, seam ingress.OperatorSeam, payload, sig []byte) (ingress.OperatorScope, error) {
 	if verifier == nil {
 		// No verifier wired: a SOAR webhook cannot be trusted, so it is refused
