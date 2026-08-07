@@ -12,6 +12,7 @@ import (
 
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
+	"github.com/Wide-Moat/ocu-control/internal/audit/retention"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
@@ -83,7 +84,7 @@ func bootEmit(t *testing.T, path string, n int) {
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
-	sink, err := buildResumedChainSink(context.Background(), state.SystemClock(), w, path)
+	sink, err := buildResumedChainSink(context.Background(), state.SystemClock(), w, path, retention.Result{})
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
@@ -140,7 +141,7 @@ func Test_buildResumedChainSink_DecoupledTailRecordsChainBreak(t *testing.T) {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
 	t.Cleanup(func() { _ = w.Close() })
-	_, err = buildResumedChainSink(context.Background(), state.SystemClock(), w, path)
+	_, err = buildResumedChainSink(context.Background(), state.SystemClock(), w, path, retention.Result{})
 	if err == nil {
 		t.Fatal("buildResumedChainSink over a torn file = nil; a file that already fails the chain must abort the boot")
 	}

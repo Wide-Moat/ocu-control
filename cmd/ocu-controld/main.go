@@ -41,6 +41,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
+	"github.com/Wide-Moat/ocu-control/internal/audit/retention"
 	"github.com/Wide-Moat/ocu-control/internal/boot"
 	"github.com/Wide-Moat/ocu-control/internal/controlrpc"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
@@ -293,6 +294,21 @@ func serve(ctx context.Context, cfg config) error {
 	// loaded further down (boot.New / seq) and gated on the listener-bind hook — no
 	// listener binds before it, and neither the provider nor the audit sink admits a
 	// create.
+	// Hot-to-cold rotation runs BEFORE the writer opens anything (NFR-COMP-01).
+	// In-process is deliberate: RotateSegment is read-then-truncate by path, so
+	// an external process racing the live writer would destroy any envelope
+	// appended between the read and the truncate, after the action was already
+	// acknowledged. It also bounds the file the boot verifier below reads end to
+	// end. -audit-cold-dir unset leaves this a no-op.
+	rotated, err := rotateAuditAtBoot(cfg.auditSink, cfg.auditColdDir, clk.Now())
+	if err != nil {
+		return fmt.Errorf("boot: rotate audit spine: %w", err)
+	}
+	if rotated.Rotated {
+		fmt.Fprintf(os.Stderr, "ocu-controld: audit spine rotated at boot: %d event(s), sequences %d-%d, sealed to %s\n",
+			rotated.Events, rotated.FirstSequence, rotated.LastSequence, rotated.SegmentPath)
+	}
+
 	auditWriter, err := buildAuditWriter(cfg.auditSink)
 	if err != nil {
 		return fmt.Errorf("boot: open audit sink: %w", err)
@@ -307,7 +323,7 @@ func serve(ctx context.Context, cfg config) error {
 	// an explicit chain-break marker before the spine continues; a boot-time verify
 	// aborts if the existing file already fails the chain. All fail-closed at boot,
 	// before any listener binds.
-	sink, err := buildResumedChainSink(ctx, clk, auditWriter, cfg.auditSink)
+	sink, err := buildResumedChainSink(ctx, clk, auditWriter, cfg.auditSink, rotated)
 	if err != nil {
 		return fmt.Errorf("boot: resume audit chain: %w", err)
 	}
@@ -982,7 +998,7 @@ const auditChainSource = "control"
 //   - Before returning, the existing file is verified end-to-end (ValidateChain). A
 //     file that already fails the chain aborts the boot rather than appending onto a
 //     spine known to be broken.
-func buildResumedChainSink(ctx context.Context, clk state.Clock, writer ocsf.EventWriter, path string) (*ocsf.ChainSink, error) {
+func buildResumedChainSink(ctx context.Context, clk state.Clock, writer ocsf.EventWriter, path string, rotated retention.Result) (*ocsf.ChainSink, error) {
 	// The non-durable opt-out has no on-disk spine: start fresh at genesis.
 	if auditSinkNone[strings.ToLower(path)] {
 		return ocsf.NewChainSink(clk, writer, auditChainSource), nil
@@ -994,7 +1010,12 @@ func buildResumedChainSink(ctx context.Context, clk state.Clock, writer ocsf.Eve
 		return nil, err
 	}
 
-	tip, err := ocsf.ReadTip(path)
+	// After a boot rotation the hot file is empty and its own tip reads as a
+	// legitimate genesis; resuming from it would re-anchor the spine — the
+	// rotation would manufacture the chain break it exists to prevent. The tip
+	// then comes from the sealed segment. An unrotated boot reads the hot file
+	// exactly as before.
+	tip, err := resumeTipAfterBootRotation(path, rotated)
 	if errors.Is(err, ocsf.ErrTipDecoupled) {
 		// The tail could not be read as a valid tip. Record the discontinuity as an
 		// explicit chain-break marker, then continue on the new spine. The marker is
