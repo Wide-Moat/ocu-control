@@ -226,6 +226,36 @@ func TestRotationIsNotDeletion(t *testing.T) {
 	}
 }
 
+// TestShouldRotateRefusesAnUnusableSealTime pins the two arms nothing else
+// reaches. sealedAt is derived from the first retained envelope's event time, so
+// both are live inputs rather than defensive padding: a zero value means the hot
+// file held no first envelope, and a future value means the clock or the event
+// metadata is wrong.
+//
+// Both must read as NOT due. Returning true for either would seal a window whose
+// extent is unknown — on the zero value, every window since the epoch.
+func TestShouldRotateRefusesAnUnusableSealTime(t *testing.T) {
+	p, err := NewPolicy(Config{})
+	if err != nil {
+		t.Fatalf("NewPolicy: %v", err)
+	}
+	now := time.Date(2033, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	if p.ShouldRotate(time.Time{}, now) {
+		t.Error("a zero seal time reported as due; the window would span from the " +
+			"epoch and the segment's extent is unknown")
+	}
+	if p.ShouldRotate(now.Add(time.Hour), now) {
+		t.Error("a future seal time reported as due; the elapsed window is negative")
+	}
+
+	// The control: an ordinary elapsed window is still due, so a build that
+	// returned false unconditionally cannot pass this.
+	if !p.ShouldRotate(now.Add(-100*24*time.Hour), now) {
+		t.Error("a 100-day-old segment is not due; the guards refuse everything")
+	}
+}
+
 // TestHotWindowIsConfigurableWithinTheFloor allows a deployment to shorten the
 // hot tier (smaller boot-time validation, earlier cold commit) but never to push
 // it past the floor, which would leave records due for rotation after they were

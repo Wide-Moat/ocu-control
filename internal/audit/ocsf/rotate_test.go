@@ -408,6 +408,231 @@ func TestRotateNeverOverwritesAnExistingSegment(t *testing.T) {
 	}
 }
 
+// TestRotateCompletesAfterACrashBetweenSealAndTruncate is the crash-idempotence
+// property. RotateSegment is deliberately create-then-truncate, so there is a
+// window where the segment is durable and the hot file is not yet empty. A crash
+// there is meant to leave a recoverable duplicate.
+//
+// It was not recoverable: the retry recomputed the SAME first-last segment name,
+// O_EXCL returned EEXIST, and the boot path that will call this fails closed —
+// so the daemon aborted on every boot until an operator hand-removed a file from
+// the cold tier. Wiring rotation into boot without this turns one crash into a
+// permanent outage.
+//
+// The retry must complete the interrupted rotation: recognise the existing
+// segment as its own successful output and finish the truncate.
+func TestRotateCompletesAfterACrashBetweenSealAndTruncate(t *testing.T) {
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "audit.ocsf.jsonl")
+	writeSpine(t, hot, 3)
+	cold := filepath.Join(dir, "cold")
+
+	sealed, err := RotateSegment(hot, cold)
+	if err != nil {
+		t.Fatalf("first rotation: %v", err)
+	}
+	sealedBytes, err := os.ReadFile(sealed)
+	if err != nil {
+		t.Fatalf("read sealed: %v", err)
+	}
+
+	// Undo ONLY the truncate: the segment is durable, the hot file still holds
+	// everything. This is the crash window, exactly.
+	if err := os.WriteFile(hot, sealedBytes, 0o600); err != nil {
+		t.Fatalf("restore hot: %v", err)
+	}
+
+	got, err := RotateSegment(hot, cold)
+	if err != nil {
+		t.Fatalf("the retry failed (%v); a crash in the seal window would abort every "+
+			"subsequent boot until an operator cleared the cold tier", err)
+	}
+	if got != sealed {
+		t.Errorf("the retry sealed %q, the interrupted run had already sealed %q", got, sealed)
+	}
+
+	// The hot file must now be empty, and the segment byte-unchanged.
+	hotAfter, err := os.ReadFile(hot)
+	if err != nil {
+		t.Fatalf("read hot after retry: %v", err)
+	}
+	if len(hotAfter) != 0 {
+		t.Errorf("the retry left %d bytes in the hot file; the rotation did not complete",
+			len(hotAfter))
+	}
+	segAfter, err := os.ReadFile(sealed)
+	if err != nil {
+		t.Fatalf("read sealed after retry: %v", err)
+	}
+	if string(segAfter) != string(sealedBytes) {
+		t.Error("the retry rewrote the already-sealed segment")
+	}
+}
+
+// TestRotateResealsAfterACrashDuringTheCopy is the other crash window, and it
+// must resolve the OPPOSITE way. A partial copy is not a completed rotation, so
+// the retry must replace it rather than accept it — the hot file still holds
+// every event, which is what makes re-sealing safe.
+func TestRotateResealsAfterACrashDuringTheCopy(t *testing.T) {
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "audit.ocsf.jsonl")
+	writeSpine(t, hot, 3)
+	cold := filepath.Join(dir, "cold")
+	if err := os.MkdirAll(cold, 0o700); err != nil {
+		t.Fatalf("mkdir cold: %v", err)
+	}
+
+	// A partial copy at the name this range will claim: the first two of three
+	// envelopes, whole lines, exactly as an interrupted io.Copy leaves them.
+	// Truncating mid-line would be a DIFFERENT case — an unreadable file, which
+	// rotation refuses rather than replaces, since it cannot prove such a file is
+	// its own.
+	partial := filepath.Join(cold, "control.00000000000000000001-00000000000000000003.jsonl")
+	whole, err := os.ReadFile(hot)
+	if err != nil {
+		t.Fatalf("read hot: %v", err)
+	}
+	lines := strings.SplitAfter(string(whole), "\n")
+	if len(lines) < 3 {
+		t.Fatalf("hot file holds %d lines, want at least 3", len(lines))
+	}
+	if err := os.WriteFile(partial, []byte(lines[0]+lines[1]), 0o600); err != nil {
+		t.Fatalf("plant partial: %v", err)
+	}
+
+	got, err := RotateSegment(hot, cold)
+	if err != nil {
+		t.Fatalf("the retry failed on a PARTIAL segment (%v); the hot file still held "+
+			"every event, so re-sealing was safe", err)
+	}
+
+	envs, err := ReadChainFile(got)
+	if err != nil {
+		t.Fatalf("read resealed: %v", err)
+	}
+	if len(envs) != 3 {
+		t.Errorf("the resealed segment holds %d events, the hot file held 3", len(envs))
+	}
+}
+
+// TestRotateRefusesAForeignSegment binds the OWNERSHIP half of the partial-copy
+// recovery. A file at the segment path is only replaceable when it is provably
+// this rotation's own interrupted output — a hash-for-hash prefix of what is
+// about to be sealed.
+//
+// Anything else is somebody else's: another run, a restored backup, an
+// operator's copy. Replacing it would delete retained history to resolve a name
+// collision.
+//
+// The fixture is a chain of the SAME length with different hashes. Mutation
+// testing forced that: a shorter foreign file is rejected by the length
+// comparison alone, so only an equal-length one can bind the hash check — and a
+// prefix comparison that ignored hashes passed against the shorter fixture.
+func TestRotateRefusesAForeignSegment(t *testing.T) {
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "audit.ocsf.jsonl")
+	writeSpine(t, hot, 3)
+	cold := filepath.Join(dir, "cold")
+	if err := os.MkdirAll(cold, 0o700); err != nil {
+		t.Fatalf("mkdir cold: %v", err)
+	}
+
+	// A VALID chain of the SAME length, built independently so its hashes differ.
+	// Same length matters: a shorter file is already rejected by the length
+	// comparison alone, so only an equal-length one can bind the hash check.
+	otherDir := t.TempDir()
+	other := filepath.Join(otherDir, "other.ocsf.jsonl")
+	writeSpine(t, other, 3)
+	foreignBytes, err := os.ReadFile(other)
+	if err != nil {
+		t.Fatalf("read foreign: %v", err)
+	}
+	foreign := filepath.Join(cold, "control.00000000000000000001-00000000000000000003.jsonl")
+	if err := os.WriteFile(foreign, foreignBytes, 0o600); err != nil {
+		t.Fatalf("plant foreign: %v", err)
+	}
+
+	// It must genuinely differ, or this test asserts nothing.
+	planted, err := ReadChainFile(foreign)
+	if err != nil {
+		t.Fatalf("the planted file does not parse: %v", err)
+	}
+	sealing, err := ReadChainFile(hot)
+	if err != nil {
+		t.Fatalf("read hot: %v", err)
+	}
+	if planted[0].Hash == sealing[0].Hash {
+		t.Fatal("the planted chain shares the spine's first hash; it is not foreign " +
+			"and this test would pass vacuously")
+	}
+
+	if _, err := RotateSegment(hot, cold); !errors.Is(err, ErrSegmentExists) {
+		t.Errorf("rotating over a FOREIGN segment = %v, want ErrSegmentExists", err)
+	}
+
+	after, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatalf("read foreign after: %v", err)
+	}
+	if string(after) != string(foreignBytes) {
+		t.Error("the foreign segment was replaced; retained history was destroyed to " +
+			"resolve a name collision")
+	}
+
+	// The hot file must still hold everything. Accepting the foreign file as
+	// this run's own output is the silent failure: rotation reports success,
+	// truncates the hot spine, and the events it was sealing exist nowhere —
+	// the archive holds somebody else's segment under their name.
+	remaining, err := ReadChainFile(hot)
+	if err != nil {
+		t.Fatalf("read hot after: %v", err)
+	}
+	if len(remaining) != 3 {
+		t.Errorf("the hot file holds %d events after a refused rotation, want 3; the "+
+			"foreign segment was accepted as this run's output and the real events "+
+			"were truncated away", len(remaining))
+	}
+}
+
+// TestRotateRefusesAShorterForeignSegment is the SHORTER arm of the ownership
+// check, kept alongside the equal-length one because the two bind different
+// halves. Equal-length exercises the hash comparison; shorter exercises the
+// "is it a prefix of ours" test, which a length-only check would skip — and a
+// length-only check deletes another run's segment to make room.
+func TestRotateRefusesAShorterForeignSegment(t *testing.T) {
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "audit.ocsf.jsonl")
+	writeSpine(t, hot, 3)
+	cold := filepath.Join(dir, "cold")
+	if err := os.MkdirAll(cold, 0o700); err != nil {
+		t.Fatalf("mkdir cold: %v", err)
+	}
+
+	otherDir := t.TempDir()
+	other := filepath.Join(otherDir, "other.ocsf.jsonl")
+	writeSpine(t, other, 2)
+	foreignBytes, err := os.ReadFile(other)
+	if err != nil {
+		t.Fatalf("read foreign: %v", err)
+	}
+	foreign := filepath.Join(cold, "control.00000000000000000001-00000000000000000003.jsonl")
+	if err := os.WriteFile(foreign, foreignBytes, 0o600); err != nil {
+		t.Fatalf("plant foreign: %v", err)
+	}
+
+	if _, err := RotateSegment(hot, cold); !errors.Is(err, ErrSegmentExists) {
+		t.Errorf("rotating over a SHORTER foreign segment = %v, want ErrSegmentExists", err)
+	}
+	after, err := os.ReadFile(foreign)
+	if err != nil {
+		t.Fatalf("read foreign after: %v", err)
+	}
+	if string(after) != string(foreignBytes) {
+		t.Error("a shorter foreign segment was deleted to make room; it may be another " +
+			"run's archived output")
+	}
+}
+
 // TestRotatedSegmentIsReadOnly pins the sealed file's mode. A segment is
 // finished; leaving it writable invites an append that no head covers, since
 // the head was computed at seal time.

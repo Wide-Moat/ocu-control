@@ -243,6 +243,52 @@ func TestDriverSurfacesARotationFailure(t *testing.T) {
 	}
 }
 
+// TestDriverRefusesANilPolicy is the programming-error arm. It is cheap to
+// state and the alternative is a nil dereference inside ShouldRotate, which
+// surfaces as a panic in whatever goroutine drives rotation rather than as a
+// refusal the caller can log.
+func TestDriverRefusesANilPolicy(t *testing.T) {
+	dir := t.TempDir()
+	hot := spineAt(t, dir, 2)
+	now := time.Date(2033, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	if _, err := retention.RotateIfDue(nil, hot, filepath.Join(dir, "cold"),
+		now.Add(-100*24*time.Hour), now); err == nil {
+		t.Error("a nil policy was accepted; the next call would dereference it")
+	}
+}
+
+// TestASealedSegmentThatStopsParsingIsDetectable states the property the
+// driver's describe step relies on: a segment whose bytes are damaged after
+// sealing no longer reads as a chain. Without that, RotateIfDue could report a
+// range for a file that is no longer the segment it sealed.
+//
+// It does not drive RotateIfDue's own describe branch — reaching that needs the
+// segment to break between seal and describe, inside one call — so it is stated
+// as what it is rather than dressed up as coverage of that branch.
+func TestASealedSegmentThatStopsParsingIsDetectable(t *testing.T) {
+	dir := t.TempDir()
+	hot := spineAt(t, dir, 3)
+	now := time.Date(2033, 6, 1, 0, 0, 0, 0, time.UTC)
+
+	res, err := retention.RotateIfDue(testPolicy(t), hot, filepath.Join(dir, "cold"),
+		now.Add(-100*24*time.Hour), now)
+	if err != nil || !res.Rotated {
+		t.Fatalf("setup rotation: rotated=%v err=%v", res.Rotated, err)
+	}
+
+	if err := os.Chmod(res.SegmentPath, 0o600); err != nil {
+		t.Fatalf("chmod sealed: %v", err)
+	}
+	if err := os.WriteFile(res.SegmentPath, []byte("not json\n"), 0o600); err != nil {
+		t.Fatalf("corrupt sealed: %v", err)
+	}
+	if _, err := ocsf.ReadChainFile(res.SegmentPath); err == nil {
+		t.Error("a damaged segment still parses as a chain; the describe step would " +
+			"report a range for a file that is no longer what was sealed")
+	}
+}
+
 // TestDriverRefusesAFutureSealTime fails closed on a clock anomaly, matching
 // MayDelete. A seal time ahead of now makes the window negative, and treating
 // that as "not due" would silently stop rotating.

@@ -32,6 +32,11 @@ import (
 // twice would file a witness of nothing.
 var ErrNothingToRotate = errors.New("ocsf: hot file holds no events to rotate")
 
+// ErrSegmentExists refuses a rotation whose target name is occupied by a file
+// this run did not write. Deleting it to make room would destroy retained
+// history to resolve a name collision.
+var ErrSegmentExists = errors.New("ocsf: a foreign file occupies the segment path")
+
 // RotateSegment seals the hot file at path into a segment under coldDir and
 // leaves path empty and resumable. It returns the sealed segment's path.
 //
@@ -65,6 +70,32 @@ func RotateSegment(path, coldDir string) (string, error) {
 	first, last := envs[0].Sequence, envs[len(envs)-1].Sequence
 	sealed := filepath.Join(coldDir,
 		fmt.Sprintf("%s.%020d-%020d.jsonl", envs[0].Source, first, last))
+
+	// A file already at this name is the debris of an interrupted run: the
+	// sealing is create-then-truncate, so a crash between the two leaves a
+	// segment and an untruncated hot file. Refusing here would turn one crash
+	// into a permanent outage, because the retry recomputes the same name and
+	// the boot path that calls this fails closed.
+	//
+	// The two crash windows are distinguishable and resolve oppositely. A
+	// COMPLETE segment means the previous run sealed successfully and only the
+	// truncate is missing: finish it. A partial or invalid one is a crash during
+	// the copy: replace it, which is safe precisely because the hot file still
+	// holds every event.
+	switch resumable, err := inspectExistingSegment(sealed, envs); {
+	case err != nil:
+		return "", err
+	case resumable:
+		// Already sealed and verified by the interrupted run. Re-apply the two
+		// steps that follow it; both are idempotent.
+		if err := os.Chmod(sealed, 0o400); err != nil {
+			return "", fmt.Errorf("seal segment %q read-only: %w", sealed, err)
+		}
+		if err := os.Truncate(path, 0); err != nil {
+			return "", fmt.Errorf("truncate hot file %q: %w", path, err)
+		}
+		return sealed, nil
+	}
 
 	if err := copyAndSync(path, sealed); err != nil {
 		return "", err
@@ -105,6 +136,70 @@ func RotateSegment(path, coldDir string) (string, error) {
 		return "", fmt.Errorf("truncate hot file %q: %w", path, err)
 	}
 	return sealed, nil
+}
+
+// inspectExistingSegment classifies a file already sitting at the segment path.
+//
+// resumable=true means that file IS this rotation's own output: a valid chain
+// carrying exactly the envelopes about to be sealed. The interrupted run got as
+// far as a durable, verified copy, so the retry finishes rather than repeats it.
+//
+// Anything else is refused, not deleted. An unrecognised file under the archive
+// path may be another run's output, a restored backup, or an operator's copy;
+// removing it to make room would destroy retained history to resolve a name
+// collision. The one exception is a PREFIX of what we are about to write — a
+// crash partway through this same copy, which is provably ours and provably
+// incomplete.
+//
+// A missing file is the ordinary case: resumable=false, no error.
+func inspectExistingSegment(sealed string, envs []ChainEnvelope) (bool, error) {
+	if _, err := os.Stat(sealed); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("stat existing segment %q: %w", sealed, err)
+	}
+
+	existing, err := ReadChainFile(sealed)
+	if err != nil {
+		// Not a chain at all. It is not ours to interpret, let alone remove.
+		return false, fmt.Errorf("%w: a file at %q is not a readable chain: %w",
+			ErrSegmentExists, sealed, err)
+	}
+
+	// Our own partial copy: a strict prefix of the envelopes we are sealing,
+	// matching hash for hash. Only this is safe to replace, and only because the
+	// hot file still holds every event.
+	if len(existing) < len(envs) && envelopePrefix(existing, envs) {
+		_ = os.Chmod(sealed, 0o600)
+		if err := os.Remove(sealed); err != nil {
+			return false, fmt.Errorf("remove partial segment %q: %w", sealed, err)
+		}
+		return false, nil
+	}
+
+	if len(existing) != len(envs) || !envelopePrefix(existing, envs) {
+		return false, fmt.Errorf("%w: %q holds %d event(s) that are not the %d being "+
+			"sealed; refusing to replace archived history to resolve a name collision",
+			ErrSegmentExists, sealed, len(existing), len(envs))
+	}
+	if err := ValidateChain(existing); err != nil {
+		return false, fmt.Errorf("%w: %q does not validate: %w", ErrSegmentExists, sealed, err)
+	}
+	return true, nil
+}
+
+// envelopePrefix reports whether got is a hash-for-hash prefix of want.
+func envelopePrefix(got, want []ChainEnvelope) bool {
+	if len(got) > len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i].Hash != want[i].Hash {
+			return false
+		}
+	}
+	return true
 }
 
 // copyAndSync writes src to dst and fsyncs both the file and its directory, so
