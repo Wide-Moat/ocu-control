@@ -62,7 +62,7 @@ const (
 	AuthnProtocolMTLS AuthnProtocol = "mtls-x509"
 	// AuthnProtocolPeerCred is the operator Unix socket: kernel-vouched
 	// uid/gid/pid via SO_PEERCRED.
-	AuthnProtocolPeerCred AuthnProtocol = "unix-peercred"
+	AuthnProtocolPeerCred AuthnProtocol = "unix-peercred" //nolint:gosec // G101: protocol label ("cred" heuristic), not a credential
 	// AuthnProtocolStorageJWT is the per-session lease mint (activity 3).
 	AuthnProtocolStorageJWT AuthnProtocol = "storage-jwt"
 )
