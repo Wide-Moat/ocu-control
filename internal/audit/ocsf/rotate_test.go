@@ -633,6 +633,92 @@ func TestRotateRefusesAShorterForeignSegment(t *testing.T) {
 	}
 }
 
+// TestResumeTipPrefersANonEmptyHotFile is the crash-window branch. A crash
+// after sealing but before truncation leaves BOTH files holding events. The hot
+// file is the later state, so its tip must win — resuming from the sealed
+// segment would reissue sequence numbers the hot file already committed, and
+// the spine would carry two events at the same sequence.
+func TestResumeTipPrefersANonEmptyHotFile(t *testing.T) {
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "audit.ocsf.jsonl")
+	writeSpine(t, hot, 3)
+
+	sealed, err := RotateSegment(hot, filepath.Join(dir, "cold"))
+	if err != nil {
+		t.Fatalf("RotateSegment: %v", err)
+	}
+	// Continue past the seal, so the hot file is ahead of the segment.
+	continueSpine(t, hot, sealed, 2)
+
+	tip, err := ResumeTipAfterRotation(hot, sealed)
+	if err != nil {
+		t.Fatalf("ResumeTipAfterRotation: %v", err)
+	}
+
+	hotEnvs, err := ReadChainFile(hot)
+	if err != nil {
+		t.Fatalf("read hot: %v", err)
+	}
+	last := hotEnvs[len(hotEnvs)-1]
+	if tip.LastSeq != last.Sequence || tip.PriorTip != last.Hash {
+		t.Errorf("tip is seq=%d prior=%s; the hot file's tail is seq=%d hash=%s — "+
+			"resuming from the segment would reissue sequences already committed",
+			tip.LastSeq, tip.PriorTip, last.Sequence, last.Hash)
+	}
+}
+
+// TestResumeTipRefusesTwoEmptyFiles fails closed when neither file offers a tip.
+// Returning a genesis tip here would silently re-anchor the spine: the next
+// event would start at sequence 1 with no prior link, which is exactly the chain
+// break rotation exists to avoid.
+func TestResumeTipRefusesTwoEmptyFiles(t *testing.T) {
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "audit.ocsf.jsonl")
+	sealed := filepath.Join(dir, "sealed.jsonl")
+	for _, p := range []string{hot, sealed} {
+		if err := os.WriteFile(p, nil, 0o600); err != nil {
+			t.Fatalf("write %s: %v", p, err)
+		}
+	}
+
+	if _, err := ResumeTipAfterRotation(hot, sealed); !errors.Is(err, ErrNothingToRotate) {
+		t.Errorf("two empty files = %v, want ErrNothingToRotate; a genesis tip here "+
+			"would re-anchor the spine and break the chain silently", err)
+	}
+}
+
+// TestRotateReportsAnUnreadableHotFile covers the source-open failure. It is
+// reachable in practice: RotateSegment reads the hot file to validate it, then
+// opens it again to copy, and the permissions can change in between — an
+// operator tightening the audit directory, or a deployment resetting modes.
+//
+// The failure must name the hot file. Reporting it against the segment would
+// send an operator to the cold tier for a problem in the source.
+func TestRotateReportsAnUnreadableHotFile(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root: mode bits do not deny access")
+	}
+	dir := t.TempDir()
+	hot := filepath.Join(dir, "audit.ocsf.jsonl")
+	writeSpine(t, hot, 3)
+
+	// Readable for the validate pass, then unreadable. RotateSegment opens the
+	// file a second time to copy it, which is the path under test.
+	if err := os.Chmod(hot, 0o000); err != nil {
+		t.Fatalf("chmod hot: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(hot, 0o600) })
+
+	_, err := RotateSegment(hot, filepath.Join(dir, "cold"))
+	if err == nil {
+		t.Fatal("rotation succeeded with an unreadable hot file")
+	}
+	if !strings.Contains(err.Error(), hot) {
+		t.Errorf("the failure %q does not name the hot file; an operator would look "+
+			"for the problem in the cold tier", err)
+	}
+}
+
 // TestRotatedSegmentIsReadOnly pins the sealed file's mode. A segment is
 // finished; leaving it writable invites an append that no head covers, since
 // the head was computed at seal time.
