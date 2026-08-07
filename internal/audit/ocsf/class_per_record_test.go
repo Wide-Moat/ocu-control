@@ -62,7 +62,7 @@ func TestClassAndCategoryAgree(t *testing.T) {
 		class := classFor(a)
 		got := categoryFor(class)
 		want := class / 1000
-		if uint32(got) != want {
+		if got != want {
 			t.Errorf("%s: class %d sits in category %d; the class uid says %d",
 				a, class, got, want)
 		}
