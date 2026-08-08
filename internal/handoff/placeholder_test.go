@@ -186,3 +186,38 @@ func TestStagePlaceholder_UnwritableBase(t *testing.T) {
 		t.Fatal("StagePlaceholder succeeded with a file as its base dir")
 	}
 }
+
+// TestClaimSpecialize_OverwriteFailureSurfaces covers the overwrite-failure arm:
+// if the container_info file is removed after staging (so the in-place overwrite
+// cannot open it), ClaimSpecialize fails closed rather than silently proceeding.
+func TestClaimSpecialize_OverwriteFailureSurfaces(t *testing.T) {
+	s := newStager(t)
+	st, err := s.StagePlaceholder(context.Background(), "ocu-pool-of")
+	if err != nil {
+		t.Fatalf("StagePlaceholder: %v", err)
+	}
+	// Delete the staged container_info so overwriteInPlace's open fails.
+	if err := os.Remove(st.Material.ContainerInfoHostPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimSpecialize(context.Background(), st, "sess", realKey(t)); err == nil {
+		t.Fatal("ClaimSpecialize succeeded with a missing container_info file")
+	}
+}
+
+// TestClaimSpecialize_KeyOverwriteFailureSurfaces covers the key-overwrite arm:
+// the container_info overwrite succeeds but the key file is gone, so the second
+// in-place overwrite fails and ClaimSpecialize fails closed.
+func TestClaimSpecialize_KeyOverwriteFailureSurfaces(t *testing.T) {
+	s := newStager(t)
+	st, err := s.StagePlaceholder(context.Background(), "ocu-pool-kf")
+	if err != nil {
+		t.Fatalf("StagePlaceholder: %v", err)
+	}
+	if err := os.Remove(st.Material.PublicKeyHostPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ClaimSpecialize(context.Background(), st, "sess", realKey(t)); err == nil {
+		t.Fatal("ClaimSpecialize succeeded with a missing key file")
+	}
+}

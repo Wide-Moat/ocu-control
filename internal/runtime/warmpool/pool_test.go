@@ -247,3 +247,50 @@ func TestWarm_IsIdempotent(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 	}
 }
+
+// TestWarm_AfterCloseIsNoOp covers the closed-pool guard in Warm: warming a
+// profile after Close spawns no producer.
+func TestWarm_AfterCloseIsNoOp(t *testing.T) {
+	f := newFakeFactory()
+	p := New(f, 2)
+	_ = p.Close(context.Background())
+	p.Warm(testProfile) // must be a no-op on a closed pool
+	time.Sleep(30 * time.Millisecond)
+	if f.liveCount() != 0 {
+		t.Errorf("Warm on a closed pool created %d units; want 0", f.liveCount())
+	}
+}
+
+// TestClose_IsIdempotent covers the double-Close guard.
+func TestClose_IsIdempotent(t *testing.T) {
+	f := newFakeFactory()
+	p := New(f, 2)
+	p.Warm(testProfile)
+	waitFor(t, func() bool { return f.liveCount() >= 2 })
+	if err := p.Close(context.Background()); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := p.Close(context.Background()); err != nil {
+		t.Fatalf("second Close must be a satisfied no-op, got %v", err)
+	}
+}
+
+// TestClose_SurfacesDestroyError covers the Close destroy-error arm: a factory
+// whose DestroyPlaceholder errors makes Close return the joined error rather
+// than swallowing it.
+func TestClose_SurfacesDestroyError(t *testing.T) {
+	f := &errDestroyFactory{fakeFactory: newFakeFactory()}
+	p := New(f, 2)
+	p.Warm(testProfile)
+	waitFor(t, func() bool { return f.liveCount() >= 2 })
+	if err := p.Close(context.Background()); err == nil {
+		t.Error("Close did not surface the destroy error")
+	}
+}
+
+type errDestroyFactory struct{ *fakeFactory }
+
+func (e *errDestroyFactory) DestroyPlaceholder(ctx context.Context, u Unit) error {
+	_ = e.fakeFactory.DestroyPlaceholder(ctx, u)
+	return errors.New("destroy refused")
+}
