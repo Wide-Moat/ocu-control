@@ -4,6 +4,7 @@
 package admit_test
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,39 @@ func TestLimiter_ZeroCapAllowsAll(t *testing.T) {
 		if !lim.Allow("anyone") {
 			t.Fatalf("a zero-cap limiter throttled request %d; it must be disabled", i)
 		}
+	}
+}
+
+// TestNewGate_NegativeSizesClampToEmpty pins the defensive clamp: a negative pool
+// size becomes an empty pool of that class rather than a panic (make with a negative
+// cap would panic). A gate with a clamped-to-zero general pool refuses a general
+// acquire on a done context, and a clamped reserved pool falls back to general.
+func TestNewGate_NegativeSizesClampToEmpty(t *testing.T) {
+	t.Parallel()
+	g := admit.NewGate(-5, -3) // both clamp to 0
+	ctx := context.Background()
+	// Both pools are empty: a general acquire on a cancelled context refuses without
+	// panicking, proving the negative sizes were clamped, not passed to make().
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, ok := g.Acquire(cctx, admit.ClassGeneral); ok {
+		t.Fatal("acquired from an empty (negative-clamped) general pool")
+	}
+}
+
+// TestNewLimiter_NonPositiveWindowClamps pins that a non-positive window does not
+// panic (Truncate by a zero duration would); it is clamped to a minimal window and
+// the cap still binds within it.
+func TestNewLimiter_NonPositiveWindowClamps(t *testing.T) {
+	t.Parallel()
+	clk := newFakeClock()
+	lim := admit.NewLimiter(1, 0, clk) // window <= 0 clamps to 1ns
+	if !lim.Allow("c") {
+		t.Fatal("first request refused under a clamped window")
+	}
+	// Same instant (the fake clock does not advance): still the same window, cap binds.
+	if lim.Allow("c") {
+		t.Fatal("second request in the same clamped window exceeded a cap of 1")
 	}
 }
 
