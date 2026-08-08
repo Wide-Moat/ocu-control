@@ -165,6 +165,9 @@ type Unmapped struct {
 	Action        string `json:"action"`
 	Reason        string `json:"reason"`
 	RevokeOutcome string `json:"revoke_outcome,omitempty"`
+	// WarmHit marks a create-commit served from the warm pool (a pool-claim
+	// transition, NFR-SEC-72). omitempty keeps a cold create byte-identical.
+	WarmHit bool `json:"warm_hit,omitempty"`
 }
 
 // Metadata is the OCSF metadata object: the product, the OCSF schema version, the
@@ -428,6 +431,7 @@ func buildEvent(clk state.Clock, rec audit.Record) OCSFEvent {
 				Action:        rec.Action.String(),
 				Reason:        rec.Reason,
 				RevokeOutcome: rec.RevokeOutcome,
+				WarmHit:       rec.WarmHit,
 			},
 		},
 	}

@@ -470,6 +470,10 @@ func stageCommit(ctx context.Context, m *Manager, st *createState) (compensator,
 		Key:     st.key.String(),
 		Caller:  st.owner.Caller,
 		Tenant:  st.owner.Tenant,
+		// A warm-pool claim survives to commit with st.unit still set (a failed
+		// claim nils it and falls back to cold). Mark the pool-claim transition on
+		// the create-commit record (NFR-SEC-72).
+		WarmHit: st.unit != nil,
 	}
 	if err := m.audit.Emit(ctx, rec); err != nil {
 		return nil, fmt.Errorf("lifecycle: commit audit: %w", err)

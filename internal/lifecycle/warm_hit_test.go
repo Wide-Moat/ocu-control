@@ -76,7 +76,7 @@ func (c *fakeClaimer) Claim(_ context.Context, u warmclaim.Unit, realName runtim
 	sb := c.sandbox
 	sb.Name = realName
 	sb.RuntimeID = "ocu-sess-" + string(realName)
-	sb.SockDirRoot = "/var/lib/ocu/handoff/" + string(u.PlaceholderID)
+	sb.SockDirRoot = "/var/lib/ocu/handoff/" + u.PlaceholderID
 	return sb, c.material, nil
 }
 
@@ -279,4 +279,41 @@ func newWarmHarnessWithPushFault(t *testing.T, pool warmclaim.Pool, claimer warm
 		Claimer:       claimer,
 	})
 	return &harness{mgr: mgr, store: store, provider: provider, stager: stager, audit: sink, gate: gate, clk: clk}
+}
+
+// TestWarmHit_CommitRecordMarksThePoolClaim pins NFR-SEC-72: a warm-pool-served
+// create's commit audit record carries WarmHit=true, and a cold create's does
+// not, so the pool-claim lifecycle transition is distinguishable on the
+// tamper-evident spine.
+func TestWarmHit_CommitRecordMarksThePoolClaim(t *testing.T) {
+	t.Parallel()
+
+	// Warm hit: the commit record is marked.
+	warmPool := &fakePool{units: []warmclaim.Unit{warmUnit("pool-audit")}}
+	hw := newWarmHarness(t, warmPool, &fakeClaimer{})
+	if _, err := hw.mgr.Create(context.Background(), input("warm-audit")); err != nil {
+		t.Fatalf("Create (warm): %v", err)
+	}
+	if !hasWarmHitCommit(hw.audit.Records(), true) {
+		t.Error("a warm-pool create's commit record is not marked WarmHit=true (the pool-claim transition is invisible on the spine)")
+	}
+
+	// Cold create (empty pool): the commit record is NOT marked.
+	coldPool := &fakePool{}
+	hc := newWarmHarness(t, coldPool, &fakeClaimer{})
+	if _, err := hc.mgr.Create(context.Background(), input("cold-audit")); err != nil {
+		t.Fatalf("Create (cold): %v", err)
+	}
+	if hasWarmHitCommit(hc.audit.Records(), true) {
+		t.Error("a cold create's commit record is marked WarmHit=true; the marker must distinguish a pool claim from a cold materialize")
+	}
+}
+
+func hasWarmHitCommit(recs []audit.Record, want bool) bool {
+	for _, r := range recs {
+		if r.Action == audit.ActionCreateCommit && r.WarmHit == want {
+			return true
+		}
+	}
+	return false
 }
