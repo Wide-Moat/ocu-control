@@ -32,6 +32,8 @@ type config struct {
 	gatewayListen    string        // gateway service-identity ingress endpoint
 	runtimeTier      string        // deployment-wide isolation tier; never per-request
 	runtimeProvider  string        // container backend behind the RuntimeProvider seam
+	k8sNamespace     string        // -runtime-provider=k8s: the deployment-fixed namespace every session Pod/NetworkPolicy/Secret lands in; required when the provider is k8s
+	k8sRuntimeClass  string        // -runtime-provider=k8s: the RuntimeClass name for the bound tier (e.g. gvisor); empty = cluster default (runc, dev-only)
 	workloadProfile  string        // deployment-declared trust profile feeding the admission matrix; never per-request
 	guestImage       string        // deployment-declared default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); the body image is an override; unset + no body image is a fail-closed 400
 	guestImageAllow  string        // comma-separated exact-match allow-list of guest images a create BODY may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only (deny-by-default)
@@ -128,6 +130,8 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.gatewayListen, "gateway-listen", "", "gateway service-identity ingress endpoint (required)")
 	fs.StringVar(&cfg.runtimeTier, "runtime-tier", "", "deployment-wide isolation tier: runc|gvisor|firecracker (required)")
 	fs.StringVar(&cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker|k8s (required)")
+	fs.StringVar(&cfg.k8sNamespace, "k8s-namespace", "", "runtime-provider=k8s: the namespace every session Pod/NetworkPolicy/Secret lands in (required when provider is k8s)")
+	fs.StringVar(&cfg.k8sRuntimeClass, "k8s-runtime-class", "", "runtime-provider=k8s: RuntimeClass for the bound tier (e.g. gvisor); empty = cluster default (runc, dev-only)")
 	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.guestImage, "guest-image", "", "default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); a body image overrides it; unset + no body image is refused 400")
 	fs.StringVar(&cfg.guestImageAllow, "guest-image-allow", "", "comma-separated exact-match allow-list of images a create body may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only, a non-allowed override is refused 400")
@@ -267,6 +271,14 @@ func validate(cfg config) error {
 	}
 	if !knownRuntimeProviders[cfg.runtimeProvider] {
 		return fmt.Errorf("%w: %q (choose docker|k8s)", errUnknownProvider, cfg.runtimeProvider)
+	}
+	// The k8s provider MUST be told its namespace: every session object is
+	// namespace-scoped and there is no safe default (an empty namespace would
+	// land session pods wherever the daemon's own pod runs, mixing them with the
+	// control plane). The runtime-class stays optional — empty is the dev-only
+	// runc fallback, refused for the untrusted profile by admission, not here.
+	if cfg.runtimeProvider == "k8s" && cfg.k8sNamespace == "" {
+		return fmt.Errorf("%w: -runtime-provider=k8s requires -k8s-namespace", errRequiredFlagMissing)
 	}
 	if !knownWorkloadProfiles[cfg.workloadProfile] {
 		return fmt.Errorf("%w: %q (choose trusted_operator|internal_workforce|untrusted)", errUnknownWorkloadProfile, cfg.workloadProfile)

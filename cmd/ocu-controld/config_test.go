@@ -333,3 +333,61 @@ func Test_validate_RequiresStoragePin(t *testing.T) {
 		})
 	}
 }
+
+// Test_validate_K8sRequiresNamespace pins the k8s-provider precondition: there
+// is no safe default namespace, so -runtime-provider=k8s without -k8s-namespace
+// aborts boot. A docker provider is unaffected, and a k8s provider WITH a
+// namespace validates (the runtime-class stays optional — empty = runc default).
+func Test_validate_K8sRequiresNamespace(t *testing.T) {
+	t.Parallel()
+	base := []string{
+		"-operator-listen", "unix:///tmp/test.sock",
+		"-gateway-listen", "127.0.0.1:0",
+		"-runtime-tier", "gvisor",
+		"-workload-profile", "internal_workforce",
+		"-jwt-signing-key", "/tmp/jwt.key",
+		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
+	}
+
+	t.Run("k8s-without-namespace-refused", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-runtime-provider", "k8s")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		err = validate(cfg)
+		if !errors.Is(err, errRequiredFlagMissing) {
+			t.Fatalf("k8s without -k8s-namespace = %v, want errRequiredFlagMissing", err)
+		}
+		if !strings.Contains(err.Error(), "-k8s-namespace") {
+			t.Fatalf("error %q does not name -k8s-namespace", err)
+		}
+	})
+
+	t.Run("k8s-with-namespace-validates", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-runtime-provider", "k8s", "-k8s-namespace", "ocu-sessions")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := validate(cfg); err != nil {
+			t.Fatalf("k8s with a namespace must validate, got %v", err)
+		}
+	})
+
+	t.Run("docker-unaffected-by-namespace-rule", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-runtime-provider", "docker")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := validate(cfg); err != nil {
+			t.Fatalf("docker provider must validate without a k8s namespace, got %v", err)
+		}
+	})
+}
