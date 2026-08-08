@@ -41,6 +41,11 @@ type Unit struct {
 	// served a unit from its own profile (image + resources + FUSE posture are
 	// baked at create and cannot change at claim).
 	Profile Profile
+	// Handoff is an OPAQUE handle the Factory round-trips: the substrate-specific
+	// placeholder handoff state (the docker Factory stores its handoff.Staged
+	// here) so Destroy can reclaim it and a claim can specialize it. The pool
+	// never inspects it — keeping the pool package free of any substrate import.
+	Handoff any
 }
 
 // Profile is the create-time key a pooled unit is bound to. Two sessions share a
