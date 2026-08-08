@@ -8,8 +8,8 @@
 version: v2
 plugins:
   - local: protoc-gen-go
-    out: gen/proto
+    out: ../../gen/proto
     opt: paths=source_relative
   - local: protoc-gen-go-grpc
-    out: gen/proto
+    out: ../../gen/proto
     opt: paths=source_relative
