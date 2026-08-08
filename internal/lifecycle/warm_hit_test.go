@@ -1,0 +1,282 @@
+// SPDX-License-Identifier: FSL-1.1-Apache-2.0
+// Copyright (c) 2025 Open Computer Use Contributors
+
+package lifecycle_test
+
+import (
+	"context"
+	"errors"
+	"sync"
+	"testing"
+
+	"github.com/Wide-Moat/ocu-control/internal/admission"
+	"github.com/Wide-Moat/ocu-control/internal/audit"
+	"github.com/Wide-Moat/ocu-control/internal/cred"
+	"github.com/Wide-Moat/ocu-control/internal/handoff"
+	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
+	"github.com/Wide-Moat/ocu-control/internal/quota"
+	"github.com/Wide-Moat/ocu-control/internal/registry"
+	"github.com/Wide-Moat/ocu-control/internal/runtime"
+	"github.com/Wide-Moat/ocu-control/internal/state"
+	"github.com/Wide-Moat/ocu-control/internal/warmclaim"
+)
+
+// fakePool hands out a scripted set of warm units and records Get/Put so a test
+// can assert a hit was claimed and a failed create returned or disposed it.
+type fakePool struct {
+	mu       sync.Mutex
+	units    []warmclaim.Unit // popped FIFO on Get
+	getCalls int
+	putCalls int
+	putUnits []warmclaim.Unit
+}
+
+func (p *fakePool) Get(_ warmclaim.Profile) (warmclaim.Unit, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.getCalls++
+	if len(p.units) == 0 {
+		return warmclaim.Unit{}, false
+	}
+	u := p.units[0]
+	p.units = p.units[1:]
+	return u, true
+}
+
+func (p *fakePool) Put(u warmclaim.Unit) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.putCalls++
+	p.putUnits = append(p.putUnits, u)
+}
+
+// fakeClaimer records Claim/Dispose. Claim returns a scripted sandbox+material or
+// a scripted error; Dispose counts the disposals so a leak (neither Put nor
+// Dispose) is detectable.
+type fakeClaimer struct {
+	mu           sync.Mutex
+	claimCalls   int
+	disposeCalls int
+	claimErr     error
+	lastPubKey   []byte
+	lastName     runtime.SessionName
+	sandbox      runtime.Sandbox
+	material     runtime.HandoffMaterial
+}
+
+func (c *fakeClaimer) Claim(_ context.Context, u warmclaim.Unit, realName runtime.SessionName, realPubKey []byte, _ runtime.EgressPolicy) (runtime.Sandbox, runtime.HandoffMaterial, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.claimCalls++
+	c.lastPubKey = realPubKey
+	c.lastName = realName
+	if c.claimErr != nil {
+		return runtime.Sandbox{}, runtime.HandoffMaterial{}, c.claimErr
+	}
+	sb := c.sandbox
+	sb.Name = realName
+	sb.RuntimeID = "ocu-sess-" + string(realName)
+	sb.SockDirRoot = "/var/lib/ocu/handoff/" + string(u.PlaceholderID)
+	return sb, c.material, nil
+}
+
+func (c *fakeClaimer) Dispose(_ context.Context, _ warmclaim.Unit) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.disposeCalls++
+	return nil
+}
+
+func newWarmHarness(t *testing.T, pool warmclaim.Pool, claimer warmclaim.Claimer) *harness {
+	t.Helper()
+	clk := state.NewFakeClock(lifeStart)
+	store := newListerStore(state.NewInMemory(clk))
+	provider := newRecordingProvider()
+	stager := newFaultStager(t.TempDir())
+	sink := audit.NewRecordingFake()
+	gate := quota.NewGate(store, clk, generousLimits())
+	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
+		ExecVerifyKey: pub32(),
+		Pool:          pool,
+		Claimer:       claimer,
+	})
+	return &harness{mgr: mgr, store: store, provider: provider, stager: stager, audit: sink, gate: gate, clk: clk}
+}
+
+func warmUnit(id string) warmclaim.Unit {
+	// The unit carries a placeholder Staged handoff (a Root the compensator would
+	// reclaim); the fake claimer never inspects Material, only PlaceholderID.
+	return warmclaim.Unit{PlaceholderID: id, Handoff: stagedFor(id)}
+}
+
+// TestWarmHit_ClaimsInsteadOfMaterialize is the keystone: a warm hit runs Claim
+// with the REAL exec verify key (not the placeholder), sets the row's container
+// name from the claimed sandbox, and NEVER calls the cold provider.Materialize.
+func TestWarmHit_ClaimsInsteadOfMaterialize(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{units: []warmclaim.Unit{warmUnit("pool-1")}}
+	claimer := &fakeClaimer{}
+	h := newWarmHarness(t, pool, claimer)
+
+	row, err := h.mgr.Create(context.Background(), input("warm-sess"))
+	if err != nil {
+		t.Fatalf("Create (warm hit): %v", err)
+	}
+
+	if claimer.claimCalls != 1 {
+		t.Errorf("Claim called %d times, want 1", claimer.claimCalls)
+	}
+	if h.provider.materializeCalls != 0 {
+		t.Errorf("cold provider.Materialize called %d times on a warm hit, want 0", h.provider.materializeCalls)
+	}
+	// Claim received the DEPLOYMENT exec verify key, not a per-session/placeholder key.
+	if !bytesEqual(claimer.lastPubKey, pub32()) {
+		t.Error("Claim did not receive the deployment exec verify key")
+	}
+	// The row carries the claimed container name and the warm sock-dir root.
+	if row.ContainerName != "ocu-sess-"+row.Key {
+		t.Errorf("row.ContainerName = %q, want the claimed container name", row.ContainerName)
+	}
+	if row.SockDirRoot == "" {
+		t.Error("row.SockDirRoot is empty on a warm hit; the finalizer would miss the pooled root")
+	}
+}
+
+// TestWarmMiss_FallsThroughToCold pins that an empty pool (miss) runs the cold
+// path unchanged: provider.Materialize is called, Claim is not.
+func TestWarmMiss_FallsThroughToCold(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{} // empty: every Get misses
+	claimer := &fakeClaimer{}
+	h := newWarmHarness(t, pool, claimer)
+
+	if _, err := h.mgr.Create(context.Background(), input("cold-sess")); err != nil {
+		t.Fatalf("Create (warm miss): %v", err)
+	}
+	if claimer.claimCalls != 0 {
+		t.Errorf("Claim called on a pool miss (%d); want the cold path", claimer.claimCalls)
+	}
+	if h.provider.materializeCalls != 1 {
+		t.Errorf("cold Materialize called %d times on a miss, want 1", h.provider.materializeCalls)
+	}
+}
+
+// TestWarmHit_ClaimFailureDisposesUnitAndFailsCreate is the no-leak keystone:
+// when Claim fails, the unit is disposed (not leaked, not returned to the pool)
+// and the create fails.
+func TestWarmHit_ClaimFailureDisposesUnitAndFailsCreate(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{units: []warmclaim.Unit{warmUnit("pool-2")}}
+	claimer := &fakeClaimer{claimErr: errors.New("claim refused")}
+	h := newWarmHarness(t, pool, claimer)
+
+	if _, err := h.mgr.Create(context.Background(), input("fail-sess")); err == nil {
+		t.Fatal("Create with a failing Claim returned nil; want the claim error")
+	}
+	// The unit was DISPOSED (Branch B: claim-attempted), never Put back to the pool
+	// (a claim-attempted unit is renamed/started and unreturnable — NFR-SEC-68).
+	if claimer.disposeCalls == 0 {
+		t.Error("a failed Claim did not dispose the unit — it leaks")
+	}
+	if pool.putCalls != 0 {
+		t.Errorf("a claim-attempted unit was returned to the pool (%d Puts); it must be disposed, not returned", pool.putCalls)
+	}
+}
+
+// TestWarmHit_UnwindAfterHitReturnsPristineUnit pins Branch A: when the create
+// fails AFTER the warm handoff hit but BEFORE stageMaterialize claims (here, a
+// forced commit failure would be ideal, but we drive it via a quota-refund path);
+// the pristine unit is RETURNED to the pool, not disposed. We approximate the
+// pre-claim unwind by making the claimer's Claim itself the first failure is
+// Branch B; to exercise Branch A we need a failure between S5 and S8. The
+// audit-commit fault store gives us exactly that.
+func TestWarmHit_UnwindBeforeClaimReturnsPristineUnit(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{units: []warmclaim.Unit{warmUnit("pool-3")}}
+	claimer := &fakeClaimer{}
+	// A store whose Commit fails: the create unwinds from S9 (commit), so S8's
+	// Claim already ran — that is Branch B, not A. To hit Branch A we fail at S6/S7.
+	// The simplest S6/S7 failure with a warm hit is a mint failure: no Signer wired
+	// means the mint stage is a clean no-op, so instead we use a claimer whose
+	// Claim is never reached because we fail earlier. Drive a render/push failure.
+	h := newWarmHarnessWithPushFault(t, pool, claimer)
+
+	if _, err := h.mgr.Create(context.Background(), input("pristine-sess")); err == nil {
+		t.Fatal("Create with a push fault returned nil; want the injected fault")
+	}
+	// The unit was never claimed (the failure is before S8), so it is PRISTINE and
+	// RETURNED to the pool, not disposed.
+	if claimer.claimCalls != 0 {
+		t.Errorf("Claim ran (%d) before the pre-S8 failure; the unit should be pristine", claimer.claimCalls)
+	}
+	if pool.putCalls != 1 {
+		t.Errorf("a pristine unit was not returned to the pool (%d Puts); Branch A must Put", pool.putCalls)
+	}
+	if claimer.disposeCalls != 0 {
+		t.Errorf("a pristine unit was disposed (%d) instead of returned", claimer.disposeCalls)
+	}
+}
+
+// stagedFor builds a minimal placeholder Staged for a fake pool unit — a Root the
+// Branch-B compensator would reclaim. The fake claimer never reads Material.
+func stagedFor(id string) handoff.Staged {
+	return handoff.Staged{Root: "/var/lib/ocu/handoff/" + id}
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// newWarmHarnessWithPushFault wires a Signer + a push-faulting Pusher so the
+// storage render/push stage (S7) fails AFTER the warm handoff hit (S5) but BEFORE
+// the claim (S8) — exercising Branch A of the warm compensator (pristine return).
+func newWarmHarnessWithPushFault(t *testing.T, pool warmclaim.Pool, claimer warmclaim.Claimer) *harness {
+	t.Helper()
+	clk := state.NewFakeClock(lifeStart)
+	store := newListerStore(state.NewInMemory(clk))
+	provider := newRecordingProvider()
+	stager := newFaultStager(t.TempDir())
+	sink := audit.NewRecordingFake()
+	gate := quota.NewGate(store, clk, generousLimits())
+	signer, _ := newTestSigner(t, clk)
+	pusher := newRecordingPusher()
+	pusher.failPush = true
+	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
+		ExecVerifyKey: pub32(),
+		Signer:        signer,
+		Push:          pusher,
+		ServiceURL:    testServiceURL,
+		CACertPEM:     testCACert,
+		MountDefaults: testMountDefaults(t),
+		StorageScope:  lifecycle.StorageScope{Workspace: "ws", Org: "org", Intent: cred.IntentWrite},
+		Pool:          pool,
+		Claimer:       claimer,
+	})
+	return &harness{mgr: mgr, store: store, provider: provider, stager: stager, audit: sink, gate: gate, clk: clk}
+}

@@ -180,6 +180,31 @@ func (p *Pool) Get(profile Profile) (Unit, bool) {
 	}
 }
 
+// Put re-offers a PRISTINE, never-claimed unit back to its profile's ready
+// channel — the create-unwind path when a warm-hit create failed AFTER Get but
+// BEFORE the unit was specialized/claimed, so the never-run placeholder is still
+// reusable. It is non-blocking and best-effort: if the channel is full or the
+// pool is closed, the unit is destroyed via the factory instead so it never
+// leaks. A Claim-attempted unit must NEVER be Put (it is renamed/started and
+// structurally unreturnable — NFR-SEC-68); that discipline is the caller's.
+func (p *Pool) Put(u Unit) {
+	p.mu.Lock()
+	ch, ok := p.ready[u.Profile]
+	closed := p.closed
+	p.mu.Unlock()
+	if closed || !ok {
+		_ = p.factory.DestroyPlaceholder(context.Background(), u)
+		return
+	}
+	select {
+	case ch <- u:
+	default:
+		// The ready channel is at its watermark; the returned unit is surplus, so
+		// destroy it rather than block or drop it on the floor.
+		_ = p.factory.DestroyPlaceholder(context.Background(), u)
+	}
+}
+
 // Close stops every producer and destroys every unit still sitting in a ready
 // channel (unclaimed placeholders must not leak). It blocks until all producers
 // have exited. After Close, Get always returns a miss.

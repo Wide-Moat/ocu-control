@@ -294,3 +294,42 @@ func (e *errDestroyFactory) DestroyPlaceholder(ctx context.Context, u Unit) erro
 	_ = e.fakeFactory.DestroyPlaceholder(ctx, u)
 	return errors.New("destroy refused")
 }
+
+// TestPut_ReturnsToTheReadyChannel pins that Put re-offers a pristine unit to its
+// profile's channel, so a subsequent Get hits it — the create-unwind Branch-A
+// return path.
+func TestPut_ReturnsToTheReadyChannel(t *testing.T) {
+	f := newFakeFactory()
+	p := New(f, 4)
+	defer p.Close(context.Background())
+	p.Warm(testProfile)
+	waitFor(t, func() bool { return f.liveCount() >= 4 })
+
+	u, ok := p.Get(testProfile)
+	if !ok {
+		t.Fatal("expected a hit")
+	}
+	// Return it; a Get must be able to hand it back out (it re-entered the channel).
+	p.Put(u)
+	got, ok := p.Get(testProfile)
+	if !ok {
+		t.Fatal("Put did not return the unit to the pool (next Get missed)")
+	}
+	_ = got
+}
+
+// TestPut_OnClosedPoolDestroys pins that Put on a closed pool destroys the unit
+// rather than leaking it.
+func TestPut_OnClosedPoolDestroys(t *testing.T) {
+	f := newFakeFactory()
+	p := New(f, 2)
+	p.Warm(testProfile)
+	waitFor(t, func() bool { return f.liveCount() >= 2 })
+	u, _ := p.Get(testProfile)
+	_ = p.Close(context.Background())
+	before := f.destroyed
+	p.Put(u) // pool closed: must destroy
+	if f.destroyed <= before {
+		t.Error("Put on a closed pool did not destroy the returned unit")
+	}
+}

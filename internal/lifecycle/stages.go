@@ -10,6 +10,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/cred"
+	"github.com/Wide-Moat/ocu-control/internal/handoff"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
@@ -165,6 +166,28 @@ func emitCreateRejected(ctx context.Context, m *Manager, st *createState, cause 
 // stays a later-phase placeholder. A short write or a non-32-byte key fails closed
 // here. On success it pushes Unstage as the compensator.
 func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compensator, error) {
+	// WARM path: try a pre-warmed unit whose baked container config matches this
+	// session's profile. Get runs HERE (not in Create) so the disposal compensator
+	// is pushed by the stage runner in the SAME step the unit is claimed — the code
+	// between Get and the compensator return is pure assignment with no failure
+	// point, so a claimed-but-undisposed window is exactly zero (a create refused at
+	// S1-S4 or resumed never reaches this stage, so it never claims a unit).
+	if m.warmEnabled() {
+		if u, ok := m.pool.Get(m.warmProfile(st.in)); ok {
+			staged, sok := u.Handoff.(handoff.Staged)
+			if !sok {
+				// A unit with no staged handoff cannot be claimed; dispose it and fall
+				// through to the cold path rather than fail the create.
+				_ = m.claimer.Dispose(context.WithoutCancel(ctx), u)
+			} else {
+				st.unit = &u
+				st.staged = staged
+				return warmHandoffCompensator(m, st), nil
+			}
+		}
+	}
+
+	// COLD path (byte-identical to the pre-warm-pool behavior).
 	name := runtime.SessionName(st.key.String())
 	mounts := []runtime.MountIntent{st.in.Mount}
 	// The guest's verify key is the DEPLOYMENT-FIXED exec verify key (host-derived,
@@ -184,6 +207,35 @@ func stageStageHandoff(ctx context.Context, m *Manager, st *createState) (compen
 		}
 		return nil
 	}, nil
+}
+
+// warmHandoffCompensator is the branching disposal compensator for a warm-hit
+// create, with exactly-once accounting proven by the LIFO unwind order:
+//
+//	Branch A (st.claimAttempted == false): the unwind fired at S5-late/S6/S7, so
+//	  stageMaterialize never touched the unit. It is a PRISTINE never-started
+//	  placeholder — the S7 mount-config Scrub compensator has already popped (LIFO)
+//	  and is idempotent, so the sock dir is clean. Return it to the pool; Put
+//	  destroys it if the pool is full/closed, so it never leaks.
+//	Branch B (st.claimAttempted == true): stageMaterialize called Claim — the unit
+//	  is renamed/specialized/possibly started and structurally UNRETURNABLE
+//	  (NFR-SEC-68). Its container is already gone (S8's ForceKill compensator on a
+//	  successful claim, or stageMaterialize's in-stage force-remove on a failed
+//	  one), so this compensator only Disposes to reclaim the pooled handoff ROOT —
+//	  the ONLY reclaimer of that credential-bearing root, since ForceKill does not
+//	  touch host dirs.
+func warmHandoffCompensator(m *Manager, st *createState) compensator {
+	unit := *st.unit
+	return func(cctx context.Context) error {
+		if st.claimAttempted {
+			if err := m.claimer.Dispose(cctx, unit); err != nil {
+				return fmt.Errorf("lifecycle: unwind dispose claimed warm unit: %w", err)
+			}
+			return nil
+		}
+		m.pool.Put(unit)
+		return nil
+	}
 }
 
 // hasStorageScope reports whether the create requested a storage scope at all. A
@@ -323,6 +375,39 @@ func stageRenderPushMount(ctx context.Context, m *Manager, st *createState) (com
 // returns ErrMaterialize (no orphan below the seam). On success it pushes a
 // force-kill teardown as the compensator (force-remove-authoritative, idempotent).
 func stageMaterialize(ctx context.Context, m *Manager, st *createState) (compensator, error) {
+	// WARM path: the handoff stage claimed a pooled unit. Claim specializes its
+	// handoff to this session's real identity (m.execVerifyKey — the deployment
+	// exec verify key, NOT a per-session key), renames + networks + starts it. On
+	// any Claim failure the unit is force-removed in-stage and the create FALLS
+	// BACK to a cold materialize (the pooled unit is dead weight; a claim failure
+	// need not fail the create). The pooled ROOT is reclaimed by the S5 branching
+	// compensator on the eventual unwind; here we set claimAttempted so that
+	// compensator takes Branch B (dispose, never return).
+	if st.unit != nil {
+		st.claimAttempted = true
+		sandbox, mat, cerr := m.claimer.Claim(ctx, *st.unit, runtime.SessionName(st.key.String()), m.execVerifyKey, st.in.Egress)
+		if cerr != nil {
+			// The pooled container is force-removed here (in-stage) so it does not
+			// leak; the create then FAILS and unwinds. The unwind's S5 compensator
+			// takes Branch B (claimAttempted) and Disposes the unit to reclaim the
+			// pooled handoff ROOT (a second Dispose of the already-removed container is
+			// idempotent). The create failing is acceptable — the pool is now one unit
+			// lighter and a client retry cold-creates. This stage pushes NO compensator
+			// on failure (the in-stage force-remove + the S5 compensator cover the unit).
+			_ = m.claimer.Dispose(context.WithoutCancel(ctx), *st.unit)
+			return nil, cerr
+		}
+		st.sandbox = sandbox
+		st.staged.Material = mat
+		st.sockDirRoot = sandbox.SockDirRoot
+		return func(cctx context.Context) error {
+			if err := m.provider.Teardown().ForceKill(cctx, sandbox); err != nil {
+				return fmt.Errorf("lifecycle: unwind force-kill claimed sandbox: %w", err)
+			}
+			return nil
+		}, nil
+	}
+
 	spec := runtime.SessionSpec{
 		SchemaVersion: runtime.SchemaV1Alpha,
 		Name:          runtime.SessionName(st.key.String()),

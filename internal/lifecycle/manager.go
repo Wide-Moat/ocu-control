@@ -53,6 +53,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
+	"github.com/Wide-Moat/ocu-control/internal/warmclaim"
 )
 
 // unwindStepTimeout bounds each compensator and each teardown step run under the
@@ -228,6 +229,15 @@ type ManagerDeps struct {
 	// Question #2). Publishing is best-effort and NON-FATAL — it never blocks or fails
 	// a create/destroy.
 	Events EventPublisher
+
+	// Pool and Claimer are the OPTIONAL warm-pool seam. When BOTH are set, the
+	// handoff stage tries Pool.Get for a pre-warmed unit matching the resolved
+	// profile; on a hit the pipeline claims it (specializing its handoff to the real
+	// identity before the guest boots) instead of a cold stage+materialize. Both nil
+	// (the minimal shelf) means every create is cold — the pipeline is byte-identical
+	// to the pre-warm-pool behavior. They are wired together or not at all.
+	Pool    warmclaim.Pool
+	Claimer warmclaim.Claimer
 }
 
 // Recorder is the NARROW observability port the Manager records lifecycle metrics
@@ -333,6 +343,13 @@ type Manager struct {
 	// events is the design-fenced live-view fan-out. nil is a clean no-op (the guarded
 	// publishEvent), so the base pipeline runs without a fan-out hub wired.
 	events EventPublisher
+
+	// pool and claimer are the optional warm-pool seam (both nil = cold-only). The
+	// handoff stage tries pool.Get for a matching pre-warmed unit; on a hit the
+	// pipeline claims it instead of a cold materialize. warmEnabled() gates the whole
+	// path on BOTH being set.
+	pool    warmclaim.Pool
+	claimer warmclaim.Claimer
 }
 
 // NewManager constructs a Manager from its deps and binds the canon create order
@@ -365,6 +382,8 @@ func NewManager(deps ManagerDeps) *Manager {
 		execVerifyKey:   deps.ExecVerifyKey,
 		metrics:         deps.Metrics,
 		events:          deps.Events,
+		pool:            deps.Pool,
+		claimer:         deps.Claimer,
 	}
 	// Build the body-image override allow-set: the explicitly listed images plus the
 	// deployment default (implicitly allowed — the operator already trusted it by
@@ -439,6 +458,12 @@ type createState struct {
 	// EMPTY on the cold path (consumers name-derive base/<key>); the warm-pool
 	// claim path sets it to the pooled placeholder root the key cannot re-derive.
 	sockDirRoot string
+	// unit is the warm-pool unit a hit claimed for this create (nil on the cold
+	// path). claimAttempted records whether stageMaterialize called Claimer.Claim on
+	// it yet, so the unwind compensator picks Branch A (pristine -> return/dispose)
+	// vs Branch B (claim-attempted -> never return, dispose).
+	unit           *warmclaim.Unit
+	claimAttempted bool
 	// reservedMark is the monotonic instant the reservation row was written, stamped
 	// at stageReserve. stageCommit observes clk.Since(reservedMark) into the
 	// reserved->active start-duration metric — a monotonic interval, so a wall-clock
@@ -1110,4 +1135,33 @@ func (m *Manager) sockDirFor(row state.SessionRow) string {
 		return m.handoff.SockDirUnder(row.SockDirRoot)
 	}
 	return m.handoff.SockDir(runtime.SessionName(row.Key))
+}
+
+// warmEnabled reports whether the warm-pool create path is wired: BOTH a pool and
+// a claimer, and a non-nil exec verify key (a warm claim specializes the guest's
+// verify key, so a nil-key deployment cannot claim). A half-wired deployment falls
+// back to cold-only rather than reaching a nil claimer on a hit.
+func (m *Manager) warmEnabled() bool {
+	return m.pool != nil && m.claimer != nil && m.execVerifyKey != nil
+}
+
+// warmProfile derives the pool lookup key from the resolved create input. It
+// mirrors the fields the WarmFactory bakes into a placeholder at create — the
+// image, the hard caps, and the FUSE/storage posture — so a claim is only ever
+// served a unit whose baked container config matches this session's. The FUSE bit
+// is the SAME condition the mint+render stages skip on (a storage scope AND a
+// wired Signer+Push): a storage-baked unit on a shelf with no Signer would boot
+// with a mount-config argv but no config ever pushed.
+func (m *Manager) warmProfile(in CreateInput) warmclaim.Profile {
+	var pids int64
+	if in.Resources.PidsLimit != nil {
+		pids = *in.Resources.PidsLimit
+	}
+	return warmclaim.Profile{
+		ImageRef:    in.Image,
+		CPUCores:    in.Resources.CPUCores,
+		MemoryBytes: in.Resources.MemoryBytes,
+		PidsLimit:   pids,
+		FUSE:        hasStorageScope(in.Mount) && m.signer != nil && m.push != nil,
+	}
 }

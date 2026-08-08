@@ -225,3 +225,10 @@ func placeholderSpec(p warmpool.Profile, name runtime.SessionName, mat runtime.H
 	}
 	return spec
 }
+
+// Dispose satisfies warmclaim.Claimer's disposal verb: it is DestroyPlaceholder
+// under the name the create-unwind compensator calls it by (a claim-attempted or
+// unreturnable unit). Same idempotent force-remove + unstage.
+func (f *WarmFactory) Dispose(ctx context.Context, u warmpool.Unit) error {
+	return f.DestroyPlaceholder(ctx, u)
+}
