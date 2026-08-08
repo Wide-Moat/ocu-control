@@ -189,6 +189,13 @@ func (f *fakeAPI) ContainerStart(_ context.Context, containerID string, _ contai
 	return f.errOn["ContainerStart"]
 }
 
+func (f *fakeAPI) ContainerRename(_ context.Context, containerID, newName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("ContainerRename", containerID+"->"+newName)
+	return f.errOn["ContainerRename"]
+}
+
 func (f *fakeAPI) ContainerStop(_ context.Context, containerID string, _ container.StopOptions) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
