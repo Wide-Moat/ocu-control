@@ -38,6 +38,7 @@ type config struct {
 	grantedIntents  string        // comma-separated Storage-JWT intent ceiling (read|write|preview) the deployment serves (ADR-0029); empty = the pinned default (read,write); a claim outside it is refused fail-closed. The flag never grants, only narrows.
 	jwtSigningKey   string        // path to the Storage-JWT signing key (config/secret mount)
 	execSigningKey  string        // path to the SEPARATE exec-channel Ed25519 signing key (ADR-0013 key separation); OPTIONAL — unset disables the exec channel
+	soarKeyring     string        // OPTIONAL path to the SOAR webhook keyring (ADR-0039: JSON principals with hex Ed25519 keys); unset keeps the SOAR channel fail-closed (no revoke can verify)
 	gatewayTLSCert  string        // OPTIONAL gateway mTLS server-cert PEM; all-or-none with key+client-ca — unset keeps the stubbed fail-closed plain-TCP posture
 	gatewayTLSKey   string        // OPTIONAL gateway mTLS server-key PEM (all-or-none)
 	gatewayClientCA string        // OPTIONAL gateway mTLS client-CA PEM the verified client-cert SAN is anchored against (all-or-none)
@@ -129,6 +130,7 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.grantedIntents, "granted-intents", "", "comma-separated Storage-JWT intent ceiling the deployment serves: read|write|preview (ADR-0029). Empty = the pinned default (read,write) for the zero-config minimal shelf; the flag NEVER grants, only narrows — a per-mount-derived intent outside the ceiling refuses the create fail-closed. An unknown intent aborts boot")
 	fs.StringVar(&cfg.jwtSigningKey, "jwt-signing-key", "", "path to the Storage-JWT signing key (required)")
 	fs.StringVar(&cfg.execSigningKey, "exec-signing-key", "", "path to the SEPARATE exec-channel Ed25519 signing key mount (ADR-0013 key separation); unset disables the exec channel")
+	fs.StringVar(&cfg.soarKeyring, "soar-keyring", "", "path to the SOAR webhook keyring (ADR-0039: JSON array of principals with hex Ed25519 keys); unset keeps the SOAR channel fail-closed — no webhook can verify and no scope can mint")
 	fs.StringVar(&cfg.gatewayTLSCert, "gateway-tls-cert", "", "gateway mTLS server-cert PEM (all-or-none with -gateway-tls-key/-gateway-client-ca); unset keeps the stubbed plain-TCP fail-closed posture")
 	fs.StringVar(&cfg.gatewayTLSKey, "gateway-tls-key", "", "gateway mTLS server-key PEM (all-or-none)")
 	fs.StringVar(&cfg.gatewayClientCA, "gateway-client-ca", "", "gateway mTLS client-CA PEM the verified client SAN is anchored against (all-or-none)")

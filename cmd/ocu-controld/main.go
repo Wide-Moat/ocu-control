@@ -64,6 +64,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/runtime/docker"
 	"github.com/Wide-Moat/ocu-control/internal/runtime/k8s"
+	"github.com/Wide-Moat/ocu-control/internal/soarverify"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 	"github.com/Wide-Moat/ocu-control/internal/state/postgres"
 )
@@ -359,8 +360,26 @@ func serve(ctx context.Context, cfg config) error {
 	seam := ingress.NewOperatorSeam()
 	seq := boot.New(store, clk)
 
+	// SOAR trust root (ADR-0039, D3): with a keyring configured, the concrete
+	// Ed25519 verifier backs the verify-then-mint fence; without one the
+	// Verifier stays nil and the fence keeps refusing every webhook — the SOAR
+	// channel is fail-closed either way, never fail-open.
+	var soarVerifier killswitch.SOARVerifier
+	if cfg.soarKeyring != "" {
+		principals, err := soarverify.LoadKeyring(cfg.soarKeyring)
+		if err != nil {
+			return err
+		}
+		v, err := soarverify.New(principals)
+		if err != nil {
+			return err
+		}
+		soarVerifier = v
+	}
+
 	opListener := operator.NewListener(socketPathOf(cfg.operatorListen), operator.Deps{
 		Manager:   mgr,
+		Verifier:  soarVerifier,
 		Engine:    eng,
 		Healthz:   seq.Healthz(),
 		Resolver:  operator.NewPeerCredResolver(nil),
