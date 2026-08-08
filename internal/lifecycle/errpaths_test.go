@@ -550,6 +550,10 @@ func (s unstageFailStager) SockDir(name runtime.SessionName) string {
 	return s.inner.SockDir(name)
 }
 
+func (s unstageFailStager) SockDirUnder(root string) string {
+	return s.inner.SockDirUnder(root)
+}
+
 // TestUnwindCompensatorErrorsAreSwallowed covers the error branches inside the
 // stageReserve (Release), stageStageHandoff (Unstage), and stageMaterialize
 // (ForceKill) compensators: when a create fails at commit, the unwind replays each

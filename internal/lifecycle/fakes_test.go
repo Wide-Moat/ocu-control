@@ -333,6 +333,10 @@ func (s *faultStager) SockDir(name runtime.SessionName) string {
 	return s.inner.SockDir(name)
 }
 
+func (s *faultStager) SockDirUnder(root string) string {
+	return s.inner.SockDirUnder(root)
+}
+
 func (s *faultStager) counts() (stage, unstage int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

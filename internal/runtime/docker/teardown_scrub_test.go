@@ -285,3 +285,53 @@ func TestTeardownStep3ReScrubOfReCreatedTree(t *testing.T) {
 		t.Fatalf("after the second scrub the root must be absent: %v", err)
 	}
 }
+
+// TestTeardownStep3ScrubsWarmSockDirRoot is the warm-pool security keystone: a
+// warm-claimed session's handoff lives under a PLACEHOLDER root (base/ocu-pool-N)
+// that the SessionName cannot re-derive. If the finalizer only name-derived
+// base/<sess.Name>, the pooled session's weak Storage-JWT (in its mount-config)
+// would survive teardown on host disk — a credential-persistence hole. The
+// finalizer must scrub the root recorded on the Sandbox handle (SockDirRoot).
+func TestTeardownStep3ScrubsWarmSockDirRoot(t *testing.T) {
+	t.Parallel()
+	base := t.TempDir()
+	const realName = runtime.SessionName("sess-warm-42")
+	// Stage the handoff under the PLACEHOLDER name (as CreatePlaceholder did), not
+	// the real session name; the pooled root is base/ocu-pool-9.
+	placeholderRoot := stageHandoffRoot(t, base, runtime.SessionName("ocu-pool-9"))
+
+	// The name-derived root for the real session was NEVER created (a warm session
+	// has no base/<sess.Name> tree).
+	nameDerivedRoot := filepath.Join(base, string(realName))
+	if _, err := os.Stat(nameDerivedRoot); !os.IsNotExist(err) {
+		t.Fatalf("precondition: the name-derived root must not exist for a warm session")
+	}
+	// The credential-bearing tree IS on disk at the placeholder root.
+	if _, err := os.Stat(filepath.Join(placeholderRoot, "mount-config.json")); err != nil {
+		t.Fatalf("precondition: the pooled JWT-bearing mount-config must exist: %v", err)
+	}
+
+	fake := newFakeAPI()
+	p, err := NewDockerProvider(runtime.TierRunc, Deps{API: fake, StagerBase: base})
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	// The Sandbox handle carries the REAL name but the PLACEHOLDER SockDirRoot —
+	// exactly what the lifecycle passes for a warm-claimed session.
+	sess := runtime.Sandbox{
+		Name:        realName,
+		RuntimeID:   "ctr-warm",
+		Egress:      runtime.EgressBinding{Name: realName, FilesystemID: "fs-1"},
+		Tier:        runtime.TierRunc,
+		SockDirRoot: placeholderRoot,
+	}
+
+	if err := p.Teardown().ForceKill(context.Background(), sess); err != nil {
+		t.Fatalf("ForceKill: %v", err)
+	}
+
+	// The placeholder root — with the tenant Storage-JWT — is GONE.
+	if _, err := os.Lstat(placeholderRoot); !os.IsNotExist(err) {
+		t.Fatalf("the pooled handoff root (with the tenant Storage-JWT) survived teardown (stat err=%v); a name-derived-only scrub missed it", err)
+	}
+}

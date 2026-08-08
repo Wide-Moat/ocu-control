@@ -736,7 +736,7 @@ func (m *Manager) Destroy(ctx context.Context, caller ingress.AuthenticatedCalle
 	// (NFR-SEC-43). The container_name the dial binds the exec JWT to is the
 	// host-attested row.ContainerName, never a body value.
 	if m.controlDialer != nil && row.ContainerName != "" {
-		sockDir := m.handoff.SockDir(runtime.SessionName(row.Key))
+		sockDir := m.sockDirFor(row)
 		// The error is intentionally swallowed: the advisory dial is non-authoritative
 		// for teardown and the pure-domain Manager holds no transport or logger. The
 		// blank assignment makes the deliberate swallow explicit and greppable, mirroring
@@ -759,6 +759,10 @@ func (m *Manager) Destroy(ctx context.Context, caller ingress.AuthenticatedCalle
 		RuntimeID: row.ContainerName,
 		Egress:    runtime.EgressBinding{Name: runtime.SessionName(row.Key), FilesystemID: row.Key},
 		Tier:      m.tier,
+		// SockDirRoot is set only for a warm-pool-claimed session (empty for a cold
+		// one); the finalizer scrubs it so the pooled session's handoff — under a
+		// placeholder root the key cannot re-derive — does not survive teardown.
+		SockDirRoot: row.SockDirRoot,
 	}
 	if err := m.provider.Teardown().GracefulStop(ctx, sandbox, destroyGrace); err != nil {
 		if !errors.Is(err, runtime.ErrNoSuchContainer) {
@@ -1067,6 +1071,10 @@ func (m *Manager) reapOne(ctx context.Context, row state.SessionRow) error {
 		RuntimeID: row.ContainerName,
 		Egress:    runtime.EgressBinding{Name: runtime.SessionName(row.Key), FilesystemID: row.Key},
 		Tier:      m.tier,
+		// SockDirRoot is set only for a warm-pool-claimed session (empty for a cold
+		// one); the finalizer scrubs it so the pooled session's handoff — under a
+		// placeholder root the key cannot re-derive — does not survive teardown.
+		SockDirRoot: row.SockDirRoot,
 	}
 	if err := m.provider.Teardown().ForceKill(ctx, sandbox); err != nil {
 		if !errors.Is(err, runtime.ErrNoSuchContainer) {
@@ -1089,4 +1097,17 @@ func (m *Manager) reapOne(ctx context.Context, row state.SessionRow) error {
 		return fmt.Errorf("release reaped concurrency: %w", err)
 	}
 	return nil
+}
+
+// sockDirFor resolves a session's host-side sock dir. A cold session's root is
+// name-derived (base/<key>/sock); a warm-pool-claimed session's handoff was
+// staged under a placeholder root the key cannot re-derive, so its recorded
+// row.SockDirRoot is used instead (root/sock). This is the ONE place the two
+// paths converge, so the exec dial and the destroy control-RPC dial can never
+// disagree on where a warm session's socket lives.
+func (m *Manager) sockDirFor(row state.SessionRow) string {
+	if row.SockDirRoot != "" {
+		return m.handoff.SockDirUnder(row.SockDirRoot)
+	}
+	return m.handoff.SockDir(runtime.SessionName(row.Key))
 }

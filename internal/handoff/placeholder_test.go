@@ -221,3 +221,21 @@ func TestClaimSpecialize_KeyOverwriteFailureSurfaces(t *testing.T) {
 		t.Fatal("ClaimSpecialize succeeded with a missing key file")
 	}
 }
+
+// TestSockDirUnder_JoinsRootAndSockLeaf pins that SockDirUnder returns root/sock,
+// the same in-root layout SockDir builds — so a warm session's exec dial (which
+// passes the recorded placeholder root) resolves to the identical sock path a
+// cold session gets under its name-derived root, only the root differing.
+func TestSockDirUnder_JoinsRootAndSockLeaf(t *testing.T) {
+	s := newStager(t)
+	// A warm placeholder root, and the cold name-derived root for the same layout.
+	warm := s.SockDirUnder("/var/lib/ocu/handoff/ocu-pool-3")
+	if warm != "/var/lib/ocu/handoff/ocu-pool-3/sock" {
+		t.Errorf("SockDirUnder = %q, want root/sock", warm)
+	}
+	// The two derivations agree on the leaf name: SockDir(name) == SockDirUnder(base/name).
+	cold := s.SockDir("sess-x")
+	if s.SockDirUnder(s.base+"/sess-x") != cold {
+		t.Errorf("SockDirUnder(base/name)=%q disagrees with SockDir(name)=%q on the sock leaf", s.SockDirUnder(s.base+"/sess-x"), cold)
+	}
+}

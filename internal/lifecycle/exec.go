@@ -10,7 +10,6 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
-	"github.com/Wide-Moat/ocu-control/internal/runtime"
 )
 
 // ExecRequest is the substrate-neutral exec request the Manager routes to the
@@ -100,7 +99,7 @@ func (m *Manager) Exec(ctx context.Context, caller ingress.AuthenticatedCaller, 
 	// The sock dir is re-derived PURELY from the host-derived session key (the same
 	// pure function the create-path handoff stager used), and the container name is
 	// the host-attested row value — never a body hint (NFR-SEC-43).
-	sockDir := m.handoff.SockDir(runtime.SessionName(row.Key))
+	sockDir := m.sockDirFor(row)
 	res, err := m.execDriver.Exec(ctx, sockDir, row.ContainerName, req)
 	if err != nil {
 		return ExecResult{}, err

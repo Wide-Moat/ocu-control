@@ -151,6 +151,9 @@ type Stager interface {
 	// (mirroring how the finalizer re-derives every resource name from SessionName).
 	// It writes nothing and is a read-only derivation.
 	SockDir(name runtime.SessionName) string
+	// SockDirUnder returns the sock dir under an EXPLICIT handoff root, for a
+	// warm-pool-claimed session whose root the SessionName cannot re-derive.
+	SockDirUnder(root string) string
 }
 
 // fsStager is the filesystem Stager. It owns a base directory under which every
@@ -270,6 +273,15 @@ func (s *fsStager) Stage(ctx context.Context, name runtime.SessionName, pubKey [
 // row persisting it.
 func (s *fsStager) SockDir(name runtime.SessionName) string {
 	return filepath.Join(s.base, string(name), sockDirName)
+}
+
+// SockDirUnder returns the sock dir under an EXPLICIT handoff root, for a
+// warm-pool-claimed session whose root (base/ocu-pool-N) the SessionName cannot
+// re-derive. It is the same root/sock layout SockDir builds, so a warm session's
+// exec dial and its cold cousin's resolve to the identical in-root sock path —
+// only the root differs. The caller passes the root recorded on the session row.
+func (s *fsStager) SockDirUnder(root string) string {
+	return filepath.Join(root, sockDirName)
 }
 
 // failClosed removes the partial root and returns the wrapped ErrStageFailed, so
