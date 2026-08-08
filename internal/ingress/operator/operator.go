@@ -127,6 +127,15 @@ type Deps struct {
 	// general-flood wait. Zero selects defaultAdmitWait. It trades queue tolerance
 	// against how fast a saturated general pool sheds load rather than piling up.
 	AdmitWait time.Duration
+	// PerCallerRate and PerCallerWindow size the SEC-55 per-caller fairness limiter
+	// keyed on the host-attested PeerCred UID: at most PerCallerRate requests per
+	// PerCallerWindow from one operator principal, so a single flooding caller cannot
+	// consume the shared admission capacity. A GENERAL request over its caller's rate
+	// is throttled with 429; a PRIORITY (revoke) request is NEVER rate-throttled — the
+	// kill switch must fire even from a caller that has otherwise saturated its rate.
+	// A non-positive rate disables the limiter (the gate remains the hard bound).
+	PerCallerRate   int
+	PerCallerWindow time.Duration
 }
 
 // HealthzFunc is the readiness handler the boot Sequencer's Healthz returns. The
@@ -391,6 +400,7 @@ type Listener struct {
 	ln        net.Listener
 	gate      *admit.Gate
 	admitWait time.Duration
+	limiter   *admit.Limiter
 }
 
 // defaultAdmitGeneral / defaultAdmitReserved / defaultAdmitWait size the SEC-55
@@ -405,6 +415,26 @@ const (
 	defaultAdmitReserved = 8
 	defaultAdmitWait     = 2 * time.Second
 )
+
+// defaultPerCallerRate / defaultPerCallerWindow size the per-caller fairness
+// limiter when Deps leaves them at zero: how many GENERAL operator requests one
+// host-attested principal may issue per window before it is throttled with 429. The
+// default is generous relative to legitimate admin/CLI/SOAR usage but far below what
+// a flood needs to monopolize the general pool.
+const (
+	defaultPerCallerRate   = 120
+	defaultPerCallerWindow = time.Second
+)
+
+// admitClock returns c when set, else the production system clock, so the
+// per-caller limiter rate-shapes on real wall time in a deployment that did not
+// inject one. state.Clock's Now method satisfies admit.Clock.
+func admitClock(c state.Clock) admit.Clock {
+	if c != nil {
+		return c
+	}
+	return state.SystemClock()
+}
 
 // NewListener builds the operator listener bound (logically) to socketPath. It
 // does NOT open the socket — Bind does — so a construction in cmd cannot bind
@@ -423,6 +453,18 @@ func NewListener(socketPath string, deps Deps) *Listener {
 	if wait <= 0 {
 		wait = defaultAdmitWait
 	}
+	rate := deps.PerCallerRate
+	if rate == 0 {
+		rate = defaultPerCallerRate
+	}
+	window := deps.PerCallerWindow
+	if window <= 0 {
+		window = defaultPerCallerWindow
+	}
+	// The limiter reads the same Clock the replay window uses; the real clock when
+	// unset, so a construction without an injected clock still rate-shapes on wall
+	// time. state.Clock's Now satisfies admit.Clock.
+	rateClock := admitClock(deps.Clock)
 	l := &Listener{
 		handlers:  NewHandlers(deps),
 		healthz:   deps.Healthz,
@@ -430,6 +472,7 @@ func NewListener(socketPath string, deps Deps) *Listener {
 		socket:    socketPath,
 		gate:      admit.NewGate(general, reserved),
 		admitWait: wait,
+		limiter:   admit.NewLimiter(rate, window, rateClock),
 	}
 	// The read surface is mounted only when a reader is supplied. It is built with
 	// the SAME resolver the mutating handlers use (so attestation is identical) but

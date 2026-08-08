@@ -4,6 +4,7 @@
 package operator
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -11,7 +12,18 @@ import (
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/admit"
+	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/state"
 )
+
+// reqAs builds an operator request whose host-attested PeerCred carries the given
+// uid, stamped on the context exactly as the ConnContext hook does, so the
+// admission middleware's callerRateKey resolves a distinct per-caller bucket.
+func reqAs(method, path string, uid uint32) *http.Request {
+	r := httptest.NewRequest(method, path, nil)
+	info := ingress.ConnInfo{Channel: ingress.ChannelOperator, PeerCred: &ingress.PeerCred{UID: uid}}
+	return r.WithContext(context.WithValue(r.Context(), connInfoKey{}, info))
+}
 
 // TestAdmissionGate_RevokeAdmitsWhileGeneralSaturatedShedsCreate is the SEC-55
 // transport keystone: with the single general slot held by an in-flight request,
@@ -105,6 +117,59 @@ func TestClassOf_PriorityAndGeneralPartition(t *testing.T) {
 		if got := classOf(p); got != admit.ClassGeneral {
 			t.Errorf("classOf(%q) = %v, want ClassGeneral", p, got)
 		}
+	}
+}
+
+// TestAdmissionGate_PerCallerRateThrottlesFloodNotCoTenantNorRevoke is the SEC-55
+// fairness keystone at the middleware: a single caller flooding GENERAL requests is
+// throttled with 429 once over its per-caller rate, while (a) a co-tenant caller
+// keeps its full allowance and (b) a REVOKE from the throttled caller still admits —
+// the kill switch is never rate-throttled.
+func TestAdmissionGate_PerCallerRateThrottlesFloodNotCoTenantNorRevoke(t *testing.T) {
+	t.Parallel()
+	l := &Listener{
+		gate:      admit.NewGate(64, 8), // ample concurrency: the rate limiter is the subject here
+		admitWait: time.Second,
+		limiter:   admit.NewLimiter(2, time.Minute, state.SystemClock()), // 2 general reqs/caller/min
+	}
+	handler := l.admissionGate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	const flooder, cotenant = uint32(1001), uint32(2002)
+
+	// The flooder's first 2 general requests admit; the 3rd is throttled 429.
+	for i := 0; i < 2; i++ {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, reqAs(http.MethodPost, "/v1alpha/sessions", flooder))
+		if rr.Code != http.StatusOK {
+			t.Fatalf("flooder general request %d got %d, want 200", i, rr.Code)
+		}
+	}
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, reqAs(http.MethodPost, "/v1alpha/sessions", flooder))
+	if rr.Code != http.StatusTooManyRequests {
+		t.Errorf("flooder's over-rate general request got %d, want 429", rr.Code)
+	}
+	if rr.Header().Get("Retry-After") == "" {
+		t.Error("a throttled request carries no Retry-After header")
+	}
+
+	// The co-tenant is untouched: its general requests still admit.
+	for i := 0; i < 2; i++ {
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, reqAs(http.MethodPost, "/v1alpha/sessions", cotenant))
+		if rr.Code != http.StatusOK {
+			t.Errorf("co-tenant general request %d got %d, want 200 (the flood consumed a shared bucket)", i, rr.Code)
+		}
+	}
+
+	// A REVOKE from the throttled flooder still admits — the kill switch is exempt
+	// from the per-caller rate limit.
+	revokeRR := httptest.NewRecorder()
+	handler.ServeHTTP(revokeRR, reqAs(http.MethodPost, "/v1alpha/revoke/one", flooder))
+	if revokeRR.Code != http.StatusOK {
+		t.Errorf("revoke from a rate-throttled caller got %d, want 200 — the kill switch must not be rate-limited", revokeRR.Code)
 	}
 }
 

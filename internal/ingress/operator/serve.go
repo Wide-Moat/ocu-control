@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/admit"
@@ -112,6 +113,20 @@ func classOf(path string) admit.Class {
 	return admit.ClassGeneral
 }
 
+// callerRateKey derives the per-caller rate-limit key from the HOST-ATTESTED
+// PeerCred UID stamped on the connection by the ConnContext hook — never a request
+// body or header, so a caller cannot spoof a fresh bucket. An unattested connection
+// (nil PeerCred) shares one "unattested" key so an unattested flood is throttled as
+// a single principal; such requests are refused fail-closed by the handler anyway,
+// but sharing a bucket keeps them from each opening a private allowance.
+func callerRateKey(r *http.Request) string {
+	conn := connInfoFromRequest(r)
+	if conn.PeerCred == nil {
+		return "unattested"
+	}
+	return "uid:" + strconv.FormatUint(uint64(conn.PeerCred.UID), 10)
+}
+
 // admissionGate wraps next with the SEC-55 bounded admission: every request
 // acquires a gate slot before it reaches a handler and releases it after. A
 // priority (revoke/resume/health) request draws on the reserved pool and admits
@@ -123,6 +138,16 @@ func classOf(path string) admit.Class {
 func (l *Listener) admissionGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		class := classOf(r.URL.Path)
+
+		// Per-caller fairness (SEC-55): a GENERAL request over its host-attested
+		// caller's rate is throttled with 429 so one principal cannot monopolize the
+		// general pool. A PRIORITY (revoke) request is NEVER rate-throttled — the kill
+		// switch must fire even from a caller that has saturated its own rate.
+		if class == admit.ClassGeneral && l.limiter != nil && !l.limiter.Allow(callerRateKey(r)) {
+			w.Header().Set("Retry-After", "1")
+			writeStatus(w, http.StatusTooManyRequests, "per-caller operator rate exceeded; retry")
+			return
+		}
 
 		acqCtx := r.Context()
 		// A general request gets a bounded wait so a saturated general pool sheds
