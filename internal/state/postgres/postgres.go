@@ -443,6 +443,12 @@ func (s *store) BindContainerName(ctx context.Context, key string, owner state.I
 	}
 
 	row.ContainerName = containerName
+	// The returned row reflects BOTH values written by the UPDATE. row was read by
+	// selectRowForUpdate BEFORE the write, so its sock_dir_root is still the old
+	// (empty) value; set it to what was persisted so the caller sees a consistent
+	// row without a re-select (the DB stored NULLIF(sockDirRoot,''), which reads
+	// back as "" — the same value the caller passed for a cold bind).
+	row.SockDirRoot = sockDirRoot
 	return row, nil
 }
 
