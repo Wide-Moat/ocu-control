@@ -397,6 +397,11 @@ func serve(ctx context.Context, cfg config) error {
 		Deployment:   operator.DeploymentInfo{RuntimeTier: cfg.runtimeTier, RuntimeProvider: cfg.runtimeProvider},
 		Metrics:      collector.Handler(),
 		MCPKeyEngine: mcpKeyEngine, // operator adapter alone; gateway adapter gets none
+		// SEC-55 admission sizing: reserved-priority pool for the revoke path plus a
+		// per-caller rate on the operator ingress. Zero selects the adapter defaults.
+		AdmitGeneral:  cfg.opAdmitGeneral,
+		AdmitReserved: cfg.opAdmitReserved,
+		PerCallerRate: cfg.opCallerRate,
 	})
 	// Gateway mTLS server config, FAIL-CLOSED at boot when configured: with all
 	// three -gateway-tls-* flags set, the gateway binds a real TLS 1.3 listener that

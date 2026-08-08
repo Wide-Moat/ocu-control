@@ -63,6 +63,9 @@ type config struct {
 	mcpKeysetPath    string        // OPTIONAL path to write the static hashed-key-set artifact (Control→gateway config plane); unset = no-op
 	mcpKeyFile       string        // OPTIONAL path to the minimal-shelf 0600 hashed-entries file; unset = in-memory-only
 	sessionIdleTTL   time.Duration // OPTIONAL idle-session reaper window; 0 = unset (shelf-split resolution in resolveIdleTTL: off on the minimal shelf, ≤15 min ceiling on the full shelf per NFR-SEC-40)
+	opAdmitGeneral   int           // -operator-admit-general: everyday operator concurrency (NFR-SEC-55); 0 = the adapter default (32)
+	opAdmitReserved  int           // -operator-admit-reserved: revoke-path headroom held back from a flood (NFR-SEC-55); 0 = the adapter default (8)
+	opCallerRate     int           // -operator-caller-rate: per-caller GENERAL requests/sec on the operator ingress (NFR-SEC-55); 0 = the adapter default (120), negative disables
 	create           bool          // a create request presented at startup (smoke hook)
 }
 
@@ -134,6 +137,9 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.k8sNamespace, "k8s-namespace", "", "runtime-provider=k8s: the namespace every session Pod/NetworkPolicy/Secret lands in (required when provider is k8s)")
 	fs.StringVar(&cfg.k8sRuntimeClass, "k8s-runtime-class", "", "runtime-provider=k8s: RuntimeClass for the bound tier (e.g. gvisor); empty = cluster default (runc, dev-only)")
 	fs.IntVar(&cfg.warmPoolSize, "warm-pool-size", 0, "pre-warmed docker sandboxes per profile off the create path (0 = disabled). Only the docker provider supports warm.")
+	fs.IntVar(&cfg.opAdmitGeneral, "operator-admit-general", 0, "operator-ingress everyday concurrency (NFR-SEC-55); 0 = adapter default (32)")
+	fs.IntVar(&cfg.opAdmitReserved, "operator-admit-reserved", 0, "operator-ingress revoke-path headroom held back from a flood (NFR-SEC-55); 0 = adapter default (8)")
+	fs.IntVar(&cfg.opCallerRate, "operator-caller-rate", 0, "per-caller GENERAL requests/sec on the operator ingress (NFR-SEC-55); 0 = adapter default (120), negative disables")
 	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.guestImage, "guest-image", "", "default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); a body image overrides it; unset + no body image is refused 400")
 	fs.StringVar(&cfg.guestImageAllow, "guest-image-allow", "", "comma-separated exact-match allow-list of images a create body may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only, a non-allowed override is refused 400")
@@ -284,6 +290,15 @@ func validate(cfg config) error {
 	}
 	if cfg.warmPoolSize < 0 {
 		return fmt.Errorf("%w: -warm-pool-size must not be negative", errRequiredFlagMissing)
+	}
+	// The SEC-55 pool sizes are counts: a negative one is a misconfiguration (the
+	// adapter would clamp it to zero and silently drop the operator's intent). The
+	// per-caller rate is allowed to be negative — that DISABLES the limiter by design.
+	if cfg.opAdmitGeneral < 0 {
+		return fmt.Errorf("%w: -operator-admit-general must not be negative", errRequiredFlagMissing)
+	}
+	if cfg.opAdmitReserved < 0 {
+		return fmt.Errorf("%w: -operator-admit-reserved must not be negative", errRequiredFlagMissing)
 	}
 	if cfg.warmPoolSize > 0 && cfg.runtimeProvider != "docker" {
 		// Only the docker provider supports the create-ahead warm pool; the k8s

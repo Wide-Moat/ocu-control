@@ -466,3 +466,75 @@ func Test_validate_WarmPoolSize(t *testing.T) {
 		}
 	})
 }
+
+// Test_validate_OperatorAdmission pins the SEC-55 admission flags: a negative pool
+// size is refused (it would silently clamp to zero and drop the operator's intent),
+// a negative per-caller rate is ALLOWED (it disables the limiter by design), and
+// zero everywhere selects the adapter defaults.
+func Test_validate_OperatorAdmission(t *testing.T) {
+	t.Parallel()
+	base := []string{
+		"-operator-listen", "unix:///tmp/test.sock",
+		"-gateway-listen", "127.0.0.1:0",
+		"-runtime-tier", "gvisor",
+		"-runtime-provider", "docker",
+		"-workload-profile", "internal_workforce",
+		"-jwt-signing-key", "/tmp/jwt.key",
+		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
+	}
+
+	t.Run("negative-general-refused", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-operator-admit-general", "-1")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if verr := validate(cfg); !errors.Is(verr, errRequiredFlagMissing) {
+			t.Fatalf("negative -operator-admit-general = %v, want a refusal", verr)
+		}
+	})
+
+	t.Run("negative-reserved-refused", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-operator-admit-reserved", "-1")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if verr := validate(cfg); !errors.Is(verr, errRequiredFlagMissing) {
+			t.Fatalf("negative -operator-admit-reserved = %v, want a refusal", verr)
+		}
+	})
+
+	t.Run("negative-caller-rate-allowed-disables", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-operator-caller-rate", "-1")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if verr := validate(cfg); verr != nil {
+			t.Fatalf("negative -operator-caller-rate must validate (it disables the limiter), got %v", verr)
+		}
+		if cfg.opCallerRate != -1 {
+			t.Fatalf("opCallerRate parsed = %d, want -1", cfg.opCallerRate)
+		}
+	})
+
+	t.Run("zero-defaults-validate", func(t *testing.T) {
+		t.Parallel()
+		cfg, _, err := parse(append([]string{}, base...))
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if verr := validate(cfg); verr != nil {
+			t.Fatalf("zero admission flags must validate (adapter defaults), got %v", verr)
+		}
+		if cfg.opAdmitGeneral != 0 || cfg.opAdmitReserved != 0 || cfg.opCallerRate != 0 {
+			t.Fatalf("defaults = (%d,%d,%d), want all zero (adapter defaults)", cfg.opAdmitGeneral, cfg.opAdmitReserved, cfg.opCallerRate)
+		}
+	})
+}
