@@ -30,6 +30,8 @@ package ingress
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync/atomic"
 
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
@@ -234,6 +236,12 @@ type ConnInfo struct {
 	// CertSANs are the verified mTLS client-cert SANs of the gateway peer. It is
 	// nil on the operator channel.
 	CertSANs []string
+	// ConnID is the host-assigned identity of the underlying connection, stamped
+	// once by the listener's per-connection hook. It keys the authentication
+	// trail's once-per-connection success latch and correlates the logon with
+	// the actions that follow on the same connection. Empty when the request did
+	// not arrive through a listener hook.
+	ConnID string
 }
 
 // ErrUnattested is the fail-closed identity refusal: a resolver could not derive a
@@ -254,4 +262,32 @@ type IdentityResolver interface {
 	// (or a wrapped resolver-specific cause) when no attested identity is present.
 	// It MUST NOT consult a request body.
 	Resolve(ctx context.Context, conn ConnInfo) (AuthenticatedCaller, error)
+}
+
+// nextConnID is the process-wide connection counter behind NextConnID.
+var nextConnID atomic.Uint64
+
+// NextConnID mints the host-assigned identity for one accepted connection.
+// Monotonic per process; the value is a correlation handle, never an authority.
+func NextConnID() string {
+	return fmt.Sprintf("conn-%020d", nextConnID.Add(1))
+}
+
+// authnLatchKey carries the per-connection success latch on the base context
+// the listener's ConnContext hook creates. Every request on the connection
+// inherits it, so the authentication trail emits one logon per connection with
+// no global map and no eviction to reason about — the connection's own
+// lifetime is the latch's lifetime.
+type authnLatchKey struct{}
+
+// WithAuthnLatch attaches a fresh latch to a per-connection context.
+func WithAuthnLatch(ctx context.Context) context.Context {
+	return context.WithValue(ctx, authnLatchKey{}, &atomic.Bool{})
+}
+
+// AuthnLatchFrom reads the connection's latch, or nil when the request did not
+// arrive through a listener hook.
+func AuthnLatchFrom(ctx context.Context) *atomic.Bool {
+	latch, _ := ctx.Value(authnLatchKey{}).(*atomic.Bool)
+	return latch
 }
