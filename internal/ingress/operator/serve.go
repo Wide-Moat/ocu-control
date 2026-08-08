@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strconv"
 	"time"
 
+	"github.com/Wide-Moat/ocu-control/internal/admit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 )
 
@@ -64,7 +66,7 @@ func (l *Listener) Serve(ctx context.Context) error {
 	}
 	l.registerRoutes(mux)
 
-	srv := newServer(ctx, mux)
+	srv := newServer(ctx, l.admissionGate(mux))
 
 	// Shut the server down when ctx is cancelled so a caller's lifecycle drives the
 	// listener's lifetime; Serve returns http.ErrServerClosed on that path, which we
@@ -82,6 +84,93 @@ func (l *Listener) Serve(ctx context.Context) error {
 		return fmt.Errorf("operator: serve: %w", err)
 	}
 	return nil
+}
+
+// priorityRoutes is the kill-switch family whose admission draws on the reserved
+// pool first: revoke-one, revoke-all, and the in-band DENY-ALL lift (resume-all).
+// A request whose path is one of these is ClassPriority; everything else on the
+// operator plane (create, destroy, read, quota-override, mcp-key) is ClassGeneral.
+// The set is matched by exact path so a new operator route defaults to general
+// unless it is deliberately added here — a revoke route must never silently lose
+// its reservation, and a non-revoke route must never silently gain it.
+var priorityRoutes = map[string]struct{}{
+	"/v1alpha/revoke/one": {},
+	"/v1alpha/revoke/all": {},
+	"/v1alpha/resume/all": {},
+}
+
+// classOf maps a request path to its admission class. The health and metrics
+// endpoints are ClassPriority so a flood on the mutating surface cannot starve a
+// liveness scrape or the readiness probe the boot sequencer depends on.
+func classOf(path string) admit.Class {
+	switch path {
+	case "/healthz", "/metrics":
+		return admit.ClassPriority
+	}
+	if _, ok := priorityRoutes[path]; ok {
+		return admit.ClassPriority
+	}
+	return admit.ClassGeneral
+}
+
+// callerRateKey derives the per-caller rate-limit key from the HOST-ATTESTED
+// PeerCred UID stamped on the connection by the ConnContext hook — never a request
+// body or header, so a caller cannot spoof a fresh bucket. An unattested connection
+// (nil PeerCred) shares one "unattested" key so an unattested flood is throttled as
+// a single principal; such requests are refused fail-closed by the handler anyway,
+// but sharing a bucket keeps them from each opening a private allowance.
+func callerRateKey(r *http.Request) string {
+	conn := connInfoFromRequest(r)
+	if conn.PeerCred == nil {
+		return "unattested"
+	}
+	return "uid:" + strconv.FormatUint(uint64(conn.PeerCred.UID), 10)
+}
+
+// admissionGate wraps next with the SEC-55 bounded admission: every request
+// acquires a gate slot before it reaches a handler and releases it after. A
+// priority (revoke/resume/health) request draws on the reserved pool and admits
+// even while a general flood holds every general slot; a general request waits at
+// most admitWait for a general slot and is shed with 503 + Retry-After if the pool
+// stays saturated, so a flood sheds load rather than queuing unboundedly. The gate
+// is acquired under the REQUEST context so a client that hangs up frees its wait
+// immediately.
+func (l *Listener) admissionGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		class := classOf(r.URL.Path)
+
+		// Per-caller fairness (SEC-55): a GENERAL request over its host-attested
+		// caller's rate is throttled with 429 so one principal cannot monopolize the
+		// general pool. A PRIORITY (revoke) request is NEVER rate-throttled — the kill
+		// switch must fire even from a caller that has saturated its own rate.
+		if class == admit.ClassGeneral && l.limiter != nil && !l.limiter.Allow(callerRateKey(r)) {
+			w.Header().Set("Retry-After", "1")
+			writeStatus(w, http.StatusTooManyRequests, "per-caller operator rate exceeded; retry")
+			return
+		}
+
+		acqCtx := r.Context()
+		// A general request gets a bounded wait so a saturated general pool sheds
+		// rather than piling goroutines; a priority request is not subject to the
+		// general-flood wait — it draws on the reserved pool.
+		if class == admit.ClassGeneral {
+			var cancel context.CancelFunc
+			acqCtx, cancel = context.WithTimeout(acqCtx, l.admitWait)
+			defer cancel()
+		}
+
+		release, ok := l.gate.Acquire(acqCtx, class)
+		if !ok {
+			// Shed: the general pool stayed saturated past admitWait (or the client
+			// hung up). 503 with Retry-After is the load-shed signal, distinct from a
+			// 4xx deny — the request was well-formed, the plane is momentarily full.
+			w.Header().Set("Retry-After", "1")
+			writeStatus(w, http.StatusServiceUnavailable, "operator ingress saturated; retry")
+			return
+		}
+		defer release()
+		next.ServeHTTP(w, r)
+	})
 }
 
 // newServer builds the operator HTTP server with the bounded read/idle posture and

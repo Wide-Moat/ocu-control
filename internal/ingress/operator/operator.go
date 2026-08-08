@@ -42,6 +42,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/Wide-Moat/ocu-control/internal/admit"
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
 	"github.com/Wide-Moat/ocu-control/internal/ingress/authntrail"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
@@ -113,6 +114,28 @@ type Deps struct {
 	// wires the real engine; tests may inject a configured one. It is SEPARATE from the
 	// killswitch Engine: MCP key operations do not touch the session denylist.
 	MCPKeyEngine *mcpkey.Engine
+	// AdmitGeneral and AdmitReserved size the SEC-55 admission gate the listener
+	// wraps around every request: AdmitGeneral bounds the everyday operator
+	// concurrency (create/read/override/mcp-key) and AdmitReserved is the headroom
+	// held back for the kill-switch family (revoke-one/all, resume-all) so a flood on
+	// the operator socket cannot starve a revoke. Non-positive values select the
+	// package defaults (defaultAdmitGeneral / defaultAdmitReserved).
+	AdmitGeneral  int
+	AdmitReserved int
+	// AdmitWait bounds how long a GENERAL request waits for a slot before it is shed
+	// with 503; a priority request draws on the reserved pool and is not subject to a
+	// general-flood wait. Zero selects defaultAdmitWait. It trades queue tolerance
+	// against how fast a saturated general pool sheds load rather than piling up.
+	AdmitWait time.Duration
+	// PerCallerRate and PerCallerWindow size the SEC-55 per-caller fairness limiter
+	// keyed on the host-attested PeerCred UID: at most PerCallerRate requests per
+	// PerCallerWindow from one operator principal, so a single flooding caller cannot
+	// consume the shared admission capacity. A GENERAL request over its caller's rate
+	// is throttled with 429; a PRIORITY (revoke) request is NEVER rate-throttled — the
+	// kill switch must fire even from a caller that has otherwise saturated its rate.
+	// A non-positive rate disables the limiter (the gate remains the hard bound).
+	PerCallerRate   int
+	PerCallerWindow time.Duration
 }
 
 // HealthzFunc is the readiness handler the boot Sequencer's Healthz returns. The
@@ -369,12 +392,48 @@ type CreateRequest struct {
 // kill-switch-first Boot, off the readiness hook, so it can never bind before the
 // deny posture is durable.
 type Listener struct {
-	handlers *Handlers
-	read     *ReadHandlers
-	healthz  HealthzFunc
-	metrics  http.Handler
-	socket   string
-	ln       net.Listener
+	handlers  *Handlers
+	read      *ReadHandlers
+	healthz   HealthzFunc
+	metrics   http.Handler
+	socket    string
+	ln        net.Listener
+	gate      *admit.Gate
+	admitWait time.Duration
+	limiter   *admit.Limiter
+}
+
+// defaultAdmitGeneral / defaultAdmitReserved / defaultAdmitWait size the SEC-55
+// admission gate when Deps leaves them at zero. The general pool is the everyday
+// operator concurrency; the reserved pool is the revoke headroom held back from any
+// flood; the wait is how long a general request queues before it is shed with 503.
+// The values are deliberately small — the operator plane is a low-QPS control
+// surface, and a large general pool would only let a flood consume more host
+// goroutines before shedding without changing the revoke guarantee.
+const (
+	defaultAdmitGeneral  = 32
+	defaultAdmitReserved = 8
+	defaultAdmitWait     = 2 * time.Second
+)
+
+// defaultPerCallerRate / defaultPerCallerWindow size the per-caller fairness
+// limiter when Deps leaves them at zero: how many GENERAL operator requests one
+// host-attested principal may issue per window before it is throttled with 429. The
+// default is generous relative to legitimate admin/CLI/SOAR usage but far below what
+// a flood needs to monopolize the general pool.
+const (
+	defaultPerCallerRate   = 120
+	defaultPerCallerWindow = time.Second
+)
+
+// admitClock returns c when set, else the production system clock, so the
+// per-caller limiter rate-shapes on real wall time in a deployment that did not
+// inject one. state.Clock's Now method satisfies admit.Clock.
+func admitClock(c state.Clock) admit.Clock {
+	if c != nil {
+		return c
+	}
+	return state.SystemClock()
 }
 
 // NewListener builds the operator listener bound (logically) to socketPath. It
@@ -382,11 +441,38 @@ type Listener struct {
 // ahead of the readiness gate. socketPath is the filesystem path of the Unix
 // socket (the operator endpoint with any unix:// scheme stripped by the caller).
 func NewListener(socketPath string, deps Deps) *Listener {
+	general := deps.AdmitGeneral
+	if general <= 0 {
+		general = defaultAdmitGeneral
+	}
+	reserved := deps.AdmitReserved
+	if reserved <= 0 {
+		reserved = defaultAdmitReserved
+	}
+	wait := deps.AdmitWait
+	if wait <= 0 {
+		wait = defaultAdmitWait
+	}
+	rate := deps.PerCallerRate
+	if rate == 0 {
+		rate = defaultPerCallerRate
+	}
+	window := deps.PerCallerWindow
+	if window <= 0 {
+		window = defaultPerCallerWindow
+	}
+	// The limiter reads the same Clock the replay window uses; the real clock when
+	// unset, so a construction without an injected clock still rate-shapes on wall
+	// time. state.Clock's Now satisfies admit.Clock.
+	rateClock := admitClock(deps.Clock)
 	l := &Listener{
-		handlers: NewHandlers(deps),
-		healthz:  deps.Healthz,
-		metrics:  deps.Metrics,
-		socket:   socketPath,
+		handlers:  NewHandlers(deps),
+		healthz:   deps.Healthz,
+		metrics:   deps.Metrics,
+		socket:    socketPath,
+		gate:      admit.NewGate(general, reserved),
+		admitWait: wait,
+		limiter:   admit.NewLimiter(rate, window, rateClock),
 	}
 	// The read surface is mounted only when a reader is supplied. It is built with
 	// the SAME resolver the mutating handlers use (so attestation is identical) but
