@@ -29,10 +29,10 @@ type fakeAPI struct {
 	secrets  map[string]*corev1.Secret
 	calls    []string
 
-	// readyPod, when set, is returned by GetPod already Ready. Otherwise GetPod
-	// returns whatever is stored (a freshly created pod is not Ready), so a test
-	// that wants Materialize to succeed marks it ready via markReady.
-	failOn map[string]error
+	// readyOnCreate, when true, makes CreatePod store the pod already Ready with
+	// an IP, so a Materialize happy-path test needs no concurrent readiness dance.
+	readyOnCreate bool
+	failOn        map[string]error
 }
 
 func newFakeAPI() *fakeAPI {
@@ -75,7 +75,13 @@ func (f *fakeAPI) CreatePod(_ context.Context, p *corev1.Pod) error {
 	if err := f.failOn["CreatePod"]; err != nil {
 		return err
 	}
-	f.pods[p.Name] = p.DeepCopy()
+	stored := p.DeepCopy()
+	if f.readyOnCreate {
+		stored.Status.PodIP = "10.1.2.3"
+		stored.Status.Phase = corev1.PodRunning
+		stored.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
+	}
+	f.pods[p.Name] = stored
 	return nil
 }
 
@@ -90,7 +96,10 @@ func (f *fakeAPI) GetPod(_ context.Context, name string) (*corev1.Pod, error) {
 	if !ok {
 		return nil, notFound(name)
 	}
-	return p, nil
+	// Return a deep copy, as a real clientset does: the provider must never share
+	// mutable state with the store, and a test that mutates the stored pod (e.g.
+	// markReady) must not race a concurrent GetPod read.
+	return p.DeepCopy(), nil
 }
 
 func (f *fakeAPI) DeletePod(_ context.Context, name string, grace *int64) error {
@@ -137,6 +146,9 @@ func (f *fakeAPI) ListManagedPods(_ context.Context) ([]corev1.Pod, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.record("ListManagedPods")
+	if err := f.failOn["ListManagedPods"]; err != nil {
+		return nil, err
+	}
 	out := make([]corev1.Pod, 0, len(f.pods))
 	for _, p := range f.pods {
 		out = append(out, *p)
@@ -195,49 +207,21 @@ func newTestProvider(t *testing.T, api kubeAPI, tier runtime.RuntimeTier) *Provi
 // RuntimeID.
 func TestMaterialize_CreatesAllThreeObjectsInOrderAndReturnsHandle(t *testing.T) {
 	api := newFakeAPI()
+	api.readyOnCreate = true // the pod is Ready the moment it exists, so waitReady returns on the first poll
 	p := newTestProvider(t, api, runtime.TierGvisor)
 
-	// Make the pod Ready as soon as it is created so waitReady returns on the
-	// first poll: pre-arm by marking on the first GetPod via a goroutine is
-	// overkill; instead create, then the provider's first GetPod sees a
-	// not-ready pod, so we drive readiness by marking before Materialize returns.
-	// Simplest deterministic approach: run Materialize in a goroutine and mark
-	// ready once the pod exists.
-	done := make(chan struct {
-		sb  runtime.Sandbox
-		err error
-	}, 1)
-	go func() {
-		sb, err := p.Materialize(context.Background(), goodSpec())
-		done <- struct {
-			sb  runtime.Sandbox
-			err error
-		}{sb, err}
-	}()
-
-	// Spin until the pod exists, then mark it ready.
-	for {
-		api.mu.Lock()
-		_, ok := api.pods["ocu-sess-sess-abc"]
-		api.mu.Unlock()
-		if ok {
-			api.markReady("ocu-sess-sess-abc")
-			break
-		}
+	sb, err := p.Materialize(context.Background(), goodSpec())
+	if err != nil {
+		t.Fatalf("Materialize: %v", err)
 	}
-
-	res := <-done
-	if res.err != nil {
-		t.Fatalf("Materialize: %v", res.err)
+	if sb.Name != "sess-abc" {
+		t.Errorf("Sandbox.Name = %q, want the host-derived name", sb.Name)
 	}
-	if res.sb.Name != "sess-abc" {
-		t.Errorf("Sandbox.Name = %q, want the host-derived name", res.sb.Name)
+	if sb.RuntimeID != "ocu-sess-sess-abc" {
+		t.Errorf("Sandbox.RuntimeID = %q, want the pure-function pod name", sb.RuntimeID)
 	}
-	if res.sb.RuntimeID != "ocu-sess-sess-abc" {
-		t.Errorf("Sandbox.RuntimeID = %q, want the pure-function pod name", res.sb.RuntimeID)
-	}
-	if res.sb.Egress.Name != "sess-abc" {
-		t.Errorf("Sandbox.Egress.Name = %q, want the host-derived session key (the revoke handle)", res.sb.Egress.Name)
+	if sb.Egress.Name != "sess-abc" {
+		t.Errorf("Sandbox.Egress.Name = %q, want the host-derived session key (the revoke handle)", sb.Egress.Name)
 	}
 
 	// Order: secret before policy before pod.
