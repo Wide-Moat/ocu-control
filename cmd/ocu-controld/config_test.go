@@ -143,7 +143,7 @@ func Test_buildMCPKeyEngine_NoFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
+	_, _, _, _, auditSink, _ := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
 
 	eng, err := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if err != nil {
@@ -184,7 +184,7 @@ func Test_buildMCPKeyEngine_LoosePermAbortsBoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
+	_, _, _, _, auditSink, _ := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
 
 	_, bootErr := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if bootErr == nil {
@@ -218,7 +218,7 @@ func Test_buildMCPKeyEngine_AbsentFileIsCleanStart(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
+	_, _, _, _, auditSink, _ := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
 
 	eng, bootErr := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if bootErr != nil {
@@ -265,7 +265,7 @@ func Test_buildMCPKeyEngine_LoadsExistingEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("buildResumedChainSink: %v", err)
 	}
-	_, _, _, _, auditSink := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
+	_, _, _, _, auditSink, _ := compose(state.NewInMemory(clk), clk, nil, 0, 0, nil, nil, sink, "", cfg)
 
 	eng, bootErr := buildMCPKeyEngine(context.Background(), cfg, clk, auditSink)
 	if bootErr != nil {
@@ -388,6 +388,81 @@ func Test_validate_K8sRequiresNamespace(t *testing.T) {
 		}
 		if err := validate(cfg); err != nil {
 			t.Fatalf("docker provider must validate without a k8s namespace, got %v", err)
+		}
+	})
+}
+
+// Test_validate_WarmPoolSize pins the -warm-pool-size gate: a negative size and a
+// positive size on a non-docker provider are refused; a positive size on docker
+// (and zero on any provider) validates.
+func Test_validate_WarmPoolSize(t *testing.T) {
+	t.Parallel()
+	base := []string{
+		"-operator-listen", "unix:///tmp/test.sock",
+		"-gateway-listen", "127.0.0.1:0",
+		"-runtime-tier", "gvisor",
+		"-workload-profile", "internal_workforce",
+		"-jwt-signing-key", "/tmp/jwt.key",
+		"-audit-sink", "/tmp/audit.jsonl",
+		"-storage-issuer", "https://control.test/provisional",
+		"-storage-audience", "egress.test",
+	}
+
+	t.Run("negative-refused", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-runtime-provider", "docker", "-warm-pool-size", "-1")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := validate(cfg); !errors.Is(err, errRequiredFlagMissing) {
+			t.Fatalf("negative warm-pool-size = %v, want a refusal", err)
+		}
+	})
+
+	t.Run("positive-on-k8s-refused", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-runtime-provider", "k8s", "-k8s-namespace", "ns", "-warm-pool-size", "8")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		verr := validate(cfg)
+		if !errors.Is(verr, errRequiredFlagMissing) {
+			t.Fatalf("warm-pool-size on k8s = %v, want a refusal (only docker supports warm)", verr)
+		}
+		if !strings.Contains(verr.Error(), "docker") {
+			t.Fatalf("error %q does not name the docker-only constraint", verr)
+		}
+	})
+
+	t.Run("positive-on-docker-validates", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-runtime-provider", "docker", "-warm-pool-size", "8")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if err := validate(cfg); err != nil {
+			t.Fatalf("warm-pool-size on docker must validate, got %v", err)
+		}
+		if cfg.warmPoolSize != 8 {
+			t.Fatalf("warmPoolSize parsed = %d, want 8", cfg.warmPoolSize)
+		}
+	})
+
+	t.Run("zero-is-the-default-and-validates", func(t *testing.T) {
+		t.Parallel()
+		args := append(append([]string{}, base...), "-runtime-provider", "docker")
+		cfg, _, err := parse(args)
+		if err != nil {
+			t.Fatalf("parse: %v", err)
+		}
+		if cfg.warmPoolSize != 0 {
+			t.Fatalf("default warmPoolSize = %d, want 0 (disabled)", cfg.warmPoolSize)
+		}
+		if err := validate(cfg); err != nil {
+			t.Fatalf("zero warm-pool-size must validate, got %v", err)
 		}
 	})
 }

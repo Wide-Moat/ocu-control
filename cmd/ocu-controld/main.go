@@ -65,9 +65,11 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/runtime/docker"
 	"github.com/Wide-Moat/ocu-control/internal/runtime/k8s"
+	"github.com/Wide-Moat/ocu-control/internal/runtime/warmpool"
 	"github.com/Wide-Moat/ocu-control/internal/soarverify"
 	"github.com/Wide-Moat/ocu-control/internal/state"
 	"github.com/Wide-Moat/ocu-control/internal/state/postgres"
+	"github.com/Wide-Moat/ocu-control/internal/warmclaim"
 )
 
 // version is stamped at build time via -ldflags "-X main.version=...".
@@ -340,7 +342,7 @@ func serve(ctx context.Context, cfg config) error {
 		return err
 	}
 
-	mgr, eng, custodian, collector, auditSink := compose(store, clk, provider, profile, tier, signer, execSigner, sink, caCertPEM, cfg)
+	mgr, eng, custodian, collector, auditSink, warmPool := compose(store, clk, provider, profile, tier, signer, execSigner, sink, caCertPEM, cfg)
 
 	// MCP API key surface, FAIL-CLOSED at boot: construct the Engine from a
 	// Minter (crypto/rand), the selected RecordStore (Postgres when -state-dsn is
@@ -434,6 +436,16 @@ func serve(ctx context.Context, cfg config) error {
 			} else {
 				return fmt.Errorf("boot: reconcile orphans: %w", err)
 			}
+		}
+		// Warm the pool ONLY after the reconcile sweep completes: the sweep
+		// force-kills any managed placeholder that has no session row, so warming
+		// before it would race the sweep and destroy fresh, never-claimed units. A
+		// nil pool (the minimal shelf / non-docker provider) makes this a no-op. The
+		// pool is warmed for the deployment's default guest-image profile — the one
+		// a body-less create resolves to; a create for a different profile misses the
+		// pool and cold-creates.
+		if warmPool != nil {
+			warmPool.Warm(warmPoolProfile(cfg))
 		}
 		if err := opListener.Bind(); err != nil {
 			return err
@@ -533,7 +545,7 @@ func serveCreateOnStart(ctx context.Context, store state.Store, clk state.Clock)
 // (chain computed in-process, nothing durably persisted by default), and a
 // deployment Limits — are bound here. profile and tier are deployment-fixed and
 // flow onto the Manager as fixed fields; CreateInput carries neither.
-func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, execSigner *cred.ExecSigner, sink *ocsf.ChainSink, caCertPEM string, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink) {
+func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvider, profile admission.WorkloadProfile, tier runtime.RuntimeTier, signer *cred.Signer, execSigner *cred.ExecSigner, sink *ocsf.ChainSink, caCertPEM string, cfg config) (*lifecycle.Manager, *killswitch.Engine, *registry.Custodian, *metrics.Collector, audit.AuditSink, *warmpool.Pool) {
 	custodian := registry.NewCustodian(store)
 	gate := quota.NewGate(store, clk, defaultLimits())
 	// The metrics collector reads live state through the same custodian the admin
@@ -543,6 +555,29 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 	// /metrics scrape handler). It is purely observational — non-fatal everywhere.
 	collector := metrics.NewCollector(custodian)
 	stager := handoff.NewStager(handoffBase)
+
+	// Warm pool (opt-in, docker only). When -warm-pool-size > 0 and the provider is
+	// docker, build a WarmFactory sharing the provider's own client + tier + egress
+	// and a per-profile pool of that size. Both nil otherwise (the minimal-shelf
+	// default), so the create path is cold-only and byte-identical. validate()
+	// already refused a size on a non-docker provider, so the type assertion is
+	// only reached when it must succeed; a failed assertion falls back to cold-only
+	// rather than panicking. The pool is not WARMED here — Warm runs in serve()
+	// strictly after the boot reconcile, so the reconcile sweep cannot force-kill a
+	// fresh placeholder that has no row yet.
+	var (
+		warmPoolConcrete *warmpool.Pool
+		warmPool         warmclaim.Pool
+		warmClaimer      warmclaim.Claimer
+	)
+	if cfg.warmPoolSize > 0 {
+		if dp, ok := provider.(*docker.Provider); ok {
+			factory := dp.NewWarmFactory(stager)
+			warmPoolConcrete = warmpool.New(factory, cfg.warmPoolSize)
+			warmPool = warmPoolConcrete
+			warmClaimer = factory
+		}
+	}
 	// The OCSF chain sink is built and RESUMED in main() (buildResumedChainSink), where
 	// the boot-edge I/O — reading the prior spine's tip, recording a chain-break on a
 	// decoupled tail, and the boot-time chain verification — lives next to the boot's
@@ -627,13 +662,15 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		ExecDriver:    execDriver,
 		ExecVerifyKey: execVerifyKeyOf(execSigner),
 		Metrics:       collector,
+		Pool:          warmPool,
+		Claimer:       warmClaimer,
 	})
 	// The kill-switch refunds the per-tenant concurrency slot through the SAME
 	// quota.Gate that charged it on create, so a force-kill returns the level counter
 	// via the one decrement path the destroy and reconcile paths share (F-1: without
 	// this the counter is a write-only ratchet on the kill path).
 	eng := killswitch.NewEngine(store, custodian, provider, clk, sink, gate)
-	return mgr, eng, custodian, collector, sink
+	return mgr, eng, custodian, collector, sink, warmPoolConcrete
 }
 
 // execVerifyKeyOf returns the exec signer's public verify key, or nil when no exec
@@ -1403,3 +1440,32 @@ func tcpAddrOf(endpoint string) string {
 	}
 	return endpoint
 }
+
+// warmPoolProfile is the single profile the daemon pre-warms: the deployment's
+// default guest image with the deployment's default hard caps and a pure-exec
+// (no-FUSE) posture. A create whose resolved profile matches — the common
+// body-less create against the default image with default caps — gets a warm
+// hit; a create naming different caps, a BYO image, or a storage mount resolves
+// to a different profile and cold-creates (a pool MISS, never wrong). It MUST
+// mirror lifecycle.Manager.warmProfile's key derivation, or every warmed unit is
+// unclaimable. v1 warms exactly this one profile; a multi-profile pool is a later
+// tuning knob.
+func warmPoolProfile(cfg config) warmpool.Profile {
+	return warmpool.Profile{
+		ImageRef:    cfg.guestImage,
+		CPUCores:    warmDefaultCPUCores,
+		MemoryBytes: warmDefaultMemoryBytes,
+		PidsLimit:   warmDefaultPidsLimit,
+		FUSE:        false,
+	}
+}
+
+// warmDefault* are the deployment-fixed hard caps a body-less create resolves to,
+// the caps the warmed profile bakes. A create carrying different caps misses the
+// pool. They are the pool's canonical key; they are NOT a policy ceiling (the
+// admission matrix and the per-request caps are the real bound).
+const (
+	warmDefaultCPUCores    = 1.0
+	warmDefaultMemoryBytes = 1 << 30
+	warmDefaultPidsLimit   = 512
+)

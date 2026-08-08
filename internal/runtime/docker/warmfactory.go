@@ -232,3 +232,13 @@ func placeholderSpec(p warmpool.Profile, name runtime.SessionName, mat runtime.H
 func (f *WarmFactory) Dispose(ctx context.Context, u warmpool.Unit) error {
 	return f.DestroyPlaceholder(ctx, u)
 }
+
+// NewWarmFactory builds a WarmFactory that shares THIS provider's Docker client,
+// tier, and egress wiring, so a pooled unit is materialized on the same daemon
+// with the same hardened posture as a cold session. The daemon calls it to
+// construct the warm pool's factory from the provider it already built, keeping
+// the single dockerAPI client in one place (the CI grep that pins client.APIClient
+// to this package still holds — the factory names no SDK type).
+func (p *Provider) NewWarmFactory(stager handoff.Stager) *WarmFactory {
+	return NewWarmFactory(p.api, stager, p.tier, p.egressNetwork, p.edgeHost)
+}
