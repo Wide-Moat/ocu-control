@@ -4,7 +4,7 @@
 // notices.
 module github.com/Wide-Moat/ocu-control
 
-go 1.26.4
+go 1.26.5
 
 require (
 	github.com/Wide-Moat/ocu-sandbox/host/exec v0.1.0

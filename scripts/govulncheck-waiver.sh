@@ -4,7 +4,7 @@
 #
 # GATE (SUPPLY-03): the govulncheck waiver gate. It runs govulncheck in JSON
 # mode and fails CI on any reachable vulnerability that is NOT on the explicit
-# waiver list. The waiver covers five docker/docker@v28.5.2 advisories that have
+# waiver list. The waiver covers three docker/docker@v28.5.2 advisories that have
 # no upstream fix (Fixed-in = N/A): the Docker Engine SDK is a build-time
 # dependency of the RuntimeProvider, reached via Materialize -> docker-SDK, and
 # the project tracks no alternative SDK at this version. Each waived ID is listed
@@ -34,16 +34,14 @@
 set -euo pipefail
 
 # --- waiver table -----------------------------------------------------------
-# OSV ID -> one-line rationale. All five are docker/docker@v28.5.2, Fixed-in=N/A,
+# OSV ID -> one-line rationale. All three are docker/docker@v28.5.2, Fixed-in=N/A,
 # reachable from RuntimeProvider Materialize -> docker-SDK. Review the set on or
 # before WAIVER_REVIEW_BY; re-confirm each is still Fixed-in=N/A and still the
 # only path, or remove it.
 declare -A WAIVED=(
   [GO-2026-4883]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
   [GO-2026-4887]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
-  [GO-2026-5617]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
   [GO-2026-5668]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
-  [GO-2026-5746]="docker/docker@v28.5.2, Fixed-in=N/A, RuntimeProvider->docker-SDK"
 )
 
 # Review-by date (YYYY-MM-DD). Past this the gate fails closed and the waiver set
