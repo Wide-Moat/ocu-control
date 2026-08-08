@@ -170,7 +170,6 @@ func resourceCapsFromProto(rc *sessionv1.ResourceCaps) runtime.ResourceCaps {
 // service. No reflection service is registered: the surface is the frozen
 // contract, not a discovery endpoint.
 func newGRPCServer(h *Handlers, scope ingress.ServiceScope, selfEndpoint string) *grpc.Server {
-	// nosemgrep: go.grpc.security.grpc-server-insecure-connection.grpc-server-insecure-connection
 	// This server deliberately carries NO grpc.Creds(): it serves via
 	// ServeHTTP over the shared gateway listener, which is already a
 	// tls.NewListener terminating mTLS 1.3 with RequireAndVerifyClientCert
@@ -179,7 +178,7 @@ func newGRPCServer(h *Handlers, scope ingress.ServiceScope, selfEndpoint string)
 	// client-authenticated connection — breaking the wire, not securing it.
 	// The encryption + peer verification the rule demands live in the
 	// listener, which is where the two wires share one TLS identity.
-	srv := grpc.NewServer()
+	srv := grpc.NewServer() // nosemgrep: go.grpc.security.grpc-server-insecure-connection.grpc-server-insecure-connection
 	sessionv1.RegisterSessionSetupServer(srv, &setupServer{
 		handlers:     h,
 		scope:        scope,
