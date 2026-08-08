@@ -86,6 +86,35 @@ func TestExposition_ReaperCounters(t *testing.T) {
 	}
 }
 
+// TestExposition_AdmissionCounters asserts the SEC-55 admission gate's shed (503)
+// and throttle (429) counters are monotonic and exposed under distinct series, so
+// an operator can alert on an operator-ingress flood being absorbed. A zero-count
+// increment must not advance (only real sheds/throttles count).
+func TestExposition_AdmissionCounters(t *testing.T) {
+	c := NewCollector(fakeReader{})
+	c.IncAdmissionShed()
+	c.IncAdmissionShed()
+	c.IncAdmissionThrottled()
+
+	var buf bytes.Buffer
+	c.WritePrometheus(context.Background(), &buf)
+	out := buf.String()
+
+	for _, want := range []string{
+		`ocu_control_operator_admission_shed_total 2`,
+		`ocu_control_operator_admission_throttled_total 1`,
+		`# TYPE ocu_control_operator_admission_shed_total counter`,
+		`# TYPE ocu_control_operator_admission_throttled_total counter`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("exposition missing %q\n--- got ---\n%s", want, out)
+		}
+	}
+	// The two counters carry DISTINCT values (2 vs 1), so a shed (full pool) and a
+	// throttle (per-caller rate) cannot be the same series — they are different
+	// operational signals. The explicit `_total 2` / `_total 1` checks above bind that.
+}
+
 // TestExposition_Histogram asserts the reserved->active histogram records
 // durations into the right cumulative buckets and that _sum/_count drive the
 // average start (sum/count). Three observations: 0.04s, 0.4s, 2s.

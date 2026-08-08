@@ -70,6 +70,17 @@ type Collector struct {
 	// which fires only on a refund failure AFTER a reclaim already ran.
 	sessionsReapedTotal uint64
 	reapPassFailedTotal uint64
+	// admissionShedTotal / admissionThrottledTotal make the SEC-55 admission gate
+	// observable: shed counts a request refused with 503 because the general pool
+	// stayed saturated past the wait (a flood being absorbed), throttled counts a
+	// request refused with 429 because its host-attested caller exceeded its per-caller
+	// rate. Both are pre-handler rejects that touch no host state and emit no audit
+	// record, so without these an operator-ingress flood is invisible — a DoS-defense
+	// control that engages silently cannot be alerted on. The two are DISTINCT signals:
+	// a rising shed means the pool is undersized for real load; a rising throttle means
+	// one principal is hammering the socket.
+	admissionShedTotal      uint64
+	admissionThrottledTotal uint64
 	// startBucketCounts[i] is the count of start-durations <= buckets[i] (filled
 	// cumulatively at emit). startCount and startSum drive the histogram's _count
 	// and _sum and thus the average (sum/count = avg start seconds).
@@ -133,6 +144,22 @@ func (c *Collector) IncSessionsReaped(n int) {
 func (c *Collector) IncReapPassFailed() {
 	c.mu.Lock()
 	c.reapPassFailedTotal++
+	c.mu.Unlock()
+}
+
+// IncAdmissionShed records one operator request refused with 503 because the
+// general admission pool stayed saturated past the wait (NFR-SEC-55 load-shed).
+func (c *Collector) IncAdmissionShed() {
+	c.mu.Lock()
+	c.admissionShedTotal++
+	c.mu.Unlock()
+}
+
+// IncAdmissionThrottled records one operator request refused with 429 because its
+// host-attested caller exceeded its per-caller rate (NFR-SEC-55 fairness).
+func (c *Collector) IncAdmissionThrottled() {
+	c.mu.Lock()
+	c.admissionThrottledTotal++
 	c.mu.Unlock()
 }
 
@@ -211,6 +238,8 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	quotaRefundFailed := c.quotaRefundFailedTotal
 	sessionsReaped := c.sessionsReapedTotal
 	reapPassFailed := c.reapPassFailedTotal
+	admissionShed := c.admissionShedTotal
+	admissionThrottled := c.admissionThrottledTotal
 	startCount := c.startCount
 	startSum := c.startSum
 	bucketCounts := make([]uint64, len(c.startBucketCounts))
@@ -251,6 +280,16 @@ func (c *Collector) WritePrometheus(ctx context.Context, w writer) {
 	writeln(w, "# HELP ocu_control_reap_pass_failed_total Idle-reaper ticks that returned an error (enumerate or mid-pass reclaim failure); non-fatal, next tick retries (stuck-reaper alarm).")
 	writeln(w, "# TYPE ocu_control_reap_pass_failed_total counter")
 	fmt.Fprintf(w, "ocu_control_reap_pass_failed_total %d\n", reapPassFailed)
+
+	// SEC-55 admission gate: shed (503, general pool saturated) and throttle (429,
+	// per-caller rate exceeded) are pre-handler rejects with no audit record, so these
+	// counters are the only ops signal that an operator-ingress flood is being absorbed.
+	writeln(w, "# HELP ocu_control_operator_admission_shed_total Operator requests shed with 503 because the general admission pool stayed saturated (NFR-SEC-55 load-shed).")
+	writeln(w, "# TYPE ocu_control_operator_admission_shed_total counter")
+	fmt.Fprintf(w, "ocu_control_operator_admission_shed_total %d\n", admissionShed)
+	writeln(w, "# HELP ocu_control_operator_admission_throttled_total Operator requests throttled with 429 because the host-attested caller exceeded its per-caller rate (NFR-SEC-55 fairness).")
+	writeln(w, "# TYPE ocu_control_operator_admission_throttled_total counter")
+	fmt.Fprintf(w, "ocu_control_operator_admission_throttled_total %d\n", admissionThrottled)
 
 	// Reserved->active start-duration histogram. Buckets are cumulative le-bounds;
 	// +Inf equals _count. avg start = _sum / _count.

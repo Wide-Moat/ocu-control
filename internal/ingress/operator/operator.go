@@ -136,6 +136,21 @@ type Deps struct {
 	// A non-positive rate disables the limiter (the gate remains the hard bound).
 	PerCallerRate   int
 	PerCallerWindow time.Duration
+	// AdmissionMetrics counts the SEC-55 admission rejects so an operator-ingress flood
+	// is observable (both rejects are pre-handler and emit no audit record). When nil
+	// the middleware still sheds/throttles — it just does not count. The daemon wires
+	// the Prometheus collector; a unit test may inject a fake or leave it nil.
+	AdmissionMetrics AdmissionMetrics
+}
+
+// AdmissionMetrics is the narrow counter seam the admission middleware increments on
+// a reject. *metrics.Collector satisfies it; the operator package holds only this
+// interface so it stays decoupled from the exposition surface.
+type AdmissionMetrics interface {
+	// IncAdmissionShed counts one 503 load-shed (general pool saturated).
+	IncAdmissionShed()
+	// IncAdmissionThrottled counts one 429 throttle (per-caller rate exceeded).
+	IncAdmissionThrottled()
 }
 
 // HealthzFunc is the readiness handler the boot Sequencer's Healthz returns. The
@@ -401,6 +416,7 @@ type Listener struct {
 	gate      *admit.Gate
 	admitWait time.Duration
 	limiter   *admit.Limiter
+	admitMx   AdmissionMetrics
 }
 
 // defaultAdmitGeneral / defaultAdmitReserved / defaultAdmitWait size the SEC-55
@@ -473,6 +489,7 @@ func NewListener(socketPath string, deps Deps) *Listener {
 		gate:      admit.NewGate(general, reserved),
 		admitWait: wait,
 		limiter:   admit.NewLimiter(rate, window, rateClock),
+		admitMx:   deps.AdmissionMetrics,
 	}
 	// The read surface is mounted only when a reader is supplied. It is built with
 	// the SAME resolver the mutating handlers use (so attestation is identical) but

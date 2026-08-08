@@ -144,6 +144,9 @@ func (l *Listener) admissionGate(next http.Handler) http.Handler {
 		// general pool. A PRIORITY (revoke) request is NEVER rate-throttled — the kill
 		// switch must fire even from a caller that has saturated its own rate.
 		if class == admit.ClassGeneral && l.limiter != nil && !l.limiter.Allow(callerRateKey(r)) {
+			if l.admitMx != nil {
+				l.admitMx.IncAdmissionThrottled()
+			}
 			w.Header().Set("Retry-After", "1")
 			writeStatus(w, http.StatusTooManyRequests, "per-caller operator rate exceeded; retry")
 			return
@@ -164,6 +167,9 @@ func (l *Listener) admissionGate(next http.Handler) http.Handler {
 			// Shed: the general pool stayed saturated past admitWait (or the client
 			// hung up). 503 with Retry-After is the load-shed signal, distinct from a
 			// 4xx deny — the request was well-formed, the plane is momentarily full.
+			if l.admitMx != nil {
+				l.admitMx.IncAdmissionShed()
+			}
 			w.Header().Set("Retry-After", "1")
 			writeStatus(w, http.StatusServiceUnavailable, "operator ingress saturated; retry")
 			return

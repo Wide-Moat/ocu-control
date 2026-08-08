@@ -16,6 +16,16 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
+// fakeAdmitMetrics records the SEC-55 admission-reject counts so a test can assert
+// the middleware incremented the right counter on a shed vs a throttle.
+type fakeAdmitMetrics struct {
+	shed      int
+	throttled int
+}
+
+func (f *fakeAdmitMetrics) IncAdmissionShed()      { f.shed++ }
+func (f *fakeAdmitMetrics) IncAdmissionThrottled() { f.throttled++ }
+
 // reqAs builds an operator request whose host-attested PeerCred carries the given
 // uid, stamped on the context exactly as the ConnContext hook does, so the
 // admission middleware's callerRateKey resolves a distinct per-caller bucket.
@@ -170,6 +180,67 @@ func TestAdmissionGate_PerCallerRateThrottlesFloodNotCoTenantNorRevoke(t *testin
 	handler.ServeHTTP(revokeRR, reqAs(http.MethodPost, "/v1alpha/revoke/one", flooder))
 	if revokeRR.Code != http.StatusOK {
 		t.Errorf("revoke from a rate-throttled caller got %d, want 200 — the kill switch must not be rate-limited", revokeRR.Code)
+	}
+}
+
+// TestAdmissionGate_CountsShedAndThrottleDistinctly pins the SEC-55 observability
+// wiring: a 429 throttle increments the throttled counter (not shed), and a 503
+// shed increments the shed counter (not throttled). Without distinct counting an
+// operator cannot tell an undersized pool (shed) from a single hammering caller
+// (throttle).
+func TestAdmissionGate_CountsShedAndThrottleDistinctly(t *testing.T) {
+	t.Parallel()
+
+	// Throttle case: a 1-req/min per-caller limiter, ample pool.
+	mxT := &fakeAdmitMetrics{}
+	lt := &Listener{
+		gate:      admit.NewGate(64, 8),
+		admitWait: time.Second,
+		limiter:   admit.NewLimiter(1, time.Minute, state.SystemClock()),
+		admitMx:   mxT,
+	}
+	ht := lt.admissionGate(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) }))
+	ht.ServeHTTP(httptest.NewRecorder(), reqAs(http.MethodPost, "/v1alpha/sessions", 7)) // admits (first in window)
+	ht.ServeHTTP(httptest.NewRecorder(), reqAs(http.MethodPost, "/v1alpha/sessions", 7)) // throttled 429
+	if mxT.throttled != 1 {
+		t.Errorf("throttled count = %d, want 1", mxT.throttled)
+	}
+	if mxT.shed != 0 {
+		t.Errorf("shed count = %d on a throttle, want 0 (a throttle is not a shed)", mxT.shed)
+	}
+
+	// Shed case: a size-1 general pool held by a blocking request; limiter disabled so
+	// the reject is a pool shed, not a rate throttle.
+	mxS := &fakeAdmitMetrics{}
+	ls := &Listener{
+		gate:      admit.NewGate(1, 0),
+		admitWait: 60 * time.Millisecond,
+		limiter:   admit.NewLimiter(-1, time.Second, state.SystemClock()), // disabled
+		admitMx:   mxS,
+	}
+	hold := make(chan struct{})
+	var reached sync.Map
+	hs := ls.admissionGate(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached.Store(r.URL.Path, struct{}{})
+		if r.URL.Path == "/hold" {
+			<-hold
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	occ := make(chan struct{})
+	go func() {
+		close(occ)
+		hs.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/hold", nil))
+	}()
+	<-occ
+	waitFor(t, func() bool { _, ok := reached.Load("/hold"); return ok })
+	hs.ServeHTTP(httptest.NewRecorder(), reqAs(http.MethodPost, "/v1alpha/sessions", 9)) // shed 503
+	close(hold)
+	if mxS.shed != 1 {
+		t.Errorf("shed count = %d, want 1", mxS.shed)
+	}
+	if mxS.throttled != 0 {
+		t.Errorf("throttled count = %d on a shed, want 0 (a shed is not a throttle)", mxS.throttled)
 	}
 }
 
