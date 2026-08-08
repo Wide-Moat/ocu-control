@@ -514,6 +514,11 @@ func reasonCodeFor(code int) string {
 		return "CONFLICT"
 	case http.StatusServiceUnavailable:
 		return "UNAVAILABLE"
+	case http.StatusTooManyRequests:
+		// The per-caller rate limiter shed the request (NFR-SEC-55 fairness). The
+		// canonical code is RESOURCE_EXHAUSTED, distinct from UNAVAILABLE (the general
+		// pool was momentarily full) and never INTERNAL (a throttle is not a fault).
+		return "RESOURCE_EXHAUSTED"
 	}
 	return "INTERNAL"
 }
