@@ -5,13 +5,23 @@ package publish_test
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
 	"github.com/Wide-Moat/ocu-control/internal/audit/publish"
@@ -202,5 +212,87 @@ func TestNew_RefusesUnusableConfig(t *testing.T) {
 				t.Fatalf("New(%s) = %v, want ErrConfig", tc.name, err)
 			}
 		})
+	}
+}
+
+// TestNew_CoversTheCertAndCABranches exercises the constructor paths past the
+// early field checks: a keypair that fails to load, a CA path that cannot be
+// read, a CA file with no usable certificate, and the happy path with a valid
+// self-signed keypair (default channel + timeout). These were the uncovered
+// branches after the fan-in-injection revival.
+func TestNew_CoversTheCertAndCABranches(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	certPath, keyPath := filepath.Join(dir, "c.pem"), filepath.Join(dir, "k.pem")
+	writeSelfSigned(t, certPath, keyPath)
+
+	// A keypair path that does not resolve: LoadX509KeyPair error branch.
+	if _, err := publish.New(publish.Config{
+		BaseURL: "https://audit.internal", ClientCertPath: "/nope/c.pem", ClientKeyPath: "/nope/k.pem",
+	}); !errors.Is(err, publish.ErrConfig) {
+		t.Fatal("unloadable keypair did not refuse with ErrConfig")
+	}
+
+	// A CA path that cannot be read.
+	if _, err := publish.New(publish.Config{
+		BaseURL: "https://audit.internal", ClientCertPath: certPath, ClientKeyPath: keyPath,
+		CACertPath: "/nope/ca.pem",
+	}); !errors.Is(err, publish.ErrConfig) {
+		t.Fatal("unreadable CA path did not refuse with ErrConfig")
+	}
+
+	// A CA file with no usable certificate.
+	badCA := filepath.Join(dir, "bad-ca.pem")
+	if err := os.WriteFile(badCA, []byte("not a certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := publish.New(publish.Config{
+		BaseURL: "https://audit.internal", ClientCertPath: certPath, ClientKeyPath: keyPath,
+		CACertPath: badCA,
+	}); !errors.Is(err, publish.ErrConfig) {
+		t.Fatal("a CA file with no certificate did not refuse with ErrConfig")
+	}
+
+	// Happy path: valid keypair + valid CA, default channel and timeout resolved.
+	if _, err := publish.New(publish.Config{
+		BaseURL: "https://audit.internal/", ClientCertPath: certPath, ClientKeyPath: keyPath,
+		CACertPath: certPath, // the self-signed cert is a usable CA PEM
+	}); err != nil {
+		t.Fatalf("valid config refused: %v", err)
+	}
+}
+
+// writeSelfSigned writes a throwaway self-signed ECDSA cert+key to the given
+// paths for the constructor's LoadX509KeyPair to accept.
+func writeSelfSigned(t *testing.T, certPath, keyPath string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "ocu-control-audit-source"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyDER, err := x509.MarshalECPrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(certPath, certPEM, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(keyPath, keyPEM, 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
