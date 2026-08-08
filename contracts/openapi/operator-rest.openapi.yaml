@@ -110,6 +110,8 @@ paths:
           $ref: '#/components/responses/Denied'
         '503':
           $ref: '#/components/responses/Denied'
+        '429':
+          $ref: '#/components/responses/Throttled'
     get:
       operationId: listSessions
       summary: List sessions (operator read scope) — enriched, read-only.
@@ -138,6 +140,8 @@ paths:
           $ref: '#/components/responses/Denied'
         '503':
           $ref: '#/components/responses/Denied'
+        '429':
+          $ref: '#/components/responses/Throttled'
 
   /v1alpha/sessions/{key}:
     get:
@@ -163,6 +167,8 @@ paths:
           description: No session row addresses this key. No body.
         '503':
           $ref: '#/components/responses/Denied'
+        '429':
+          $ref: '#/components/responses/Throttled'
 
   /v1alpha/deployment:
     get:
@@ -184,6 +190,8 @@ paths:
           $ref: '#/components/responses/Denied'
         '503':
           $ref: '#/components/responses/Denied'
+        '429':
+          $ref: '#/components/responses/Throttled'
 
   /v1alpha/sessions/destroy:
     post:
@@ -213,6 +221,8 @@ paths:
           $ref: '#/components/responses/Denied'
         '503':
           $ref: '#/components/responses/Denied'
+        '429':
+          $ref: '#/components/responses/Throttled'
 
   /v1alpha/revoke/one:
     post:
@@ -337,6 +347,8 @@ paths:
           $ref: '#/components/responses/Denied'
         '503':
           $ref: '#/components/responses/Denied'
+        '429':
+          $ref: '#/components/responses/Throttled'
 
   /v1alpha/mcp-keys/revoke:
     post:
@@ -373,6 +385,8 @@ paths:
           $ref: '#/components/responses/Denied'
         '503':
           $ref: '#/components/responses/Denied'
+        '429':
+          $ref: '#/components/responses/Throttled'
 
 # NOTE: the operator denylist-edit (lift one deny) and quota-override are COMPLETE,
 # tested in-process operator handlers (operator.Handlers.LiftDeny / .OverrideQuota)
@@ -428,6 +442,24 @@ components:
         stack trace or internal topology. A not-owned session is reported the same as a
         missing one, so a probe cannot distinguish another principal's row from absence
         (NFR-SEC-43).
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/BoundedReason'
+    Throttled:
+      description: >-
+        The caller exceeded its per-caller request rate on the operator ingress and the
+        request was shed BEFORE any host state was touched (NFR-SEC-55 fairness). The
+        request was well-formed — this is load-shaping, not a deny — so the caller may
+        retry after the window. Retry-After carries the back-off in seconds. The
+        kill-switch routes (revoke, resume) are exempt: they are never rate-throttled, so
+        this response does not appear on them.
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            minimum: 0
       content:
         application/json:
           schema:

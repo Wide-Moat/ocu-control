@@ -230,12 +230,23 @@ func TestDenyBodiesAreTheContractEnvelope(t *testing.T) {
 	for _, code := range []int{
 		http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden,
 		http.StatusNotFound, http.StatusConflict, http.StatusServiceUnavailable,
-		http.StatusInternalServerError,
+		http.StatusTooManyRequests, http.StatusInternalServerError,
 	} {
 		if rcode := reasonCodeFor(code); !re.MatchString(rcode) {
 			t.Errorf("status %d yields reason_code %q, which the contract pattern %s rejects",
 				code, rcode, pattern)
 		}
+	}
+
+	// The SEC-55 per-caller throttle (429) reports RESOURCE_EXHAUSTED, distinct from
+	// UNAVAILABLE (a full general pool, 503) and never INTERNAL — a throttle is a
+	// bounded fairness signal, not a server fault. Binding the exact code, not just
+	// pattern-conformance, so a regression to the INTERNAL fallback is caught.
+	if got := reasonCodeFor(http.StatusTooManyRequests); got != "RESOURCE_EXHAUSTED" {
+		t.Errorf("429 reason_code = %q, want RESOURCE_EXHAUSTED (a throttle is not a fault)", got)
+	}
+	if reasonCodeFor(http.StatusServiceUnavailable) == reasonCodeFor(http.StatusTooManyRequests) {
+		t.Error("429 and 503 collapse to the same reason_code; a shed and a throttle must be distinguishable")
 	}
 
 	// The message bound is the contract's too: an over-long reason is a schema
