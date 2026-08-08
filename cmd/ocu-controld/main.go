@@ -402,6 +402,10 @@ func serve(ctx context.Context, cfg config) error {
 		AdmitGeneral:  cfg.opAdmitGeneral,
 		AdmitReserved: cfg.opAdmitReserved,
 		PerCallerRate: cfg.opCallerRate,
+		// The Prometheus collector counts each SEC-55 admission reject so an
+		// operator-ingress flood is observable on /metrics (both rejects are
+		// pre-handler and emit no audit record).
+		AdmissionMetrics: collector,
 	})
 	// Gateway mTLS server config, FAIL-CLOSED at boot when configured: with all
 	// three -gateway-tls-* flags set, the gateway binds a real TLS 1.3 listener that
