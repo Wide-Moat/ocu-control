@@ -379,7 +379,7 @@ func TestResumedSinkContinuesAcrossABootRotation(t *testing.T) {
 	if err != nil || !rotated.Rotated {
 		t.Fatalf("rotate: rotated=%v err=%v", rotated.Rotated, err)
 	}
-	writer, err := buildAuditWriter(hot)
+	writer, err := buildAuditWriter(config{auditSink: hot})
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}

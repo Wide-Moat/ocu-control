@@ -41,6 +41,7 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/admission"
 	"github.com/Wide-Moat/ocu-control/internal/audit"
 	"github.com/Wide-Moat/ocu-control/internal/audit/ocsf"
+	"github.com/Wide-Moat/ocu-control/internal/audit/publish"
 	"github.com/Wide-Moat/ocu-control/internal/audit/retention"
 	"github.com/Wide-Moat/ocu-control/internal/boot"
 	"github.com/Wide-Moat/ocu-control/internal/controlrpc"
@@ -310,7 +311,7 @@ func serve(ctx context.Context, cfg config) error {
 			rotated.Events, rotated.FirstSequence, rotated.LastSequence, rotated.SegmentPath)
 	}
 
-	auditWriter, err := buildAuditWriter(cfg.auditSink)
+	auditWriter, err := buildAuditWriter(cfg)
 	if err != nil {
 		return fmt.Errorf("boot: open audit sink: %w", err)
 	}
@@ -1000,7 +1001,41 @@ var auditSinkNone = map[string]bool{"none": true, "null": true}
 // and emits a LOUD startup WARN that the audit trail is non-durable. validate()
 // already rejects an EMPTY -audit-sink as a missing required flag, so this never
 // defaults a discarded sink.
-func buildAuditWriter(sink string) (auditWriter, error) {
+func buildAuditWriter(cfg config) (auditWriter, error) {
+	local, err := buildLocalAuditWriter(cfg.auditSink)
+	if err != nil {
+		return nil, err
+	}
+	// No central endpoint configured: the local durable sink IS the audit writer, and
+	// Control is a source that publishes nowhere. That is a legitimate single-node
+	// posture, not a degraded one, so it is silent.
+	if cfg.auditCentralURL == "" {
+		return local, nil
+	}
+	pub, err := publish.New(publish.Config{
+		BaseURL:        cfg.auditCentralURL,
+		ClientCertPath: cfg.auditCentralCert,
+		ClientKeyPath:  cfg.auditCentralKey,
+		CACertPath:     cfg.auditCentralCA,
+	})
+	if err != nil {
+		// Fail closed at BOOT. A daemon that came up with a broken publish leg would
+		// deny every audited action on first traffic instead; refusing here names the
+		// cause while there is still an operator watching.
+		_ = local.Close()
+		return nil, fmt.Errorf("boot: central audit publish leg: %w", err)
+	}
+	fan, err := ocsf.NewFanInWriter(local, pub)
+	if err != nil {
+		_ = local.Close()
+		return nil, fmt.Errorf("boot: central audit fan-in writer: %w", err)
+	}
+	return fan, nil
+}
+
+// buildLocalAuditWriter resolves -audit-sink to the local durable leg: the no-op
+// writer for the explicit non-durable opt-out, or an append-only OCSF file sink.
+func buildLocalAuditWriter(sink string) (auditWriter, error) {
 	if auditSinkNone[strings.ToLower(sink)] {
 		fmt.Fprintln(os.Stderr, "ocu-controld: WARNING: -audit-sink="+sink+" selects the NULL audit writer: the OCSF hash-chain is computed in-process but NOTHING is durably persisted. Every privileged action's fail-closed-on-audit deny is therefore NOT backed by durable storage. Use a writable file path for a durable, tamper-evident trail.")
 		return nullCloser{}, nil

@@ -135,7 +135,7 @@ func Test_buildMCPKeyEngine_NoFile(t *testing.T) {
 		// mcpKeysetPath and mcpKeyFile are intentionally unset.
 	}
 	clk := state.SystemClock()
-	aw, err := buildAuditWriter(cfg.auditSink)
+	aw, err := buildAuditWriter(cfg)
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
@@ -176,7 +176,7 @@ func Test_buildMCPKeyEngine_LoosePermAbortsBoot(t *testing.T) {
 		mcpKeyFile:    entriesPath,
 	}
 	clk := state.SystemClock()
-	aw, err := buildAuditWriter(cfg.auditSink)
+	aw, err := buildAuditWriter(cfg)
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
@@ -210,7 +210,7 @@ func Test_buildMCPKeyEngine_AbsentFileIsCleanStart(t *testing.T) {
 		mcpKeyFile:    filepath.Join(dir, "absent.json"), // never written
 	}
 	clk := state.SystemClock()
-	aw, err := buildAuditWriter(cfg.auditSink)
+	aw, err := buildAuditWriter(cfg)
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
@@ -257,7 +257,7 @@ func Test_buildMCPKeyEngine_LoadsExistingEntries(t *testing.T) {
 		mcpKeyFile:    entriesPath,
 	}
 	clk := state.SystemClock()
-	aw, err := buildAuditWriter(cfg.auditSink)
+	aw, err := buildAuditWriter(cfg)
 	if err != nil {
 		t.Fatalf("buildAuditWriter: %v", err)
 	}
