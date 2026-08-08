@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Generated code is out of scope for the hand-written-source SAST gate: it is
+# authored by the protobuf/grpc code generators (buf), reviewed as the FROZEN
+# .proto contract, not as Go source. Its findings — protobuf's `unsafe` fast
+# paths (go.lang.security.audit.unsafe.use-of-unsafe-block) and the generated
+# registration stub that semgrep reads as an insecure gRPC server
+# (grpc-server-insecure-connection) — are properties of the generator's output,
+# not of a reviewable decision here. The REAL transport security lives in the
+# hand-written listener (internal/ingress/gateway: mTLS 1.3, RequireAndVerify),
+# which stays in scope. Regenerating from a bumped generator re-emits the same
+# shapes, so a per-line nosemgrep would rot; the directory exclusion tracks the
+# generator boundary instead.
+gen/
