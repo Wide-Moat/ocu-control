@@ -279,7 +279,7 @@ func composeServeDaemon(t *testing.T, seedGlobalDeny bool) (*operator.Listener, 
 	// exercise that evidence, but it passes the real sink so the wiring path is the
 	// production one.
 	sink := ocsf.NewChainSink(clk, nullCloser{}, "control")
-	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, "", "", sink)
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, "", "", "", "", sink)
 	if err != nil {
 		t.Fatalf("providerOf: %v", err)
 	}

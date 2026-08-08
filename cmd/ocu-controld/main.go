@@ -335,7 +335,7 @@ func serve(ctx context.Context, cfg config) error {
 	// credential tree is reclaimed on teardown. The base is a deployment-fixed host
 	// config value, never a per-request body field. The revokeOutcomeAuditor wires
 	// the finalizer step-1 revoke outcome onto the durable spine as destroy evidence.
-	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, cfg.egressNetwork, cfg.edgeHost, sink)
+	provider, err := providerOf(cfg.runtimeProvider, tier, revoker, handoffBase, cfg.egressNetwork, cfg.edgeHost, cfg.k8sNamespace, cfg.k8sRuntimeClass, sink)
 	if err != nil {
 		return err
 	}
@@ -1341,7 +1341,7 @@ func (a revokeOutcomeAuditor) RecordRevokeOutcome(ctx context.Context, sess runt
 	}
 }
 
-func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, stagerBase, egressNetwork, edgeHost string, sink audit.AuditSink) (runtime.RuntimeProvider, error) {
+func providerOf(name string, tier runtime.RuntimeTier, revoker *cred.Revoker, stagerBase, egressNetwork, edgeHost, k8sNamespace, k8sRuntimeClass string, sink audit.AuditSink) (runtime.RuntimeProvider, error) {
 	switch name {
 	case "docker":
 		// The shared Revoker is the below-seam finalizer step-1 (revoke session JWT)
@@ -1363,7 +1363,23 @@ func providerOf(name string, tier runtime.RuntimeTier, revoker docker.Revoker, s
 		}
 		return p, nil
 	case "k8s":
-		return k8s.New(), nil
+		// The k8s provider shares the SAME below-seam collaborators as docker: the
+		// one *cred.Revoker (finalizer step-1) and the revoke-outcome auditor built
+		// from the durable sink. It has no per-session bridge, sock-dir stager, or
+		// egress network — those are Docker-substrate specifics; on k8s the sock dir
+		// is an emptyDir and egress is a per-session NetworkPolicy, both inside the
+		// pod spec. RuntimeClass maps the bound tier to the cluster's gVisor class;
+		// empty is the dev-only runc fallback. Namespace is required (validated).
+		p, err := k8s.New(tier, k8s.Deps{
+			Revoker:       revoker,
+			RevokeAuditor: revokeOutcomeAuditor{sink: sink},
+			RuntimeClass:  k8sRuntimeClass,
+			Namespace:     k8sNamespace,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("boot: construct k8s provider: %w", err)
+		}
+		return p, nil
 	default:
 		return nil, fmt.Errorf("%w: %q", errUnknownProvider, name)
 	}
