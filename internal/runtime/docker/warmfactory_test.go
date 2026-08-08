@@ -218,3 +218,40 @@ func TestClaim_StorageProfileJoinsEgressNetwork(t *testing.T) {
 		t.Errorf("storage-profile claim did not connect to the egress network (NetworkConnect count %d)", api.countOp("NetworkConnect"))
 	}
 }
+
+// TestDispose_DelegatesToDestroyPlaceholder covers the Dispose alias (the
+// create-unwind compensator's disposal verb).
+func TestDispose_DelegatesToDestroyPlaceholder(t *testing.T) {
+	api := newFakeAPI()
+	f := newWarmFactory(t, api)
+	u, _ := f.CreatePlaceholder(context.Background(), warmTestProfile())
+	if err := f.Dispose(context.Background(), u); err != nil {
+		t.Fatalf("Dispose: %v", err)
+	}
+	if api.countOp("ContainerRemove") != 1 {
+		t.Errorf("Dispose did not force-remove the container (ContainerRemove=%d)", api.countOp("ContainerRemove"))
+	}
+}
+
+// TestProviderNewWarmFactory_SharesTheClient covers Provider.NewWarmFactory: the
+// factory it returns drives the SAME injected client (a create-placeholder lands
+// a ContainerCreate on the provider's fake), so the daemon's single dockerAPI
+// client stays in one place.
+func TestProviderNewWarmFactory_SharesTheClient(t *testing.T) {
+	api := newFakeAPI()
+	p, err := NewDockerProvider(runtime.TierGvisor, Deps{API: api, StagerBase: t.TempDir()})
+	if err != nil {
+		t.Fatalf("NewDockerProvider: %v", err)
+	}
+	stager := handoff.NewStager(t.TempDir())
+	f := p.NewWarmFactory(stager)
+	if f == nil {
+		t.Fatal("NewWarmFactory returned nil")
+	}
+	if _, err := f.CreatePlaceholder(context.Background(), warmTestProfile()); err != nil {
+		t.Fatalf("CreatePlaceholder via provider factory: %v", err)
+	}
+	if api.countOp("ContainerCreate") != 1 {
+		t.Errorf("the provider's warm factory did not use the provider's client (ContainerCreate=%d)", api.countOp("ContainerCreate"))
+	}
+}

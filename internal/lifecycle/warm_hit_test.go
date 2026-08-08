@@ -317,3 +317,68 @@ func hasWarmHitCommit(recs []audit.Record, want bool) bool {
 	}
 	return false
 }
+
+// TestWarmHit_DestroyDialsTheWarmSockDir covers sockDirFor's warm branch: a
+// destroy of a warm-claimed session (row.SockDirRoot set) resolves the advisory
+// control-RPC sock dir via SockDirUnder(root), targeting the pooled root — NOT
+// the name-derived base/<key> a cold session uses.
+func TestWarmHit_DestroyDialsTheWarmSockDir(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{units: []warmclaim.Unit{warmUnit("pool-destroy")}}
+	claimer := &fakeClaimer{}
+	dialer, h := newWarmHarnessWithDialer(t, pool, claimer)
+
+	row, err := h.mgr.Create(context.Background(), input("warm-destroy"))
+	if err != nil {
+		t.Fatalf("Create (warm): %v", err)
+	}
+	// The claimed row carries the warm root the fake claimer minted; the destroy
+	// dial must resolve its sock dir UNDER that root, not the name-derived base.
+	if row.SockDirRoot == "" {
+		t.Fatal("warm create left SockDirRoot empty; the destroy branch cannot be exercised")
+	}
+	wantSockDir := h.stager.SockDirUnder(row.SockDirRoot)
+
+	if err := h.mgr.Destroy(context.Background(), testCaller, "warm-destroy"); err != nil {
+		t.Fatalf("Destroy of a warm session: %v", err)
+	}
+	// The advisory dial ran and targeted the warm root's sock dir — proving
+	// sockDirFor took the warm branch (SockDirUnder(root)) rather than the
+	// name-derived SockDir(key) a cold session would use.
+	if dialer.calls == 0 {
+		t.Fatal("the destroy advisory dial never ran for a warm session")
+	}
+	if dialer.lastSockDir != wantSockDir {
+		t.Errorf("destroy dialed sockDir %q, want the warm root's sock dir %q", dialer.lastSockDir, wantSockDir)
+	}
+}
+
+// newWarmHarnessWithDialer builds the warm harness with a recording control
+// dialer wired, so a warm session's Destroy exercises the advisory dial (and thus
+// sockDirFor's warm branch).
+func newWarmHarnessWithDialer(t *testing.T, pool warmclaim.Pool, claimer warmclaim.Claimer) (*recordingDialer, *harness) {
+	t.Helper()
+	clk := state.NewFakeClock(lifeStart)
+	store := newListerStore(state.NewInMemory(clk))
+	provider := newRecordingProvider()
+	stager := newFaultStager(t.TempDir())
+	sink := audit.NewRecordingFake()
+	gate := quota.NewGate(store, clk, generousLimits())
+	dialer := newRecordingDialer(provider)
+	mgr := lifecycle.NewManager(lifecycle.ManagerDeps{
+		Custodian:     registry.NewCustodian(store),
+		Provider:      provider,
+		Clock:         clk,
+		Quota:         gate,
+		Handoff:       stager,
+		Audit:         sink,
+		Profile:       admission.ProfileTrustedOperator,
+		Tier:          runtime.TierRunc,
+		AllowedImages: []string{testGuestImage},
+		ExecVerifyKey: pub32(),
+		ControlDialer: dialer,
+		Pool:          pool,
+		Claimer:       claimer,
+	})
+	return dialer, &harness{mgr: mgr, store: store, provider: provider, stager: stager, audit: sink, gate: gate, clk: clk}
+}
