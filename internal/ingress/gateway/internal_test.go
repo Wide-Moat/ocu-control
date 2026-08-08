@@ -29,7 +29,11 @@ var errUnclassified = errors.New("gateway_internal_test: unclassified refusal")
 // contextWithGatewayMarker stamps the same ConnContext marker Serve stamps, so
 // connInfoFromRequest treats the request as served through Serve.
 func contextWithGatewayMarker(r *http.Request) context.Context {
-	return context.WithValue(r.Context(), connInfoKey{}, ingress.ChannelGateway)
+	// The hook stamps a connMark since #107 (channel + conn identity); the helper
+	// mirrors what newServer's ConnContext actually stores, so these tests keep
+	// modelling the real hooked path.
+	return context.WithValue(r.Context(), connInfoKey{},
+		connMark{channel: ingress.ChannelGateway, connID: ingress.NextConnID()})
 }
 
 // TestVerifiedSANsOfNilAndEmpty proves verifiedSANsOf fails closed on a nil state

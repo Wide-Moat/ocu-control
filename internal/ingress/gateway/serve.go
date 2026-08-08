@@ -110,7 +110,12 @@ func newServer(ctx context.Context, mux http.Handler) *http.Server {
 		// the handshake-complete *http.Request.TLS, which is the only point a verified
 		// chain is observable.
 		ConnContext: func(connCtx context.Context, _ net.Conn) context.Context {
-			return context.WithValue(connCtx, connInfoKey{}, ingress.ChannelGateway)
+			// The authn latch and the conn identity are per-CONNECTION state: the
+			// latch keeps the trail at one logon per connection, and the ConnID is
+			// what that latch keys on downstream.
+			connCtx = ingress.WithAuthnLatch(connCtx)
+			return context.WithValue(connCtx, connInfoKey{},
+				connMark{channel: ingress.ChannelGateway, connID: ingress.NextConnID()})
 		},
 		BaseContext: func(net.Listener) context.Context { return ctx },
 	}
@@ -126,15 +131,26 @@ func newServer(ctx context.Context, mux http.Handler) *http.Server {
 // (nil CertSANs) so the handler refuses fail-closed.
 func connInfoFromRequest(r *http.Request) ingress.ConnInfo {
 	info := ingress.ConnInfo{Channel: ingress.ChannelGateway}
-	if _, ok := r.Context().Value(connInfoKey{}).(ingress.Channel); !ok {
+	mark, ok := r.Context().Value(connInfoKey{}).(connMark)
+	if !ok {
 		// Not served through Serve: still gateway-channel, but with no verified SAN it
-		// fails closed at the resolver.
+		// fails closed at the resolver, and with no ConnID the latchless path stays
+		// visible as such.
 		return info
 	}
+	info.ConnID = mark.connID
 	if r.TLS != nil {
 		info.CertSANs = verifiedSANsOf(r.TLS)
 	}
 	return info
+}
+
+// connMark is the per-connection state the ConnContext hook stamps: the channel
+// marker Serve has always carried, plus the host-assigned connection identity
+// the authentication trail correlates on.
+type connMark struct {
+	channel ingress.Channel
+	connID  string
 }
 
 // registerRoutes mounts the gateway SERVICE surface onto mux: create, destroy,

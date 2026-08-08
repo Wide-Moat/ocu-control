@@ -112,6 +112,11 @@ func newServer(ctx context.Context, mux http.Handler) *http.Server {
 				// refuses with ingress.ErrUnattested before any host state is touched.
 				info = ingress.ConnInfo{Channel: ingress.ChannelOperator}
 			}
+			// The latch and the conn identity are stamped on BOTH arms: an
+			// unattested connection's failed resolutions are exactly the records
+			// the failure half of the authentication trail exists for (#107).
+			info.ConnID = ingress.NextConnID()
+			connCtx = ingress.WithAuthnLatch(connCtx)
 			return context.WithValue(connCtx, connInfoKey{}, info)
 		},
 		BaseContext: func(net.Listener) context.Context { return ctx },
