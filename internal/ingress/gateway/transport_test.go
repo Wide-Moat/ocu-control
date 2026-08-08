@@ -141,6 +141,7 @@ func gatewayDepsFor(t *testing.T, tlsConfig *tls.Config) gateway.Deps {
 		Audit:         audit.NewRecordingFake(),
 		Profile:       0, // ProfileTrustedOperator (admits on runc)
 		Tier:          runtime.TierRunc,
+		DefaultImage:  "registry.example/ocu-sandbox:v1",
 		AllowedImages: []string{"img", "ocu/sandbox:test", "registry.example/ocu-sandbox:v1"},
 		ExecVerifyKey: ingressTestExecVerifyKey(),
 	})
