@@ -43,6 +43,7 @@ import (
 	"time"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/ingress/authntrail"
 	"github.com/Wide-Moat/ocu-control/internal/killswitch"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
 	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
@@ -71,6 +72,10 @@ type Deps struct {
 	// Resolver derives the host-attested caller from an accepted connection.
 	// Defaults to NewPeerCredResolver(nil) when nil.
 	Resolver ingress.IdentityResolver
+	// AuthnEmit lands one OCSF 3002 record on the audit spine (#107). When set,
+	// NewHandlers wraps the resolver with the authentication trail; nil keeps
+	// the resolver bare, which is what unit tests inject.
+	AuthnEmit authntrail.Emit
 	// Verifier gates the SOAR channel (verify-then-mint). When nil the SOAR path
 	// refuses fail-closed (no verifier configured).
 	Verifier killswitch.SOARVerifier
@@ -139,6 +144,11 @@ func NewHandlers(deps Deps) *Handlers {
 	resolver := deps.Resolver
 	if resolver == nil {
 		resolver = NewPeerCredResolver(nil)
+	}
+	if deps.AuthnEmit != nil {
+		// The decorator nobody wires observes nothing: this is the one seam the
+		// authentication trail hangs on for the whole operator channel.
+		resolver = authntrail.Wrap(resolver, deps.AuthnEmit)
 	}
 	// The contract's x-ocu-anti-replay-window-seconds-default. A deployment that
 	// says nothing gets the documented default rather than a zero window, which

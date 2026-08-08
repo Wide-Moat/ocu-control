@@ -36,6 +36,7 @@ import (
 	"net"
 
 	"github.com/Wide-Moat/ocu-control/internal/ingress"
+	"github.com/Wide-Moat/ocu-control/internal/ingress/authntrail"
 	"github.com/Wide-Moat/ocu-control/internal/lifecycle"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/state"
@@ -59,6 +60,10 @@ type Deps struct {
 	// carry no verified SAN, so every Resolve fails closed — a clearly-stubbed,
 	// fail-closed posture for a Phase-3 deployment without certificates wired.
 	TLSConfig *tls.Config
+	// AuthnEmit lands one OCSF 3002 record on the audit spine (#107). When set,
+	// NewHandlers wraps the resolver with the authentication trail; nil keeps
+	// the resolver bare, which is what unit tests inject.
+	AuthnEmit authntrail.Emit
 }
 
 // Handlers is the stable in-process service surface. Each method takes the
@@ -79,6 +84,11 @@ func NewHandlers(deps Deps) *Handlers {
 	resolver := deps.Resolver
 	if resolver == nil {
 		resolver = NewCertSANResolver(nil)
+	}
+	if deps.AuthnEmit != nil {
+		// The decorator nobody wires observes nothing: this is the one seam the
+		// authentication trail hangs on for the whole gateway channel.
+		resolver = authntrail.Wrap(resolver, deps.AuthnEmit)
 	}
 	return &Handlers{
 		manager:  deps.Manager,

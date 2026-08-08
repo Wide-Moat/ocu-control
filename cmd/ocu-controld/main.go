@@ -360,11 +360,12 @@ func serve(ctx context.Context, cfg config) error {
 	seq := boot.New(store, clk)
 
 	opListener := operator.NewListener(socketPathOf(cfg.operatorListen), operator.Deps{
-		Manager:  mgr,
-		Engine:   eng,
-		Healthz:  seq.Healthz(),
-		Resolver: operator.NewPeerCredResolver(nil),
-		Seam:     seam, // the operator adapter alone holds the seam
+		Manager:   mgr,
+		Engine:    eng,
+		Healthz:   seq.Healthz(),
+		Resolver:  operator.NewPeerCredResolver(nil),
+		AuthnEmit: sink.EmitAuthn,
+		Seam:      seam, // the operator adapter alone holds the seam
 		// The admin read-surface (ADR-0022): the read handler is given ONLY the
 		// custodian's enriched read port and the deployment singletons — no seam, no
 		// Manager, no Engine — so the read-only boundary holds structurally. The
@@ -389,6 +390,7 @@ func serve(ctx context.Context, cfg config) error {
 		Manager:   mgr,
 		Resolver:  gateway.NewCertSANResolver(nil),
 		TLSConfig: gwTLS,
+		AuthnEmit: sink.EmitAuthn,
 		// When TLSConfig is nil the gateway binds plain TCP whose connections carry
 		// no verified SAN, so every Resolve fails closed (a clearly-stubbed,
 		// fail-closed posture). No OperatorSeam is passed.
@@ -589,10 +591,22 @@ func compose(store state.Store, clk state.Clock, provider runtime.RuntimeProvide
 		MountDefaults:  defaultMountDefaults(),
 		StorageScope:   defaultStorageScope(),
 		GrantedIntents: grantedIntents,
-		ControlDialer:  controlDialer,
-		ExecDriver:     execDriver,
-		ExecVerifyKey:  execVerifyKeyOf(execSigner),
-		Metrics:        collector,
+		// The lease-issue record (#107): the daemon composes the OCSF semantics
+		// here so lifecycle stays ignorant of the class shape. Fail-closed at the
+		// stage: a create whose issuance the trail cannot hold is refused.
+		AuthnTicketEmit: func(ctx context.Context, sessionKey string) error {
+			return sink.EmitAuthn(ctx, ocsf.AuthnRecord{
+				Activity:   ocsf.AuthnTicket,
+				Outcome:    ocsf.AuthnSuccess,
+				Channel:    "gateway",
+				Protocol:   ocsf.AuthnProtocolStorageJWT,
+				SessionKey: sessionKey,
+			})
+		},
+		ControlDialer: controlDialer,
+		ExecDriver:    execDriver,
+		ExecVerifyKey: execVerifyKeyOf(execSigner),
+		Metrics:       collector,
 	})
 	// The kill-switch refunds the per-tenant concurrency slot through the SAME
 	// quota.Gate that charged it on create, so a force-kill returns the level counter

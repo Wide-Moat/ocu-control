@@ -254,6 +254,17 @@ func stageMintStorageJWT(ctx context.Context, m *Manager, st *createState) (comp
 		return nil, err
 	}
 	st.storageToken = tok
+
+	// The lease-issue record (#107): the plane just ISSUED a credential, and a
+	// credential whose issuance the trail does not hold is what NFR-SEC-72
+	// forbids — so a refused record refuses the create, the same fail-closed
+	// shape as every other pre-side-effect stage refusal. The minted token
+	// simply expires unused; no compensator is owed.
+	if m.authnTicketEmit != nil {
+		if err := m.authnTicketEmit(ctx, st.key.String()); err != nil {
+			return nil, fmt.Errorf("record storage-jwt issue: %w", err)
+		}
+	}
 	return nil, nil
 }
 

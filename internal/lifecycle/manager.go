@@ -181,6 +181,15 @@ type ManagerDeps struct {
 	// DefaultIntentCeiling on the minimal shelf; the flag only ever narrows it.
 	GrantedIntents IntentCeiling
 
+	// AuthnTicketEmit records the Storage-JWT mint as an authentication-ticket
+	// event (#107, NFR-SEC-72's per-session lease issue). It is a plain func so
+	// lifecycle stays ignorant of OCSF — the record's semantics live at the
+	// daemon's composition point, and the audit port's leaf property holds.
+	// FAIL-CLOSED at the call site: a refused record refuses the create, because
+	// a credential whose issuance the trail does not hold is what the lease-issue
+	// row forbids. Nil skips the record (test rigs with no trail).
+	AuthnTicketEmit func(ctx context.Context, sessionKey string) error
+
 	// ControlDialer is the ADVISORY host-dialled control-RPC surface (ADR-0018). On
 	// Destroy the Manager dials it BEFORE the host-driven finalizer to advance the
 	// cooperative SIGTERM phase; the dial is best-effort and its result is swallowed
@@ -296,13 +305,14 @@ type Manager struct {
 
 	// Storage-JWT custody + mount-config provisioning (Phase 4). signer/push are nil
 	// on the Phase-3 minimal shelf, which the mint+render stages skip cleanly.
-	signer         *cred.Signer
-	push           provisioning.Pusher
-	serviceURL     string
-	caCertPEM      string
-	mountDefaults  mountcfg.MountDefaults
-	storageScope   StorageScope
-	grantedIntents IntentCeiling
+	signer          *cred.Signer
+	push            provisioning.Pusher
+	serviceURL      string
+	caCertPEM       string
+	mountDefaults   mountcfg.MountDefaults
+	storageScope    StorageScope
+	grantedIntents  IntentCeiling
+	authnTicketEmit func(ctx context.Context, sessionKey string) error
 
 	// controlDialer is the advisory host-dialled control-RPC surface Destroy nudges
 	// before the authoritative finalizer. nil is a clean no-op.
@@ -342,18 +352,19 @@ func NewManager(deps ManagerDeps) *Manager {
 
 		defaultImage: deps.DefaultImage,
 
-		signer:         deps.Signer,
-		push:           deps.Push,
-		serviceURL:     deps.ServiceURL,
-		caCertPEM:      deps.CACertPEM,
-		mountDefaults:  deps.MountDefaults,
-		storageScope:   deps.StorageScope,
-		grantedIntents: deps.GrantedIntents,
-		controlDialer:  deps.ControlDialer,
-		execDriver:     deps.ExecDriver,
-		execVerifyKey:  deps.ExecVerifyKey,
-		metrics:        deps.Metrics,
-		events:         deps.Events,
+		signer:          deps.Signer,
+		push:            deps.Push,
+		serviceURL:      deps.ServiceURL,
+		caCertPEM:       deps.CACertPEM,
+		mountDefaults:   deps.MountDefaults,
+		storageScope:    deps.StorageScope,
+		grantedIntents:  deps.GrantedIntents,
+		authnTicketEmit: deps.AuthnTicketEmit,
+		controlDialer:   deps.ControlDialer,
+		execDriver:      deps.ExecDriver,
+		execVerifyKey:   deps.ExecVerifyKey,
+		metrics:         deps.Metrics,
+		events:          deps.Events,
 	}
 	// Build the body-image override allow-set: the explicitly listed images plus the
 	// deployment default (implicitly allowed — the operator already trusted it by
