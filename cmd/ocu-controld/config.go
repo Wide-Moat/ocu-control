@@ -34,6 +34,7 @@ type config struct {
 	runtimeProvider  string        // container backend behind the RuntimeProvider seam
 	k8sNamespace     string        // -runtime-provider=k8s: the deployment-fixed namespace every session Pod/NetworkPolicy/Secret lands in; required when the provider is k8s
 	k8sRuntimeClass  string        // -runtime-provider=k8s: the RuntimeClass name for the bound tier (e.g. gvisor); empty = cluster default (runc, dev-only)
+	warmPoolSize     int           // -warm-pool-size: pre-warmed docker sandboxes per profile (0 = disabled, the minimal-shelf default). Only the docker provider supports warm; k8s ignores it (sentry-warm is a separate ADR).
 	workloadProfile  string        // deployment-declared trust profile feeding the admission matrix; never per-request
 	guestImage       string        // deployment-declared default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); the body image is an override; unset + no body image is a fail-closed 400
 	guestImageAllow  string        // comma-separated exact-match allow-list of guest images a create BODY may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only (deny-by-default)
@@ -132,6 +133,7 @@ func parse(args []string) (config, runMode, error) {
 	fs.StringVar(&cfg.runtimeProvider, "runtime-provider", "", "container backend behind the RuntimeProvider seam: docker|k8s (required)")
 	fs.StringVar(&cfg.k8sNamespace, "k8s-namespace", "", "runtime-provider=k8s: the namespace every session Pod/NetworkPolicy/Secret lands in (required when provider is k8s)")
 	fs.StringVar(&cfg.k8sRuntimeClass, "k8s-runtime-class", "", "runtime-provider=k8s: RuntimeClass for the bound tier (e.g. gvisor); empty = cluster default (runc, dev-only)")
+	fs.IntVar(&cfg.warmPoolSize, "warm-pool-size", 0, "pre-warmed docker sandboxes per profile off the create path (0 = disabled). Only the docker provider supports warm.")
 	fs.StringVar(&cfg.workloadProfile, "workload-profile", "", "deployment-declared trust profile: trusted_operator|internal_workforce|untrusted (required)")
 	fs.StringVar(&cfg.guestImage, "guest-image", "", "default guest image a create runs when the body names none (ADR-0020 inject-at-materialize); a body image overrides it; unset + no body image is refused 400")
 	fs.StringVar(&cfg.guestImageAllow, "guest-image-allow", "", "comma-separated exact-match allow-list of images a create body may override the default with (ADR-0020 BYO rung); the default is implicitly allowed; empty = default-only, a non-allowed override is refused 400")
@@ -279,6 +281,15 @@ func validate(cfg config) error {
 	// runc fallback, refused for the untrusted profile by admission, not here.
 	if cfg.runtimeProvider == "k8s" && cfg.k8sNamespace == "" {
 		return fmt.Errorf("%w: -runtime-provider=k8s requires -k8s-namespace", errRequiredFlagMissing)
+	}
+	if cfg.warmPoolSize < 0 {
+		return fmt.Errorf("%w: -warm-pool-size must not be negative", errRequiredFlagMissing)
+	}
+	if cfg.warmPoolSize > 0 && cfg.runtimeProvider != "docker" {
+		// Only the docker provider supports the create-ahead warm pool; the k8s
+		// sentry-warm variant is a separate decision. Refuse a size on a provider
+		// that cannot honor it rather than silently ignore the operator's intent.
+		return fmt.Errorf("%w: -warm-pool-size is only supported with -runtime-provider=docker", errRequiredFlagMissing)
 	}
 	if !knownWorkloadProfiles[cfg.workloadProfile] {
 		return fmt.Errorf("%w: %q (choose trusted_operator|internal_workforce|untrusted)", errUnknownWorkloadProfile, cfg.workloadProfile)

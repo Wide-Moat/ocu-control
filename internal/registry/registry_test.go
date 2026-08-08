@@ -151,7 +151,7 @@ func TestCustodianReserveCommitBind(t *testing.T) {
 	if _, err := c.Commit(ctx, key, owner); err != nil {
 		t.Fatalf("Commit: %v", err)
 	}
-	row, err := c.BindContainerName(ctx, key, owner, "ocu-container-1")
+	row, err := c.BindContainerName(ctx, key, owner, "ocu-container-1", "")
 	if err != nil {
 		t.Fatalf("BindContainerName: %v", err)
 	}

@@ -140,6 +140,16 @@ type SessionRow struct {
 	// It is empty until BindContainerName succeeds. It is recorded data and is
 	// never consulted as authority.
 	ContainerName string
+	// SockDirRoot is the host-side per-session handoff root the guest's sock dir,
+	// container_info, and public key live under. It is EMPTY for a cold-created
+	// session, where every consumer re-derives the root purely from the key
+	// (handoff base/<key>). It is set ONLY for a WARM-POOL-claimed session, whose
+	// handoff was staged under a placeholder name (base/ocu-pool-N) that the key
+	// cannot re-derive: the exec sock dial, the destroy control-RPC dial, and the
+	// teardown credential scrub read this recorded root when set, else name-derive.
+	// It is recorded data (host-attested, written by the create path), never
+	// authority and never a body hint. Bound atomically with ContainerName.
+	SockDirRoot string
 }
 
 // Caps mirrors the hard resource caps the provider stamps onto a runtime, as
@@ -298,7 +308,11 @@ type Store interface {
 	// an unknown key and ErrReservationConflict on an owner mismatch. This is the
 	// "bind container_name" Store operation requirement 1 names; LookupSession is
 	// the matching read.
-	BindContainerName(ctx context.Context, key string, owner Identity, containerName string) (SessionRow, error)
+	// sockDirRoot is recorded atomically with containerName: EMPTY for a cold
+	// session (consumers name-derive the root from key), the placeholder root
+	// base/ocu-pool-N for a warm-pool-claimed session whose handoff the key cannot
+	// re-derive. It is recorded data, never authority.
+	BindContainerName(ctx context.Context, key string, owner Identity, containerName, sockDirRoot string) (SessionRow, error)
 
 	// Release moves the caller's reservation to the StateReleased tombstone under
 	// the per-key lock, returning its capacity. It is the single rollback for a

@@ -210,8 +210,8 @@ func (c *Custodian) Commit(ctx context.Context, key Key, owner state.Identity) (
 // ErrBindingExists if the row already has a container name or the name is bound
 // elsewhere, ErrReservationNotFound for an unknown key, and ErrReservationConflict
 // on an owner mismatch.
-func (c *Custodian) BindContainerName(ctx context.Context, key Key, owner state.Identity, containerName string) (state.SessionRow, error) {
-	return c.store.BindContainerName(ctx, key.k, owner, containerName)
+func (c *Custodian) BindContainerName(ctx context.Context, key Key, owner state.Identity, containerName, sockDirRoot string) (state.SessionRow, error) {
+	return c.store.BindContainerName(ctx, key.k, owner, containerName, sockDirRoot)
 }
 
 // Release moves the caller's reservation to the RELEASED tombstone under the

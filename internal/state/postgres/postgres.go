@@ -394,7 +394,7 @@ func (s *store) transition(
 // SQLSTATE 23505, which maps to ErrBindingExists, so two callers racing one
 // runtime identity resolve to exactly one winner. An unknown key is
 // ErrReservationNotFound; an owner mismatch is ErrReservationConflict.
-func (s *store) BindContainerName(ctx context.Context, key string, owner state.Identity, containerName string) (state.SessionRow, error) {
+func (s *store) BindContainerName(ctx context.Context, key string, owner state.Identity, containerName, sockDirRoot string) (state.SessionRow, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return state.SessionRow{}, unavailable("bind: begin", err)
@@ -426,8 +426,8 @@ func (s *store) BindContainerName(ctx context.Context, key string, owner state.I
 	}
 
 	if _, err := tx.Exec(ctx,
-		`UPDATE sessions SET container_name = $2 WHERE key = $1`,
-		key, containerName,
+		`UPDATE sessions SET container_name = $2, sock_dir_root = NULLIF($3, '') WHERE key = $1`,
+		key, containerName, sockDirRoot,
 	); err != nil {
 		if isUniqueViolation(err) {
 			// The partial UNIQUE index rejected a name already bound to another
@@ -443,6 +443,12 @@ func (s *store) BindContainerName(ctx context.Context, key string, owner state.I
 	}
 
 	row.ContainerName = containerName
+	// The returned row reflects BOTH values written by the UPDATE. row was read by
+	// selectRowForUpdate BEFORE the write, so its sock_dir_root is still the old
+	// (empty) value; set it to what was persisted so the caller sees a consistent
+	// row without a re-select (the DB stored NULLIF(sockDirRoot,''), which reads
+	// back as "" — the same value the caller passed for a cold bind).
+	row.SockDirRoot = sockDirRoot
 	return row, nil
 }
 
@@ -476,7 +482,7 @@ func (s *store) LookupSession(ctx context.Context, key string) (state.SessionRow
 // fail-closed, exactly as the other read paths wrap pgx errors.
 func (s *store) LiveSessions(ctx context.Context) ([]state.SessionRow, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, '')
+		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, ''), COALESCE(sock_dir_root, '')
 		 FROM sessions WHERE state IN ($1, $2)`,
 		int16(state.StateReserved), int16(state.StateActive))
 	if err != nil {
@@ -781,7 +787,7 @@ type rowScanner interface {
 // selectRow reads a session row by key without locking, for the read path.
 func selectRow(ctx context.Context, q rowScanner, key string) (state.SessionRow, error) {
 	return scanRow(q.QueryRow(ctx,
-		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, '')
+		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, ''), COALESCE(sock_dir_root, '')
 		 FROM sessions WHERE key = $1`, key))
 }
 
@@ -790,7 +796,7 @@ func selectRow(ctx context.Context, q rowScanner, key string) (state.SessionRow,
 // dependent UPDATE within the transaction.
 func selectRowForUpdate(ctx context.Context, tx pgx.Tx, key string) (state.SessionRow, error) {
 	return scanRow(tx.QueryRow(ctx,
-		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, '')
+		`SELECT key, owner_tenant, owner_caller, state, COALESCE(container_name, ''), COALESCE(sock_dir_root, '')
 		 FROM sessions WHERE key = $1 FOR UPDATE`, key))
 }
 
@@ -825,7 +831,7 @@ func scanRow(row pgx.Row) (state.SessionRow, error) {
 		out state.SessionRow
 		st  int16
 	)
-	if err := row.Scan(&out.Key, &out.Owner.Tenant, &out.Owner.Caller, &st, &out.ContainerName); err != nil {
+	if err := row.Scan(&out.Key, &out.Owner.Tenant, &out.Owner.Caller, &st, &out.ContainerName, &out.SockDirRoot); err != nil {
 		return state.SessionRow{}, err
 	}
 	decoded, err := sessionStateFromDB(st)

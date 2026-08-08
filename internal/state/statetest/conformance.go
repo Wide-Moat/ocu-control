@@ -146,7 +146,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		if _, err := s.Release(ctx, "missing", owner); !errors.Is(err, state.ErrReservationNotFound) {
 			t.Fatalf("Release unknown: want ErrReservationNotFound, got %v", err)
 		}
-		if _, err := s.BindContainerName(ctx, "missing", owner, "ctr-x"); !errors.Is(err, state.ErrReservationNotFound) {
+		if _, err := s.BindContainerName(ctx, "missing", owner, "ctr-x", ""); !errors.Is(err, state.ErrReservationNotFound) {
 			t.Fatalf("BindContainerName unknown: want ErrReservationNotFound, got %v", err)
 		}
 		if _, err := s.LookupSession(ctx, "missing"); !errors.Is(err, state.ErrReservationNotFound) {
@@ -186,7 +186,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		if _, err := s.Release(ctx, "k1", other); !errors.Is(err, state.ErrReservationConflict) {
 			t.Fatalf("foreign Release: want ErrReservationConflict, got %v", err)
 		}
-		if _, err := s.BindContainerName(ctx, "k1", other, "ctr-x"); !errors.Is(err, state.ErrReservationConflict) {
+		if _, err := s.BindContainerName(ctx, "k1", other, "ctr-x", ""); !errors.Is(err, state.ErrReservationConflict) {
 			t.Fatalf("foreign BindContainerName: want ErrReservationConflict, got %v", err)
 		}
 
@@ -330,7 +330,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		s := newFixture()
 		mustReserve(ctx, t, s, "k1", owner)
 		mustCommit(ctx, t, s, "k1", owner)
-		row, err := s.BindContainerName(ctx, "k1", owner, "ctr-1")
+		row, err := s.BindContainerName(ctx, "k1", owner, "ctr-1", "")
 		if err != nil {
 			t.Fatalf("first BindContainerName: unexpected error %v", err)
 		}
@@ -338,13 +338,49 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 			t.Fatalf("BindContainerName: want container_name ctr-1, got %q", row.ContainerName)
 		}
 		// A rebind, even to the same name, is refused: the bind is write-once.
-		if _, err := s.BindContainerName(ctx, "k1", owner, "ctr-2"); !errors.Is(err, state.ErrBindingExists) {
+		if _, err := s.BindContainerName(ctx, "k1", owner, "ctr-2", ""); !errors.Is(err, state.ErrBindingExists) {
 			t.Fatalf("rebind: want ErrBindingExists, got %v", err)
 		}
 		// The original binding stands.
 		got := mustLookup(ctx, t, s, "k1")
 		if got.ContainerName != "ctr-1" {
 			t.Fatalf("rebind must not change the binding: want ctr-1, got %q", got.ContainerName)
+		}
+	})
+
+	t.Run("BindContainerName records a warm-pool SockDirRoot, and cold binds leave it empty", func(t *testing.T) {
+		s := newFixture()
+
+		// A cold bind (empty sock-dir root): the row's SockDirRoot stays empty, so
+		// every consumer name-derives the root from the key.
+		mustReserve(ctx, t, s, "cold", owner)
+		mustCommit(ctx, t, s, "cold", owner)
+		coldRow, err := s.BindContainerName(ctx, "cold", owner, "ctr-cold", "")
+		if err != nil {
+			t.Fatalf("cold BindContainerName: %v", err)
+		}
+		if coldRow.SockDirRoot != "" {
+			t.Errorf("cold bind recorded a SockDirRoot %q, want empty", coldRow.SockDirRoot)
+		}
+
+		// A warm bind records the pooled placeholder root the key cannot re-derive.
+		// It must survive a round-trip through the store and a fresh LookupSession —
+		// the durable value the exec dial and the teardown scrub read for a warm
+		// session (else the guest's real sock dir is unreachable and the tenant
+		// Storage-JWT is never scrubbed).
+		const warmRoot = "/var/lib/ocu/handoff/ocu-pool-7"
+		mustReserve(ctx, t, s, "warm", owner)
+		mustCommit(ctx, t, s, "warm", owner)
+		warmRow, err := s.BindContainerName(ctx, "warm", owner, "ctr-warm", warmRoot)
+		if err != nil {
+			t.Fatalf("warm BindContainerName: %v", err)
+		}
+		if warmRow.SockDirRoot != warmRoot {
+			t.Errorf("warm bind returned SockDirRoot %q, want %q", warmRow.SockDirRoot, warmRoot)
+		}
+		got := mustLookup(ctx, t, s, "warm")
+		if got.SockDirRoot != warmRoot {
+			t.Errorf("LookupSession lost the SockDirRoot: got %q, want %q (a warm session's real sock dir is unrecoverable)", got.SockDirRoot, warmRoot)
 		}
 	})
 
@@ -361,7 +397,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		if _, err := s.Release(ctx, "k1", owner); err != nil {
 			t.Fatalf("Release: unexpected error %v", err)
 		}
-		if _, err := s.BindContainerName(ctx, "k1", owner, "ctr-1"); !errors.Is(err, state.ErrReservationConflict) {
+		if _, err := s.BindContainerName(ctx, "k1", owner, "ctr-1", ""); !errors.Is(err, state.ErrReservationConflict) {
 			t.Fatalf("bind onto a RELEASED tombstone: want ErrReservationConflict, got %v", err)
 		}
 		// The tombstone is unchanged: no container name landed on the dead row.
@@ -375,7 +411,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		if _, err := s.Release(ctx, "k2", owner); err != nil {
 			t.Fatalf("Release k2: unexpected error %v", err)
 		}
-		if _, err := s.BindContainerName(ctx, "k2", owner, "ctr-2"); !errors.Is(err, state.ErrReservationConflict) {
+		if _, err := s.BindContainerName(ctx, "k2", owner, "ctr-2", ""); !errors.Is(err, state.ErrReservationConflict) {
 			t.Fatalf("bind onto a reserved-then-released tombstone: want ErrReservationConflict, got %v", err)
 		}
 	})
@@ -384,13 +420,13 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		s := newFixture()
 		mustReserve(ctx, t, s, "k1", owner)
 		mustCommit(ctx, t, s, "k1", owner)
-		if _, err := s.BindContainerName(ctx, "k1", owner, "shared"); err != nil {
+		if _, err := s.BindContainerName(ctx, "k1", owner, "shared", ""); err != nil {
 			t.Fatalf("bind k1: unexpected error %v", err)
 		}
 		mustReserve(ctx, t, s, "k2", owner)
 		mustCommit(ctx, t, s, "k2", owner)
 		// Two sessions can never claim one runtime identity.
-		if _, err := s.BindContainerName(ctx, "k2", owner, "shared"); !errors.Is(err, state.ErrBindingExists) {
+		if _, err := s.BindContainerName(ctx, "k2", owner, "shared", ""); !errors.Is(err, state.ErrBindingExists) {
 			t.Fatalf("duplicate container_name on another row: want ErrBindingExists, got %v", err)
 		}
 		// k2 must remain unbound.
@@ -410,7 +446,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		s := newFixture()
 		mustReserve(ctx, t, s, "k1", owner)
 		mustCommit(ctx, t, s, "k1", owner)
-		if _, err := s.BindContainerName(ctx, "k1", owner, "ctr-recycle"); err != nil {
+		if _, err := s.BindContainerName(ctx, "k1", owner, "ctr-recycle", ""); err != nil {
 			t.Fatalf("bind k1: unexpected error %v", err)
 		}
 		mustRelease(ctx, t, s, "k1", owner)
@@ -425,7 +461,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		// A different session must now be able to claim the released name.
 		mustReserve(ctx, t, s, "k2", owner)
 		mustCommit(ctx, t, s, "k2", owner)
-		if _, err := s.BindContainerName(ctx, "k2", owner, "ctr-recycle"); err != nil {
+		if _, err := s.BindContainerName(ctx, "k2", owner, "ctr-recycle", ""); err != nil {
 			t.Fatalf("k2 must reuse the freed container_name, got %v", err)
 		}
 	})
@@ -908,7 +944,7 @@ func RunConformance(t *testing.T, newStore func(state.Clock) state.Store) {
 		if _, err := s.Release(cancelled, "k1", owner); !errors.Is(err, state.ErrStoreUnavailable) {
 			t.Fatalf("Release on cancelled ctx: want ErrStoreUnavailable, got %v", err)
 		}
-		if _, err := s.BindContainerName(cancelled, "k1", owner, "ctr-x"); !errors.Is(err, state.ErrStoreUnavailable) {
+		if _, err := s.BindContainerName(cancelled, "k1", owner, "ctr-x", ""); !errors.Is(err, state.ErrStoreUnavailable) {
 			t.Fatalf("BindContainerName on cancelled ctx: want ErrStoreUnavailable, got %v", err)
 		}
 		if err := s.ClearDeny(cancelled, state.ScopeGlobal, ""); !errors.Is(err, state.ErrStoreUnavailable) {

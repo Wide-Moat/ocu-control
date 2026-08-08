@@ -309,7 +309,7 @@ func TestPostgres_IdleReaperReseedsActiveRowOnBoot(t *testing.T) {
 	if _, err := a.Commit(ctx, "k-idle", durOwner); err != nil {
 		t.Fatalf("A Commit: %v", err)
 	}
-	if _, err := a.BindContainerName(ctx, "k-idle", durOwner, "ctr-idle"); err != nil {
+	if _, err := a.BindContainerName(ctx, "k-idle", durOwner, "ctr-idle", ""); err != nil {
 		t.Fatalf("A BindContainerName: %v", err)
 	}
 	// RecordActivation is an optional capability (registry.ActivationRecorder), reached

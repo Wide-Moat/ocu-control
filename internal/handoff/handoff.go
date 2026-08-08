@@ -129,6 +129,16 @@ type Stager interface {
 	// (AuthToken stays a placeholder). It returns ErrBadPublicKey on a bad key and
 	// ErrStageFailed on a filesystem failure, having removed any partial root.
 	Stage(ctx context.Context, name runtime.SessionName, pubKey []byte, mounts []runtime.MountIntent) (Staged, error)
+	// StagePlaceholder writes a POOL-UNIT handoff root under a non-tenant
+	// placeholder identity carrying zero tenant material (NFR-SEC-70), so a warm
+	// pool's container can bind the host paths at create; ClaimSpecialize
+	// overwrites the two :ro files in place at claim, before the guest boots.
+	StagePlaceholder(ctx context.Context, placeholder runtime.SessionName) (Staged, error)
+	// ClaimSpecialize rewrites a pooled unit's container_info and public key IN
+	// PLACE (same inode, so a live :ro bind sees the new content) to the session's
+	// real host-attested identity at claim (NFR-SEC-69), before ContainerStart. It
+	// returns the specialized material for the session row.
+	ClaimSpecialize(ctx context.Context, st Staged, realName runtime.SessionName, realPubKey []byte) (runtime.HandoffMaterial, error)
 	// Unstage removes the per-session root from st and is idempotent: an
 	// already-gone root returns nil, so the create unwind and a later reconcile may
 	// both call it. An empty Root is a no-op.
@@ -141,6 +151,9 @@ type Stager interface {
 	// (mirroring how the finalizer re-derives every resource name from SessionName).
 	// It writes nothing and is a read-only derivation.
 	SockDir(name runtime.SessionName) string
+	// SockDirUnder returns the sock dir under an EXPLICIT handoff root, for a
+	// warm-pool-claimed session whose root the SessionName cannot re-derive.
+	SockDirUnder(root string) string
 }
 
 // fsStager is the filesystem Stager. It owns a base directory under which every
@@ -260,6 +273,15 @@ func (s *fsStager) Stage(ctx context.Context, name runtime.SessionName, pubKey [
 // row persisting it.
 func (s *fsStager) SockDir(name runtime.SessionName) string {
 	return filepath.Join(s.base, string(name), sockDirName)
+}
+
+// SockDirUnder returns the sock dir under an EXPLICIT handoff root, for a
+// warm-pool-claimed session whose root (base/ocu-pool-N) the SessionName cannot
+// re-derive. It is the same root/sock layout SockDir builds, so a warm session's
+// exec dial and its cold cousin's resolve to the identical in-root sock path —
+// only the root differs. The caller passes the root recorded on the session row.
+func (s *fsStager) SockDirUnder(root string) string {
+	return filepath.Join(root, sockDirName)
 }
 
 // failClosed removes the partial root and returns the wrapped ErrStageFailed, so

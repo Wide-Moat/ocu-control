@@ -29,11 +29,11 @@ type bindFaultStore struct {
 	fail bool
 }
 
-func (s *bindFaultStore) BindContainerName(ctx context.Context, key string, owner state.Identity, name string) (state.SessionRow, error) {
+func (s *bindFaultStore) BindContainerName(ctx context.Context, key string, owner state.Identity, name, sockDirRoot string) (state.SessionRow, error) {
 	if s.fail {
 		return state.SessionRow{}, state.ErrBindingExists
 	}
-	return s.Store.BindContainerName(ctx, key, owner, name)
+	return s.Store.BindContainerName(ctx, key, owner, name, sockDirRoot)
 }
 
 // faultPoint names one create stage at which the no-orphan test injects a fault. The
@@ -293,7 +293,7 @@ type cancelDuringUnwindStore struct {
 	cancel context.CancelFunc
 }
 
-func (s *cancelDuringUnwindStore) BindContainerName(ctx context.Context, key string, owner state.Identity, name string) (state.SessionRow, error) {
+func (s *cancelDuringUnwindStore) BindContainerName(ctx context.Context, key string, owner state.Identity, name, sockDirRoot string) (state.SessionRow, error) {
 	// Fail the bind AND cancel the request context, so the unwind that follows runs
 	// against an already-cancelled parent.
 	s.cancel()

@@ -142,9 +142,24 @@ func mustCompact(raw []byte) string {
 // by client.APIClient (the compile-time assertion below) AND by the test fake.
 type dockerAPI interface {
 	NetworkCreate(ctx context.Context, name string, options network.CreateOptions) (network.CreateResponse, error)
+	// NetworkConnect attaches an already-created container to a network. It is
+	// used ONLY on the warm-pool claim path: a pooled placeholder is created with
+	// no network, and at claim the per-session bridge is created and the (renamed)
+	// container connected to it BEFORE ContainerStart, so each claimed unit gets
+	// its own deny-all bridge exactly like a cold create — preserving per-session
+	// isolation without a network the placeholder would leak.
+	NetworkConnect(ctx context.Context, networkID, containerID string, config *network.EndpointSettings) error
 	NetworkRemove(ctx context.Context, networkID string) error
 	ContainerCreate(ctx context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, platform *ocispecPlatform, containerName string) (container.CreateResponse, error)
 	ContainerStart(ctx context.Context, containerID string, options container.StartOptions) error
+	// ContainerRename renames a created-not-started container to its final
+	// per-session name. It is used ONLY on the warm-pool claim path: a pooled
+	// placeholder is created under a placeholder name and renamed to
+	// ocu-sess-<key> at claim, BEFORE ContainerStart, so the guest binds its real
+	// identity at first boot (the pre-boot specialize the guest contract blesses).
+	// It never renames a running container (ADR-0018 forbids a post-boot
+	// container_name change; this is a host-side pre-boot rename, not that).
+	ContainerRename(ctx context.Context, containerID, newName string) error
 	ContainerStop(ctx context.Context, containerID string, options container.StopOptions) error
 	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
 	ContainerList(ctx context.Context, options container.ListOptions) ([]container.Summary, error)

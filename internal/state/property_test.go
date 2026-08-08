@@ -232,7 +232,7 @@ func TestProperty_StateMachine(t *testing.T) {
 					modelState = StateReleased
 				}
 			case "bind":
-				_, err := s.BindContainerName(ctx, key, actor, "ctr")
+				_, err := s.BindContainerName(ctx, key, actor, "ctr", "")
 				switch {
 				case modelState == never:
 					if !errors.Is(err, ErrReservationNotFound) {

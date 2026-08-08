@@ -215,11 +215,20 @@ func (t *teardown) zeroTmpfs(base context.Context, sess runtime.Sandbox) error {
 	_ = base // the scrub is a local-filesystem operation; the ctx is unused but the
 	// step keeps the shared finalizer signature so its ordering is uniform.
 
-	// Re-derive the per-session handoff root purely from the host-derived SessionName
-	// under the deployment-fixed base — the same join handoff.Stager uses, so the
-	// finalizer and the create path agree on the path without the row persisting it.
-	root := filepath.Join(t.p.stagerBase, string(sess.Name))
-	return scrubHandoffRoot(root)
+	// A warm-pool-claimed session's handoff lives under its PLACEHOLDER root
+	// (recorded on the Sandbox handle), which the SessionName cannot re-derive: a
+	// name-derived scrub would miss it and leave the tenant Storage-JWT on host
+	// disk. Scrub the recorded root FIRST when present. Then scrub the name-derived
+	// root regardless — it is the cold-session root, and for a warm session it is
+	// an already-absent no-op (scrubHandoffRoot is satisfied on an absent path), so
+	// running both is safe and idempotent and never leaves either root unscrubbed.
+	nameRoot := filepath.Join(t.p.stagerBase, string(sess.Name))
+	if sess.SockDirRoot != "" && sess.SockDirRoot != nameRoot {
+		if err := scrubHandoffRoot(sess.SockDirRoot); err != nil {
+			return err
+		}
+	}
+	return scrubHandoffRoot(nameRoot)
 }
 
 // removeAll is the recursive-removal primitive scrubHandoffRoot drives, indirected

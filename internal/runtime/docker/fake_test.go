@@ -153,6 +153,13 @@ func (f *fakeAPI) NetworkCreate(_ context.Context, name string, options network.
 	return network.CreateResponse{ID: "net-" + name}, nil
 }
 
+func (f *fakeAPI) NetworkConnect(_ context.Context, networkID, containerID string, _ *network.EndpointSettings) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("NetworkConnect", networkID+"<-"+containerID)
+	return f.errOn["NetworkConnect"]
+}
+
 func (f *fakeAPI) NetworkRemove(_ context.Context, networkID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -187,6 +194,13 @@ func (f *fakeAPI) ContainerStart(_ context.Context, containerID string, _ contai
 	defer f.mu.Unlock()
 	f.record("ContainerStart", containerID)
 	return f.errOn["ContainerStart"]
+}
+
+func (f *fakeAPI) ContainerRename(_ context.Context, containerID, newName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.record("ContainerRename", containerID+"->"+newName)
+	return f.errOn["ContainerRename"]
 }
 
 func (f *fakeAPI) ContainerStop(_ context.Context, containerID string, _ container.StopOptions) error {

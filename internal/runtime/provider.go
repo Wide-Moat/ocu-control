@@ -359,6 +359,15 @@ type Sandbox struct {
 	// Materialized sandbox does not set it (the caller has just created a running
 	// container; there is nothing to reconcile).
 	Alive bool
+	// SockDirRoot is the host-side per-session handoff root the finalizer's
+	// credential scrub must remove. It is EMPTY for a cold-materialized session,
+	// where the finalizer re-derives the root purely from Name (stagerBase/<Name>,
+	// the same join the create path used). It is SET only for a warm-pool-claimed
+	// session, whose handoff was staged under a placeholder name the SessionName
+	// cannot re-derive: the finalizer scrubs THIS root when present so the pooled
+	// session's tenant credential (the weak Storage-JWT in its mount-config) does
+	// not survive teardown on host disk. Recorded data, never authority.
+	SockDirRoot string
 }
 
 // Sentinel errors. Callers match with errors.Is; implementations wrap with %w

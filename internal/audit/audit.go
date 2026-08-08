@@ -189,6 +189,15 @@ type Record struct {
 	// in metadata.unmapped.revoke_outcome behind omitempty so a record without it
 	// is byte-identical to before this field existed.
 	RevokeOutcome string
+
+	// WarmHit marks a create-commit record whose session was served from the warm
+	// pool (a pool-claim lifecycle transition, NFR-SEC-72) rather than cold-
+	// materialized. It is true only on a warm-hit create-commit record, false on a
+	// cold create and on every non-create record. It is trail evidence, never an
+	// authority-decision input; the OCSF serializer carries it in
+	// metadata.unmapped.warm_hit behind omitempty so a cold create (and every
+	// pre-existing record kind) is byte-identical to before this field existed.
+	WarmHit bool
 }
 
 // ErrAuditWriteFailed is the fail-closed evidence: a privileged action MUST be
