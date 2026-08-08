@@ -312,6 +312,14 @@ func (s *faultStager) Stage(ctx context.Context, name runtime.SessionName, pubKe
 	return s.inner.Stage(ctx, name, pubKey, mounts)
 }
 
+func (s *faultStager) StagePlaceholder(ctx context.Context, placeholder runtime.SessionName) (handoff.Staged, error) {
+	return s.inner.StagePlaceholder(ctx, placeholder)
+}
+
+func (s *faultStager) ClaimSpecialize(ctx context.Context, st handoff.Staged, realName runtime.SessionName, realPubKey []byte) (runtime.HandoffMaterial, error) {
+	return s.inner.ClaimSpecialize(ctx, st, realName, realPubKey)
+}
+
 func (s *faultStager) Unstage(ctx context.Context, st handoff.Staged) error {
 	s.mu.Lock()
 	s.unstageCalls++

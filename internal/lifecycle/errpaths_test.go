@@ -540,6 +540,12 @@ func (s unstageFailStager) Stage(ctx context.Context, name runtime.SessionName, 
 	return s.inner.Stage(ctx, name, pubKey, mounts)
 }
 func (s unstageFailStager) Unstage(context.Context, handoff.Staged) error { return errLcInjected }
+func (s unstageFailStager) StagePlaceholder(ctx context.Context, placeholder runtime.SessionName) (handoff.Staged, error) {
+	return s.inner.StagePlaceholder(ctx, placeholder)
+}
+func (s unstageFailStager) ClaimSpecialize(ctx context.Context, st handoff.Staged, realName runtime.SessionName, realPubKey []byte) (runtime.HandoffMaterial, error) {
+	return s.inner.ClaimSpecialize(ctx, st, realName, realPubKey)
+}
 func (s unstageFailStager) SockDir(name runtime.SessionName) string {
 	return s.inner.SockDir(name)
 }

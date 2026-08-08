@@ -129,6 +129,16 @@ type Stager interface {
 	// (AuthToken stays a placeholder). It returns ErrBadPublicKey on a bad key and
 	// ErrStageFailed on a filesystem failure, having removed any partial root.
 	Stage(ctx context.Context, name runtime.SessionName, pubKey []byte, mounts []runtime.MountIntent) (Staged, error)
+	// StagePlaceholder writes a POOL-UNIT handoff root under a non-tenant
+	// placeholder identity carrying zero tenant material (NFR-SEC-70), so a warm
+	// pool's container can bind the host paths at create; ClaimSpecialize
+	// overwrites the two :ro files in place at claim, before the guest boots.
+	StagePlaceholder(ctx context.Context, placeholder runtime.SessionName) (Staged, error)
+	// ClaimSpecialize rewrites a pooled unit's container_info and public key IN
+	// PLACE (same inode, so a live :ro bind sees the new content) to the session's
+	// real host-attested identity at claim (NFR-SEC-69), before ContainerStart. It
+	// returns the specialized material for the session row.
+	ClaimSpecialize(ctx context.Context, st Staged, realName runtime.SessionName, realPubKey []byte) (runtime.HandoffMaterial, error)
 	// Unstage removes the per-session root from st and is idempotent: an
 	// already-gone root returns nil, so the create unwind and a later reconcile may
 	// both call it. An empty Root is a no-op.
