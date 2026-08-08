@@ -8,9 +8,10 @@
 #
 # Strategy: ALLOWLIST. Exclude everything, then re-include only the inputs the
 # build actually needs. The build needs the Go module graph (go.mod/go.sum) and
-# the Go packages under cmd/ and internal/; there is no go:embed, so nothing
-# else is required. An allowlist cannot silently drift: a new top-level tree is
-# excluded by default and only ships if it is explicitly re-included here.
+# the Go packages under cmd/, internal/, and gen/ (generated protobuf/gRPC that
+# internal/ingress/gateway imports); there is no go:embed, so nothing else is
+# required. An allowlist cannot silently drift: a new top-level tree is excluded
+# by default and only ships if it is explicitly re-included here.
 
 # Exclude everything by default.
 *
@@ -20,3 +21,4 @@
 !go.sum
 !cmd
 !internal
+!gen

@@ -232,7 +232,14 @@ func (l *Listener) Bind() error {
 		return fmt.Errorf("gateway: bind tcp %q: %w", l.addr, err)
 	}
 	if l.tlsConfig != nil {
-		l.ln = tls.NewListener(tcp, l.tlsConfig)
+		// Advertise h2 ahead of http/1.1 so the gRPC wire negotiates ALPN on
+		// the same socket; the JSON wire stays reachable over http/1.1. The
+		// config is cloned: the caller's tls.Config is not mutated.
+		tc := l.tlsConfig.Clone()
+		if len(tc.NextProtos) == 0 {
+			tc.NextProtos = []string{"h2", "http/1.1"}
+		}
+		l.ln = tls.NewListener(tcp, tc)
 	} else {
 		l.ln = tcp
 	}

@@ -12,6 +12,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+
+	"golang.org/x/net/http2"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -71,7 +73,20 @@ func (l *Listener) Serve(ctx context.Context) error {
 	mux := http.NewServeMux()
 	l.registerRoutes(mux)
 
-	srv := newServer(ctx, mux)
+	// Dual-serve (G1): the generated session-setup gRPC rides the SAME mTLS
+	// listener — the connection manager muxes by protocol, so both wires share
+	// one TLS identity and one ConnInfo derivation. l.addr is the advertised
+	// control endpoint the frozen responses return.
+	grpcSrv := newGRPCServer(l.handlers, l.scope, l.addr)
+	handler := grpcMux(grpcSrv, mux)
+
+	srv := newServer(ctx, handler)
+	// gRPC requires HTTP/2. srv.Serve over an already-TLS listener does not
+	// self-configure h2 (only ServeTLS does), so it is enabled explicitly;
+	// Bind advertises h2 in ALPN.
+	if err := http2.ConfigureServer(srv, &http2.Server{}); err != nil {
+		return fmt.Errorf("gateway: enable h2: %w", err)
+	}
 
 	go func() {
 		<-ctx.Done()
