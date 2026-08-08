@@ -426,7 +426,7 @@ func stageBind(ctx context.Context, m *Manager, st *createState) (compensator, e
 		// on this defensive path — a bare key here would reintroduce the sub-mismatch.
 		containerName = "ocu-sess-" + st.key.String()
 	}
-	row, err := m.reg.BindContainerName(ctx, st.key, st.owner, containerName)
+	row, err := m.reg.BindContainerName(ctx, st.key, st.owner, containerName, st.sockDirRoot)
 	if err != nil {
 		// A rebind-poison attempt or a name already claimed elsewhere fails closed and
 		// unwinds S7..S3.

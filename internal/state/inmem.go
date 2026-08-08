@@ -274,7 +274,7 @@ func (m *memStore) Commit(ctx context.Context, key string, owner Identity) (Sess
 // already carries a name or if containerName is already bound to another row. It
 // returns ErrReservationNotFound for an unknown key and ErrReservationConflict on
 // an owner mismatch.
-func (m *memStore) BindContainerName(ctx context.Context, key string, owner Identity, containerName string) (SessionRow, error) {
+func (m *memStore) BindContainerName(ctx context.Context, key string, owner Identity, containerName, sockDirRoot string) (SessionRow, error) {
 	if err := ctxErr(ctx); err != nil {
 		return SessionRow{}, err
 	}
@@ -309,6 +309,7 @@ func (m *memStore) BindContainerName(ctx context.Context, key string, owner Iden
 	}
 
 	row.ContainerName = containerName
+	row.SockDirRoot = sockDirRoot
 	m.rows[key] = row
 	m.boundNames[containerName] = key
 	return row, nil

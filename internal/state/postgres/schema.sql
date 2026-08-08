@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     owner_caller   TEXT NOT NULL,
     state          SMALLINT NOT NULL,
     container_name TEXT,
+    sock_dir_root TEXT,
     reserved_at    TIMESTAMPTZ NOT NULL
 );
 

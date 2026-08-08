@@ -435,6 +435,10 @@ type createState struct {
 	staged  handoff.Staged
 	spec    runtime.SessionSpec
 	sandbox runtime.Sandbox
+	// sockDirRoot is the host-side handoff root recorded on the row at bind. It is
+	// EMPTY on the cold path (consumers name-derive base/<key>); the warm-pool
+	// claim path sets it to the pooled placeholder root the key cannot re-derive.
+	sockDirRoot string
 	// reservedMark is the monotonic instant the reservation row was written, stamped
 	// at stageReserve. stageCommit observes clk.Since(reservedMark) into the
 	// reserved->active start-duration metric — a monotonic interval, so a wall-clock
