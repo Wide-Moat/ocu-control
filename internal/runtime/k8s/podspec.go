@@ -77,10 +77,32 @@ func buildPod(spec runtime.SessionSpec, runtimeClass, namespace string) *corev1.
 		}}},
 	}
 
+	// Each handoff item mounts at its EXACT guest path via subPath — never at a
+	// parent directory. The guest reads container_info.json from the filesystem
+	// ROOT (/container_info.json, the guest's DEFAULT_PATH); mounting the secret
+	// volume at its parent "/" would shadow the entire rootfs, and mounting the
+	// whole volume at any single directory cannot place two items at two
+	// different guest paths (container_info at root, the key under /etc/ocu). A
+	// subPath file-mount lands one secret item at one exact path without
+	// shadowing anything — the k8s way to honor the guest's fixed, non-negotiable
+	// destinations (INTEGRATION.md invariant (i): the identity MUST land at
+	// /container_info.json or the guest binds an empty name and every session-JWT
+	// sub silently fails to match).
 	mounts := []corev1.VolumeMount{
 		{Name: sockVolumeName, MountPath: sockMountPath},
 		{Name: tmpVolumeName, MountPath: tmpMountPath},
-		{Name: handoffVolumeName, MountPath: handoffMountDir(spec), ReadOnly: true},
+		{
+			Name:      handoffVolumeName,
+			MountPath: spec.Handoff.ContainerInfoGuestPath,
+			SubPath:   handoffCIItem,
+			ReadOnly:  true,
+		},
+		{
+			Name:      handoffVolumeName,
+			MountPath: spec.Handoff.PublicKeyGuestPath,
+			SubPath:   handoffKeyItem,
+			ReadOnly:  true,
+		},
 	}
 
 	pod := &corev1.Pod{
@@ -116,17 +138,6 @@ func buildPod(spec runtime.SessionSpec, runtimeClass, namespace string) *corev1.
 		pod.Spec.RuntimeClassName = &runtimeClass
 	}
 	return pod
-}
-
-// handoffMountDir is the parent directory the read-only handoff secret mounts
-// at. The guest reads container_info.json and the public key from fixed paths
-// under it; the provider derives the directory from the guest paths the spec
-// carries so the mount target never drifts from what the guest reads.
-func handoffMountDir(spec runtime.SessionSpec) string {
-	if spec.Handoff.ContainerInfoGuestPath != "" {
-		return parentDir(spec.Handoff.ContainerInfoGuestPath)
-	}
-	return "/etc/ocu"
 }
 
 // tmpTmpfsBytes bounds the /tmp tmpfs to a fraction of the memory ceiling so a

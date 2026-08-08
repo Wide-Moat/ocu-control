@@ -120,22 +120,11 @@ func TestReconcile_SurfacesListError(t *testing.T) {
 }
 
 // TestPureHelpers_DefaultBranches covers the fallback arms of the small pure
-// helpers: no ci-guest-path -> the /etc/ocu default; a zero memory ceiling ->
-// the 64 MiB tmpfs floor; a top-level path -> parentDir "/".
+// helpers: a zero memory ceiling -> the 64 MiB tmpfs floor; a nil error stays
+// nil through materializeError.
 func TestPureHelpers_DefaultBranches(t *testing.T) {
-	spec := goodSpec()
-	spec.Handoff.ContainerInfoGuestPath = ""
-	if got := handoffMountDir(spec); got != "/etc/ocu" {
-		t.Errorf("handoffMountDir default = %q, want /etc/ocu", got)
-	}
 	if got := tmpTmpfsBytes(0); got != 64<<20 {
 		t.Errorf("tmpTmpfsBytes(0) = %d, want the 64 MiB floor", got)
-	}
-	if got := parentDir("/top"); got != "/" {
-		t.Errorf("parentDir(/top) = %q, want /", got)
-	}
-	if got := parentDir("bare"); got != "/" {
-		t.Errorf("parentDir(bare) = %q, want /", got)
 	}
 	if got := materializeError(nil); got != nil {
 		t.Errorf("materializeError(nil) = %v, want nil", got)

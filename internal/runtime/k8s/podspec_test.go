@@ -24,10 +24,10 @@ func goodSpec() runtime.SessionSpec {
 		Handoff: runtime.HandoffMaterial{
 			ContainerInfoJSON:      []byte("{}"),
 			ContainerInfoHostPath:  "/host/ci.json",
-			ContainerInfoGuestPath: "/etc/ocu/container_info.json",
+			ContainerInfoGuestPath: "/container_info.json",
 			PublicKeyEd25519:       pub,
 			PublicKeyHostPath:      "/host/pub.key",
-			PublicKeyGuestPath:     "/etc/ocu/pub.key",
+			PublicKeyGuestPath:     "/etc/ocu/auth_public_key",
 			HostSockDir:            "/host/run/ocu",
 		},
 	}
@@ -127,27 +127,53 @@ func TestBuildPod_NoRuntimeClassWhenUnset(t *testing.T) {
 // TestBuildPod_MountsTheHandoffReadOnly pins that the non-secret handoff arrives
 // as a read-only secret volume (k8s has no host binds), and the RW sock dir and
 // /tmp scratch are writable emptyDirs on the read-only rootfs.
-func TestBuildPod_MountsTheHandoffReadOnly(t *testing.T) {
+func TestBuildPod_MountsEachHandoffItemAtItsExactGuestPath(t *testing.T) {
 	pod := buildPod(goodSpec(), "gvisor", "ocu-sessions")
 	c := pod.Spec.Containers[0]
 
-	var handoff *corev1.VolumeMount
-	for i := range c.VolumeMounts {
-		if c.VolumeMounts[i].Name == handoffVolumeName {
-			handoff = &c.VolumeMounts[i]
+	// Each handoff item mounts read-only at its EXACT guest path via subPath —
+	// container_info at the filesystem root (/container_info.json, the guest's
+	// non-negotiable DEFAULT_PATH) and the key at /etc/ocu/auth_public_key. A
+	// mount at a parent directory would either shadow the rootfs (for the root
+	// path) or place the item where the guest never reads it — a silent
+	// admission break (INTEGRATION.md invariant (i)).
+	byPath := map[string]corev1.VolumeMount{}
+	for _, m := range c.VolumeMounts {
+		if m.Name == handoffVolumeName {
+			byPath[m.MountPath] = m
 		}
 	}
-	if handoff == nil {
-		t.Fatal("no handoff volume mount")
+
+	ci, ok := byPath["/container_info.json"]
+	if !ok {
+		t.Fatalf("no handoff mount at /container_info.json; mounts = %v", mountPaths(c.VolumeMounts, handoffVolumeName))
 	}
-	if !handoff.ReadOnly {
-		t.Error("handoff mount must be read-only")
+	if ci.SubPath != handoffCIItem {
+		t.Errorf("container_info subPath = %q, want %q", ci.SubPath, handoffCIItem)
 	}
-	if handoff.MountPath != "/etc/ocu" {
-		t.Errorf("handoff mount path = %q, want the parent of the guest container_info path", handoff.MountPath)
+	if !ci.ReadOnly {
+		t.Error("container_info mount must be read-only")
 	}
 
-	// The handoff volume is a secret, named per-session, 0400.
+	key, ok := byPath["/etc/ocu/auth_public_key"]
+	if !ok {
+		t.Fatalf("no handoff mount at /etc/ocu/auth_public_key; mounts = %v", mountPaths(c.VolumeMounts, handoffVolumeName))
+	}
+	if key.SubPath != handoffKeyItem {
+		t.Errorf("public-key subPath = %q, want %q", key.SubPath, handoffKeyItem)
+	}
+	if !key.ReadOnly {
+		t.Error("public-key mount must be read-only")
+	}
+
+	// Neither handoff mount lands at the filesystem root "/", which would shadow
+	// the read-only rootfs (a broken pod, and the exact bug a parent-dir mount of
+	// the root container_info path would cause).
+	if _, bad := byPath["/"]; bad {
+		t.Error("a handoff item is mounted at / — it would shadow the entire rootfs")
+	}
+
+	// The handoff volume is a per-session 0400 secret.
 	var vol *corev1.Volume
 	for i := range pod.Spec.Volumes {
 		if pod.Spec.Volumes[i].Name == handoffVolumeName {
@@ -160,4 +186,14 @@ func TestBuildPod_MountsTheHandoffReadOnly(t *testing.T) {
 	if vol.Secret.SecretName != "ocu-sess-sess-abc" {
 		t.Errorf("handoff secret name = %q, want the per-session secret", vol.Secret.SecretName)
 	}
+}
+
+func mountPaths(mounts []corev1.VolumeMount, name string) []string {
+	var out []string
+	for _, m := range mounts {
+		if m.Name == name {
+			out = append(out, m.MountPath+"[subPath="+m.SubPath+"]")
+		}
+	}
+	return out
 }
