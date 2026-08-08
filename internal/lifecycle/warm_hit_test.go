@@ -24,17 +24,19 @@ import (
 // fakePool hands out a scripted set of warm units and records Get/Put so a test
 // can assert a hit was claimed and a failed create returned or disposed it.
 type fakePool struct {
-	mu       sync.Mutex
-	units    []warmclaim.Unit // popped FIFO on Get
-	getCalls int
-	putCalls int
-	putUnits []warmclaim.Unit
+	mu          sync.Mutex
+	units       []warmclaim.Unit // popped FIFO on Get
+	getCalls    int
+	putCalls    int
+	putUnits    []warmclaim.Unit
+	lastProfile warmclaim.Profile // the profile Get was last queried with
 }
 
-func (p *fakePool) Get(_ warmclaim.Profile) (warmclaim.Unit, bool) {
+func (p *fakePool) Get(prof warmclaim.Profile) (warmclaim.Unit, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.getCalls++
+	p.lastProfile = prof
 	if len(p.units) == 0 {
 		return warmclaim.Unit{}, false
 	}
@@ -151,6 +153,41 @@ func TestWarmHit_ClaimsInsteadOfMaterialize(t *testing.T) {
 	}
 }
 
+// TestWarmHit_ProfileCarriesTheCreateCaps binds warmProfile: the pool is queried
+// with a Profile whose image and hard caps (CPU, memory, and the dereferenced
+// PidsLimit) come from the CreateInput, so a pooled unit is matched to the caps the
+// caller asked for rather than a default shape. It exercises warmProfile's
+// PidsLimit-non-nil arm, which the nil-pids inputs elsewhere never reach.
+func TestWarmHit_ProfileCarriesTheCreateCaps(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{units: []warmclaim.Unit{warmUnit("pool-caps")}}
+	h := newWarmHarness(t, pool, &fakeClaimer{})
+
+	in := input("warm-caps")
+	pids := int64(4096)
+	in.Resources.PidsLimit = &pids
+	in.Resources.CPUCores = 2
+	in.Resources.MemoryBytes = 2 << 30
+
+	if _, err := h.mgr.Create(context.Background(), in); err != nil {
+		t.Fatalf("Create (warm caps): %v", err)
+	}
+	got := pool.lastProfile
+	if got.ImageRef != in.Image {
+		t.Errorf("profile ImageRef = %q, want %q", got.ImageRef, in.Image)
+	}
+	if got.CPUCores != in.Resources.CPUCores {
+		t.Errorf("profile CPUCores = %v, want %v", got.CPUCores, in.Resources.CPUCores)
+	}
+	if got.MemoryBytes != in.Resources.MemoryBytes {
+		t.Errorf("profile MemoryBytes = %d, want %d", got.MemoryBytes, in.Resources.MemoryBytes)
+	}
+	// The dereferenced PidsLimit is the arm the nil-pids inputs never reach.
+	if got.PidsLimit != pids {
+		t.Errorf("profile PidsLimit = %d, want %d (dereferenced from the non-nil cap)", got.PidsLimit, pids)
+	}
+}
+
 // TestWarmMiss_FallsThroughToCold pins that an empty pool (miss) runs the cold
 // path unchanged: provider.Materialize is called, Claim is not.
 func TestWarmMiss_FallsThroughToCold(t *testing.T) {
@@ -189,6 +226,38 @@ func TestWarmHit_ClaimFailureDisposesUnitAndFailsCreate(t *testing.T) {
 	}
 	if pool.putCalls != 0 {
 		t.Errorf("a claim-attempted unit was returned to the pool (%d Puts); it must be disposed, not returned", pool.putCalls)
+	}
+}
+
+// TestWarmHit_ClaimSucceedsThenCommitFailsForceKillsAndDisposes covers the
+// stageMaterialize warm-success teardown compensator: a warm claim that SUCCEEDS
+// (S8) and then hits a later failure (here the S9 commit audit-emit faults) must
+// unwind cleanly — the started sandbox is force-killed by the S8 compensator and
+// the claim-attempted unit is disposed by the S5 Branch-B compensator, so a
+// commit-time failure leaks neither a running container nor a pooled handoff root.
+func TestWarmHit_ClaimSucceedsThenCommitFailsForceKillsAndDisposes(t *testing.T) {
+	t.Parallel()
+	pool := &fakePool{units: []warmclaim.Unit{warmUnit("pool-commitfail")}}
+	claimer := &fakeClaimer{}
+	h := newWarmHarness(t, pool, claimer)
+	// Fault the commit audit record: Claim already ran and succeeded, so the unwind
+	// starts from S9 and must reverse the successful S8 claim.
+	h.audit.SetFault(true, errors.New("commit emit refused"))
+
+	if _, err := h.mgr.Create(context.Background(), input("commitfail-sess")); err == nil {
+		t.Fatal("Create with a faulting commit returned nil; want the audit deny")
+	}
+	// The claim SUCCEEDED, so its teardown compensator must have force-killed the
+	// started sandbox (the S8 warm-success compensator, the covered arm).
+	if h.provider.forceKillCalls == 0 {
+		t.Error("a warm claim that succeeded then failed at commit did not force-kill the started sandbox — it leaks a running container")
+	}
+	// And the claim-attempted unit is disposed, never returned (Branch B).
+	if claimer.disposeCalls == 0 {
+		t.Error("the claim-attempted unit was not disposed on the commit-fail unwind — it leaks the pooled handoff root")
+	}
+	if pool.putCalls != 0 {
+		t.Errorf("a claim-attempted unit was returned to the pool (%d Puts) on a commit-fail unwind; it must be disposed", pool.putCalls)
 	}
 }
 
