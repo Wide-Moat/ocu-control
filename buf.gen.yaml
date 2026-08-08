@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: FSL-1.1-Apache-2.0
+# Copyright (c) 2025 Open Computer Use Contributors
+#
+# Code generation for the frozen session-setup proto (G1, 08-contracts §1:
+# "Session set-up RPC: Protobuf/gRPC"). Local plugins, no remote codegen: the
+# generators are google.golang.org/protobuf and grpc-go — vendor-backed,
+# version-pinned via go.mod tools, passing the supply-chain gate.
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: gen/proto
+    opt: paths=source_relative
+  - local: protoc-gen-go-grpc
+    out: gen/proto
+    opt: paths=source_relative
