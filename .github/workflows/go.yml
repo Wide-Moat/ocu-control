@@ -253,7 +253,8 @@ jobs:
             -s contracts/control/control-rpc.schema.json \
             -s contracts/exec/exec-channel.schema.json \
             -s contracts/storage/mount-config.schema.json \
-            -s contracts/mcp/mcp-key-set.schema.json
+            -s contracts/mcp/mcp-key-set.schema.json \
+            -s contracts/exec/exec-reply.schema.json
       # The golden is pinned byte-for-byte to WriteKeySet's output by
       # TestWriteKeySetMatchesGolden, so validating it against the vendored canon
       # schema proves the published A2 artifact conforms to the frozen wire —
@@ -310,14 +311,14 @@ jobs:
         with:
           repository: Wide-Moat/open-computer-use
           # Kept in sync with scripts/check-contract-identity.sh's pinned revision:
-          # dfd7814 (next/v1 after PR #404 — ADR-0047, which adds the required
-          # top-level state to the mcp-key-set envelope). All five vendored
-          # contracts (control-rpc, exec-channel, mount-config, audit-fanin,
-          # mcp-key-set) are byte-identical to canon @dfd7814 (verified by cmp).
-          # mcp-key-set and audit-fanin both move at this pin.
+          # 9f486c8 (next/v1 after PR #405, which freezes the F5 exec-reply
+          # envelope). All six vendored contracts (control-rpc, exec-channel,
+          # exec-reply, mount-config, audit-fanin, mcp-key-set) are
+          # byte-identical to canon @9f486c8 (verified by cmp). exec-reply
+          # enters at this pin; the prior pin was dfd7814 (ADR-0047).
           # The prior pin was 54fcc1c (PR #375 ADR-0031); the four contracts this
           # change does not touch are unchanged across that bump.
-          ref: dfd7814f391a691aab7250c8e12a3d7d45d6a3e7
+          ref: 9f486c8b2656a84ad98018e4caa81fc7fdcf3620
           path: canon
       - name: SPDX header presence
         run: bash scripts/check-spdx.sh
