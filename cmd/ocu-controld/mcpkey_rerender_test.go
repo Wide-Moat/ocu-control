@@ -8,8 +8,9 @@
 // re-seeded the store with the key active), while the operator saw a 503. This
 // suite drives the real Engine.Revoke through the real renderMCPKeyArtifacts and
 // the real mcpkeyset writers over a real temp dir, so each of those three defects
-// is a red test. Closing the LIVE gateway fail-open needs the config-plane
-// deny-all-artifact contract (open-computer-use#332); this is Control's half.
+// is a red test. The last-key revoke now publishes a deny-all boot-set (ADR-0047)
+// rather than leaving the previous artifact in place, so the live gateway
+// converges on its next config refresh instead of at its next restart.
 package main
 
 import (
@@ -135,14 +136,32 @@ func TestRevokeLastKey_DenyAllPendingAndHonestEntries(t *testing.T) {
 		t.Errorf("entries file does not record the key revoked:\n%s", entries)
 	}
 
-	// Defect 3: the boot-set must NOT present the revoked key as a still-active,
-	// ordinary-revoke success. Either it is absent (removed) or, per the frozen
-	// schema, the stale file is left — but then DenyAllPending MUST be set so the
-	// caller does not treat it as a clean revoke. We asserted DenyAllPending above;
-	// here we assert the artifact is not silently claiming the revoked key is a
-	// fresh, still-valid active key with no signal.
-	if status, present := readKeysetStatuses(t, rig.keysetPath)[rec.KeyID]; present && status == "active" && !outcome.DenyAllPending {
-		t.Errorf("boot-set still publishes revoked key %s as active with no deny-all signal — silent fail-open", rec.KeyID)
+	// Defect 3: the boot-set must be REWRITTEN as a deny-all document, not left
+	// stale. Leaving the previous artifact in place was the live fail-open: the
+	// gateway keeps its last-good set when a refresh finds nothing changed, so the
+	// revoked key kept authenticating until a restart. ADR-0047 makes the empty
+	// case expressible, so the assertion is now unconditional — a stale artifact
+	// carrying the revoked key is a failure regardless of what the outcome flag
+	// says.
+	if status, present := readKeysetStatuses(t, rig.keysetPath)[rec.KeyID]; present {
+		t.Errorf("boot-set still publishes revoked key %s (status %q); it must be rewritten as deny-all", rec.KeyID, status)
+	}
+	published, err := os.ReadFile(rig.keysetPath)
+	if err != nil {
+		t.Fatalf("no boot-set on disk after the last-key revoke (%v); a live gateway would keep its last-good set and never converge", err)
+	}
+	var doc struct {
+		State   string            `json:"state"`
+		Records []json.RawMessage `json:"records"`
+	}
+	if err := json.Unmarshal(published, &doc); err != nil {
+		t.Fatalf("published boot-set is not parseable: %v", err)
+	}
+	if doc.State != "deny-all" {
+		t.Errorf("published boot-set state = %q, want \"deny-all\" — without it the gateway cannot tell this from a truncated write", doc.State)
+	}
+	if len(doc.Records) != 0 {
+		t.Errorf("deny-all boot-set carries %d records, want none", len(doc.Records))
 	}
 
 	// Restart simulation: a fresh store seeded from the entries file must NOT

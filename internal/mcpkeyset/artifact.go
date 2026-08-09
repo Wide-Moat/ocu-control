@@ -15,13 +15,6 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/mcpkey"
 )
 
-// ErrEmptyKeySet is the fail-closed refusal WriteKeySet returns when the active,
-// non-expired subset of the supplied records is empty. An empty boot-set would
-// cause the gateway to reject every presented key (fail-open on the validation
-// side) and would mask a misconfiguration. The artifact is never written when
-// there are no active records to publish.
-var ErrEmptyKeySet = errors.New("mcpkeyset: refusing to write an empty active key set")
-
 // ErrLoosePermissions is returned by LoadEntriesFile when the hashed-entries
 // file exists with permissions looser than 0600. A world- or group-readable
 // file is a store-disclosure surface (even though it holds only hashes, not
@@ -89,12 +82,26 @@ type keySetRecord struct {
 
 // keySetDoc is the versioned published hashed-key-set envelope written by
 // WriteKeySet. version is the const 1 the frozen schema pins; a format
-// migration bumps it. The schema is additionalProperties:false, so this struct
-// carries exactly the two frozen top-level fields and nothing else.
+// migration bumps it. state says whether the document grants or refuses
+// (ADR-0047). The schema is additionalProperties:false, so this struct carries
+// exactly the three frozen top-level fields and nothing else.
+//
+// Records is NOT omitempty: the deny-all document must carry an explicit empty
+// list, and the schema requires the field. Dropping it would render a document
+// the gateway refuses, which is the fail-open this artifact exists to close.
 type keySetDoc struct {
 	Version int            `json:"version"`
+	State   string         `json:"state"`
 	Records []keySetRecord `json:"records"`
 }
+
+// The two published states (ADR-0047). stateDenyAll is what a revoke of the last
+// active key renders: a document the gateway loads and that authenticates
+// nobody, rather than no document at all.
+const (
+	stateActive  = "active"
+	stateDenyAll = "deny-all"
+)
 
 // entriesDoc is the versioned on-disk envelope for the minimal-shelf
 // hashed-entries file. It holds the FULL at-rest record set (both active and
@@ -112,9 +119,11 @@ type entriesDoc struct {
 // records are OMITTED — fail-closed — so a revoked key cannot survive in the
 // published boot-set; every emitted record therefore carries status "active".
 //
-// It is fail-closed on an empty active subset (ErrEmptyKeySet): the artifact is
-// never written when there is nothing to publish, so the gateway cannot end up
-// with a boot-set that accepts no key.
+// An empty active subset renders `state: "deny-all"` with an empty record list
+// rather than withholding the artifact (ADR-0047). Withholding it was fail-OPEN:
+// the gateway keeps its last-good set when a refresh finds nothing, so a revoke
+// of the last active key did not converge until a restart. A deny-all document
+// loads and authenticates nobody, which is what closes NFR-SEC-04.
 //
 // WriteKeySet adds NO network surface: it performs disk syscalls only.
 // The deploy layer or the gateway boot-loader reads the file; this package never
@@ -151,15 +160,20 @@ func WriteKeySet(path string, records []mcpkey.Record, now time.Time) error {
 		active = append(active, rec)
 	}
 
-	// Fail-closed BEFORE any filesystem touch: an empty active subset is never
-	// written as an empty boot-set doc (it would make the gateway reject every
-	// presented key, masking a misconfiguration).
+	// An empty active subset is published as an explicit deny-all document, not
+	// withheld. Writing nothing was the fail-OPEN: the gateway keeps its last-good
+	// set on a config-refresh miss, so withholding the artifact left the revoked
+	// key authenticating until a restart (ADR-0047, NFR-SEC-04). A deny-all
+	// document the gateway loads and that resolves nobody converges the revoke
+	// within the refresh window instead.
+	state := stateActive
 	if len(active) == 0 {
-		return ErrEmptyKeySet
+		state = stateDenyAll
 	}
 
 	doc := keySetDoc{
 		Version: 1,
+		State:   state,
 		Records: active,
 	}
 	data, err := json.MarshalIndent(doc, "", "  ")

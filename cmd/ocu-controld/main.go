@@ -959,14 +959,11 @@ func buildMCPKeyEngine(ctx context.Context, cfg config, clk state.Clock, sink au
 // its error) left the entries file stale when a last-key revoke made WriteKeySet
 // refuse, silently resurrecting the revoked key on the next boot.
 //
-// EMPTY ACTIVE SET is NOT an error. When a revoke removes the last active key,
-// WriteKeySet returns ErrEmptyKeySet (the frozen A2 schema forbids an empty active
-// set). That is the expected terminal state, so this function does not propagate it
-// as a fault: it logs the deny-all-pending warning and returns
-// RenderOutcome{DenyAllPending: true}, nil. The stale boot-set artifact is left in
-// place (removing it would not converge a live gateway, which keeps its last-good
-// set on a config-refresh miss); closing the live fail-open needs the canon
-// deny-all-artifact contract, tracked as open-computer-use#332.
+// EMPTY ACTIVE SET is a published state, not an error. When a revoke removes the
+// last active key, WriteKeySet renders `state: "deny-all"` with an empty record
+// list (ADR-0047) and the gateway converges on its next config refresh. This
+// function still reports RenderOutcome{DenyAllPending: true} so a caller can tell
+// the operator every key is now refused.
 func renderMCPKeyArtifacts(ctx context.Context, cfg config, store mcpkey.RecordStore, now time.Time) (mcpkey.RenderOutcome, error) {
 	// Entries file FIRST: the durable at-rest set (active + revoked) that re-seeds
 	// the store on a restart, so a restart never resurrects a just-revoked key.
@@ -987,17 +984,18 @@ func renderMCPKeyArtifacts(ctx context.Context, cfg config, store mcpkey.RecordS
 			return mcpkey.RenderOutcome{}, fmt.Errorf("mcp-keyset rerender: enumerate active: %w", err)
 		}
 		if err := mcpkeyset.WriteKeySet(cfg.mcpKeysetPath, active, now); err != nil {
-			if errors.Is(err, mcpkeyset.ErrEmptyKeySet) {
-				// Terminal, expected state after revoking the last active key: the
-				// schema cannot publish an empty set. NOT a fault — the revoke
-				// succeeded. Warn (the live gateway does not yet converge to
-				// deny-all; open-computer-use#332) and report DenyAllPending.
-				fmt.Fprintln(os.Stderr, "ocu-controld: WARNING: last active mcp-key revoked; the boot-set has no active keys to publish. "+
-					"The revoke is durable (audit + store), but a live gateway keeps its last-good key set on a config-refresh miss, so it may keep accepting the revoked key until it restarts. "+
-					"Converging the live gateway to deny-all needs the config-plane deny-all-artifact contract (open-computer-use#332).")
-				return mcpkey.RenderOutcome{DenyAllPending: true}, nil
-			}
 			return mcpkey.RenderOutcome{}, fmt.Errorf("mcp-keyset rerender: write keyset: %w", err)
+		}
+		if len(active) == 0 {
+			// Revoking the last active key now PUBLISHES a deny-all document rather
+			// than withholding the artifact, so a live gateway converges on its next
+			// refresh instead of keeping the last-good set until a restart. The
+			// outcome is still reported: an operator who revokes the last key has
+			// locked every caller out, which is worth saying out loud even though
+			// it is exactly what they asked for.
+			fmt.Fprintln(os.Stderr, "ocu-controld: NOTICE: last active mcp-key revoked; published a deny-all boot-set. "+
+				"Callers are refused from the gateway's next config refresh (NFR-SEC-04, within 5 minutes); issue a new key with `occ mcp-key create` to restore access.")
+			return mcpkey.RenderOutcome{DenyAllPending: true}, nil
 		}
 	}
 	return mcpkey.RenderOutcome{}, nil
