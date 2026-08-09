@@ -7,11 +7,14 @@
 # byte-identical copies so any Go parity test (and any future embed) always
 # builds against the pinned wire surface.
 #
-# Pinned canon revision (next/v1): 54fcc1c — next/v1 after PR #375,
-# "feat(contracts): freeze the mcp-key-set artifact and operator mcp-key verbs
-# (ADR-0027)". All five declared contracts are byte-identical to canon at this
-# rev (verified by cmp): mcp/mcp-key-set.schema.json enters at this pin (git
-# blob 25329b0f…); control-rpc, exec-channel, mount-config, and audit-fanin are
+# Pinned canon revision (next/v1): dfd7814 — next/v1 after PR #404,
+# "feat(contracts): ADR-0047 — a deny-all state for the MCP key set". All five
+# declared contracts are byte-identical to canon at this rev (verified by cmp):
+# mcp/mcp-key-set.schema.json moves at this pin (git blob 2b0c6034…, gaining the
+# required top-level state) and audit-fanin moves with it (1.0.0 -> 1.2.0: the
+# gateway channel gains Authentication, PR #391/#395/#402 — canon had advanced it
+# since the last bump and this pin catches up); control-rpc, exec-channel, and
+# mount-config are
 # unchanged since the prior pin 5100e14 (PR #303 exec-uplift: snake_case rename
 # + the TraceEvent 5-field $defs + zstd RFC 8878 window ≤2^17 pins; exec-channel
 # sha256 ea1e94ef…52aaf, control-rpc bd0bde46…). Keep this pin in sync with the
@@ -44,7 +47,7 @@ cd "$(dirname "$0")/.."
 readonly CANON_DIR="${OCU_CANON_DIR:-../open-computer-use}"
 # Pinned canon revision; keep in sync with the header above and with go.yml's
 # canon checkout `ref:`.
-readonly CANON_REV="${OCU_CANON_REV:-54fcc1c6deb26bb6396d3a323f9b7e6637c5f477}"
+readonly CANON_REV="${OCU_CANON_REV:-dfd7814f391a691aab7250c8e12a3d7d45d6a3e7}"
 
 # The declared set of vendored contracts, by path under contracts/ on both
 # sides. Add a path here when a contract is vendored; the loop below fails
