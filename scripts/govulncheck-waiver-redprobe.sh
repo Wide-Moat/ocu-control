@@ -56,8 +56,8 @@ module_only_finding() {
   jq -cn --arg id "$1" \
     '{finding: {osv: $id, trace: [{module: "github.com/docker/docker"}]}}'
 }
-# The five real waived IDs.
-WAIVED_IDS=(GO-2026-4883 GO-2026-4887 GO-2026-5617 GO-2026-5668 GO-2026-5746)
+# The three real waived IDs.
+WAIVED_IDS=(GO-2026-4883 GO-2026-4887 GO-2026-5668)
 
 all_waived_stream() {
   for id in "${WAIVED_IDS[@]}"; do finding "$id"; done
