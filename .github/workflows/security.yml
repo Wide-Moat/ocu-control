@@ -14,6 +14,11 @@ on:
   schedule:
     # Weekly cron: Sunday at 02:00 UTC (T2-10, SUPPLY-03)
     - cron: '0 2 * * 0'
+  # On-demand trigger: run the full supply-chain sweep without waiting for the
+  # weekly cron. A manual dispatch carries no push range and no PR — the same
+  # base==head context as `schedule` — so it also exercises the full-filesystem
+  # trufflehog path, making it the way to verify that path outside the cron.
+  workflow_dispatch:
 
 permissions:
   contents: read
