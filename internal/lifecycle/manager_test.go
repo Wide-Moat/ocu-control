@@ -6,6 +6,7 @@ package lifecycle_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -648,8 +649,14 @@ func TestCreateQuotaRejectedEmitsAudit(t *testing.T) {
 		t.Fatalf("second Create error = %v, want ErrQuotaExceeded", err)
 	}
 	recs := h.audit.Records()
-	if len(recs) != 2 || recs[1].Action != audit.ActionCreateRejected || recs[1].Reason != "quota-rejection" {
-		t.Fatalf("audit = %+v, want create_commit then create_rejected(quota-rejection)", recs)
+	if len(recs) != 2 || recs[1].Action != audit.ActionCreateRejected {
+		t.Fatalf("audit = %+v, want create_commit then create_rejected", recs)
+	}
+	// The reason must name WHICH cap refused. A bare "quota-rejection" sends an
+	// operator to whichever counter they think of first; when that one reads
+	// healthy they conclude it was not quota, and they are wrong.
+	if !strings.HasPrefix(recs[1].Reason, "quota-rejection:") {
+		t.Fatalf("rejection Reason = %q, want a quota-rejection:<dimension>", recs[1].Reason)
 	}
 	if got := concurrentCount(t, h.store, testCaller.Identity); got != 1 {
 		t.Fatalf("concurrent counter after quota rejection = %d, want 1 (the one live session)", got)

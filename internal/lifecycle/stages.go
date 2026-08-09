@@ -5,6 +5,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/Wide-Moat/ocu-control/internal/admission"
@@ -12,9 +13,11 @@ import (
 	"github.com/Wide-Moat/ocu-control/internal/cred"
 	"github.com/Wide-Moat/ocu-control/internal/handoff"
 	"github.com/Wide-Moat/ocu-control/internal/mountcfg"
+	"github.com/Wide-Moat/ocu-control/internal/quota"
 	"github.com/Wide-Moat/ocu-control/internal/registry"
 	"github.com/Wide-Moat/ocu-control/internal/runtime"
 	"github.com/Wide-Moat/ocu-control/internal/runtimemap"
+	"github.com/Wide-Moat/ocu-control/internal/state"
 )
 
 // stageResolveIdentity (S1) takes the host-derived identity from the resolved
@@ -74,7 +77,7 @@ func stageQuotaCharge(ctx context.Context, m *Manager, st *createState) (compens
 		// failure supersedes the typed error but the create is STILL denied either way.
 		// ErrStoreUnavailable also flows through here — it is faithfully audited, still a
 		// refused create.
-		if emitErr := emitCreateRejected(ctx, m, st, "quota-rejection"); emitErr != nil {
+		if emitErr := emitCreateRejected(ctx, m, st, quotaRejectionReason(err)); emitErr != nil {
 			return nil, fmt.Errorf("lifecycle: quota rejection audit: %w", emitErr)
 		}
 		return nil, err
@@ -149,6 +152,61 @@ func stageReserve(ctx context.Context, m *Manager, st *createState) (compensator
 // and the client never sees the rejection before the record is durable. A deny stage
 // pushes no compensator, so this emit is inline and synchronous. It uses the live ctx
 // so a cancelled context fails the emit closed.
+// stageFailureReason builds the audit Reason for a host-side stage that refused.
+//
+// The stage name alone answers "where" and nothing of "why". Control maps every
+// unclassified refusal to a bare 409 "request refused" so the wire carries no
+// detail by design; the audit sink is where an operator is told to look, and it
+// recorded only the name. A create refused by a missing image and one refused by
+// a full disk were the same line.
+//
+// The error text is server-side only -- this Record goes to the operator sink,
+// never into a response body -- but it is still bounded: a wrapped error can
+// carry a caller-supplied fragment (an image name, a path), and an unbounded
+// reason lets a caller pad the audit log. reasonErrCap bytes is far more than any
+// real cause needs and far less than a useful padding oracle.
+const reasonErrCap = 200
+
+func stageFailureReason(stage string, err error) string {
+	base := "stage-failed:" + stage
+	if err == nil {
+		// Never reachable from the runner (it only calls this on a non-nil error),
+		// but a reason that silently became just the stage name again is exactly the
+		// regression this function exists to prevent, so it is explicit.
+		return base
+	}
+	msg := err.Error()
+	if len(msg) > reasonErrCap {
+		msg = msg[:reasonErrCap] + "..."
+	}
+	return base + ": " + msg
+}
+
+// quotaRejectionReason names WHICH cap refused the create, not merely that a
+// quota path did. Three unrelated facts reached this stage under one label: the
+// per-caller create-rate window, the per-tenant concurrent-session level, and a
+// store that was unavailable and is not a quota fact at all. An operator reading
+// "quota-rejection" and finding the concurrency counter at zero concludes it was
+// not quota -- and is wrong, because the exhausted dimension was the other one.
+//
+// The wire is unchanged: the ingress still answers a bare 409 with no detail.
+// This is the operator-only sink, which is exactly where the caller is told the
+// reason lives.
+func quotaRejectionReason(err error) string {
+	const base = "quota-rejection"
+	switch {
+	case errors.Is(err, state.ErrStoreUnavailable):
+		// Not a cap at all. Naming it as one sends the reader to a counter that
+		// will look healthy, because nothing was ever charged.
+		return base + ":store-unavailable"
+	case errors.Is(err, quota.ErrCreateRateDimension):
+		return base + ":create-rate"
+	case errors.Is(err, quota.ErrConcurrentDimension):
+		return base + ":concurrent-sessions"
+	}
+	return base
+}
+
 func emitCreateRejected(ctx context.Context, m *Manager, st *createState, cause string) error {
 	rec := audit.Record{
 		Action:  audit.ActionCreateRejected,
