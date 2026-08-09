@@ -7,14 +7,14 @@
 # byte-identical copies so any Go parity test (and any future embed) always
 # builds against the pinned wire surface.
 #
-# Pinned canon revision (next/v1): dfd7814 — next/v1 after PR #404,
-# "feat(contracts): ADR-0047 — a deny-all state for the MCP key set". All five
-# declared contracts are byte-identical to canon at this rev (verified by cmp):
-# mcp/mcp-key-set.schema.json moves at this pin (git blob 2b0c6034…, gaining the
-# required top-level state) and audit-fanin moves with it (1.0.0 -> 1.2.0: the
-# gateway channel gains Authentication, PR #391/#395/#402 — canon had advanced it
-# since the last bump and this pin catches up); control-rpc, exec-channel, and
-# mount-config are
+# Pinned canon revision (next/v1): 9f486c8 — next/v1 after PR #405,
+# "feat(contracts): freeze the F5 exec-reply envelope". All six declared
+# contracts are byte-identical to canon at this rev (verified by cmp):
+# exec/exec-reply.schema.json ENTERS at this pin — the F5 reply envelope had
+# lived only as Go structs here and in the gateway, which is how the two size
+# caps diverged (#127/#128/#131); the schema now carries the sizing invariant
+# that binds them. control-rpc, exec-channel, mount-config, audit-fanin, and
+# mcp-key-set are
 # unchanged since the prior pin 5100e14 (PR #303 exec-uplift: snake_case rename
 # + the TraceEvent 5-field $defs + zstd RFC 8878 window ≤2^17 pins; exec-channel
 # sha256 ea1e94ef…52aaf, control-rpc bd0bde46…). Keep this pin in sync with the
@@ -47,7 +47,7 @@ cd "$(dirname "$0")/.."
 readonly CANON_DIR="${OCU_CANON_DIR:-../open-computer-use}"
 # Pinned canon revision; keep in sync with the header above and with go.yml's
 # canon checkout `ref:`.
-readonly CANON_REV="${OCU_CANON_REV:-dfd7814f391a691aab7250c8e12a3d7d45d6a3e7}"
+readonly CANON_REV="${OCU_CANON_REV:-9f486c8b2656a84ad98018e4caa81fc7fdcf3620}"
 
 # The declared set of vendored contracts, by path under contracts/ on both
 # sides. Add a path here when a contract is vendored; the loop below fails
@@ -56,6 +56,7 @@ readonly CANON_REV="${OCU_CANON_REV:-dfd7814f391a691aab7250c8e12a3d7d45d6a3e7}"
 readonly -a CONTRACTS=(
   'control/control-rpc.schema.json'
   'exec/exec-channel.schema.json'
+  'exec/exec-reply.schema.json'
   'storage/mount-config.schema.json'
   'audit/audit-fanin.asyncapi.yaml'
   'mcp/mcp-key-set.schema.json'
