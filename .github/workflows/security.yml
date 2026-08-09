@@ -116,6 +116,14 @@ jobs:
         uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11 # v3.96.0
         with:
           path: ./
+          # base: "" forces a FULL filesystem scan of the checkout rather than a
+          # git base..head diff. Without it the action derives base/head from the
+          # event context, and on a `schedule` (weekly cron) run — where there is no
+          # push range and no PR — base == head, so the action errors with "BASE and
+          # HEAD commits are the same. TruffleHog won't scan anything." A full scan
+          # is the right shape for the scheduled supply-chain sweep anyway (the whole
+          # tree, not just a diff), and at ~16 MB / ~1 s it costs nothing on push/PR.
+          base: ""
           # Pin the SCANNER BINARY, not just the action SHA. The action's
           # `version` input defaults to "latest", so the SHA-pinned composite
           # still does `docker run ghcr.io/.../trufflehog:latest` — a fresh
