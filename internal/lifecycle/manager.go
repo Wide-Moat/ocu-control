@@ -550,7 +550,16 @@ func (m *Manager) Create(ctx context.Context, in CreateInput) (state.SessionRow,
 				// mask the real stage error the caller needs, so it is swallowed here (the
 				// deny stages' emits ARE fail-closed because they are the record of record;
 				// this is a supplementary trail for an already-failing host-side stage).
-				_ = emitCreateRejected(ctx, m, st, "stage-failed:"+s.name)
+				//
+				// The CAUSE rides along, not just the stage name. The ingress maps every
+				// unclassified refusal to a bare 409 "request refused" and says the detail
+				// stays in the server-side audit trail -- which was true of the stage name
+				// and false of the reason. An operator reading "stage-failed:materialize"
+				// learns which stage refused and nothing about why, so the one artifact
+				// that names the cause discarded it. The sink is server-side and
+				// operator-only, so it is the right place for the error text; the client
+				// body is unchanged and still carries no detail.
+				_ = emitCreateRejected(ctx, m, st, stageFailureReason(s.name, err))
 			}
 			m.unwind(ctx, compensators)
 			return state.SessionRow{}, fmt.Errorf("lifecycle: create stage %q: %w", s.name, err)

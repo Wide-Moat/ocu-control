@@ -31,6 +31,7 @@ package quota
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -152,6 +153,20 @@ type Gate struct {
 	limits Limits
 }
 
+// ErrCreateRateDimension and ErrConcurrentDimension mark WHICH create-time
+// charge refused. A create refused by the per-caller rate window and one refused
+// by the tenant's concurrent-session cap are different operational facts with
+// different remedies -- wait, versus free a slot -- and store-unavailable is not
+// a quota fact at all. ChargeCreate wrapped all three the same way, so the one
+// artifact an operator is told to read recorded a single flat label and the
+// caller was left to guess. Both markers wrap the underlying typed error, so
+// errors.Is against ErrQuotaExceeded / ErrStoreUnavailable keeps working
+// unchanged; these only add the dimension the caller could not otherwise see.
+var (
+	ErrCreateRateDimension = errors.New("quota: create-rate window")
+	ErrConcurrentDimension = errors.New("quota: concurrent-sessions level")
+)
+
 // NewGate constructs a Gate bound to the Store, Clock, and deployment Limits.
 func NewGate(store state.Store, clk state.Clock, limits Limits) *Gate {
 	return &Gate{store: store, clk: clk, limits: limits}
@@ -182,8 +197,9 @@ func (g *Gate) ChargeCreate(ctx context.Context, id state.Identity) (*Receipt, e
 	}
 	if _, err := g.store.Charge(ctx, rateKey, 1, g.limits.CreateRatePerCallerPerMin); err != nil {
 		// First charge refused or store-unavailable: nothing applied, nothing to
-		// refund. Propagate the typed error unchanged for the caller to branch on.
-		return nil, err
+		// refund. The typed error is preserved for the caller to branch on; the
+		// dimension marker rides alongside so the audit can name which cap it was.
+		return nil, fmt.Errorf("%w: %w", ErrCreateRateDimension, err)
 	}
 
 	concKey := state.QuotaKey{
@@ -196,7 +212,7 @@ func (g *Gate) ChargeCreate(ctx context.Context, id state.Identity) (*Receipt, e
 		// surface the typed error. The refund runs detached + bounded so a
 		// cancelled request context cannot strand the create-rate counter.
 		g.refundOne(ctx, rateKey)
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", ErrConcurrentDimension, err)
 	}
 
 	return &Receipt{
