@@ -270,39 +270,97 @@ func TestWriteKeySetFrozenA2Shape(t *testing.T) {
 	}
 }
 
-// TestWriteKeySetEmptyFailsClosed proves that WriteKeySet returns ErrEmptyKeySet
-// when the active+non-expired subset is empty, and writes NOTHING to disk.
-func TestWriteKeySetEmptyFailsClosed(t *testing.T) {
+// TestWriteKeySetEmptyPublishesDenyAll is the producer keystone for ADR-0047.
+//
+// Asserting only that a file appears, or that the write returns nil, would stay
+// green for a document the gateway refuses — and a refused document is exactly
+// the old behaviour: the gateway keeps its last-good set and the revoked key
+// keeps authenticating until a restart. That failure is invisible from this
+// side, because from here the write looked like it worked.
+//
+// So the test asserts the three properties the gateway's loader actually reads:
+// the state says deny-all, the record list is present and empty, and the empty
+// list serialises as `[]` rather than `null` (a nil slice would render `null`,
+// which fails the schema's array type and would be refused at the gateway).
+func TestWriteKeySetEmptyPublishesDenyAll(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keyset.json")
-	now := time.Now()
 
-	// Only revoked and expired records — active subset is empty.
-	err := WriteKeySet(path, []mcpkey.Record{revokedRecord(), expiredRecord()}, now)
-	if !errors.Is(err, ErrEmptyKeySet) {
-		t.Fatalf("WriteKeySet over an all-revoked/expired set returned %v; want ErrEmptyKeySet", err)
-	}
+	for _, tc := range []struct {
+		name    string
+		records []mcpkey.Record
+	}{
+		{"all revoked and expired", []mcpkey.Record{revokedRecord(), expiredRecord()}},
+		{"nil slice", nil},
+		{"empty slice", []mcpkey.Record{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "keyset.json")
 
-	// No file must have been written.
-	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("WriteKeySet ErrEmptyKeySet left a file at path (stat=%v)", statErr)
+			if err := WriteKeySet(path, tc.records, time.Now()); err != nil {
+				t.Fatalf("WriteKeySet must PUBLISH a deny-all set, not refuse: %v", err)
+			}
+
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("no artifact was written; a live gateway keeps its last-good set and the revoke never converges: %v", err)
+			}
+
+			var doc struct {
+				Version int                `json:"version"`
+				State   string             `json:"state"`
+				Records *[]json.RawMessage `json:"records"`
+			}
+			if err := json.Unmarshal(data, &doc); err != nil {
+				t.Fatalf("published deny-all set is not parseable: %v", err)
+			}
+			if doc.Version != 1 {
+				t.Errorf("version = %d, want 1", doc.Version)
+			}
+			if doc.State != stateDenyAll {
+				t.Errorf("state = %q, want %q — without it the gateway cannot tell a revocation from a truncated write", doc.State, stateDenyAll)
+			}
+			if doc.Records == nil {
+				t.Fatal("records is absent or null; the schema requires an array and the gateway would refuse the document")
+			}
+			if len(*doc.Records) != 0 {
+				t.Errorf("deny-all document carries %d records, want none", len(*doc.Records))
+			}
+			// Bind the null-vs-[] distinction to the bytes: a nil slice marshals to
+			// `null`, which unmarshals into the pointer above as nil but is easy to
+			// reintroduce, and which the gateway's schema refuses.
+			if !strings.Contains(string(data), `"records": []`) {
+				t.Errorf("records did not serialise as an empty array; got:\n%s", data)
+			}
+		})
 	}
 }
 
-// TestWriteKeySetNilFailsClosed proves the nil/empty-slice path also triggers
-// ErrEmptyKeySet with no filesystem touch.
-func TestWriteKeySetNilFailsClosed(t *testing.T) {
+// The control for the keystone above: a set WITH active records must publish
+// state "active", or "deny-all" could be a constant the renderer always emits.
+func TestWriteKeySetActivePublishesActiveState(t *testing.T) {
 	t.Parallel()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keyset.json")
-	now := time.Now()
+	path := filepath.Join(t.TempDir(), "keyset.json")
 
-	if err := WriteKeySet(path, nil, now); !errors.Is(err, ErrEmptyKeySet) {
-		t.Fatalf("WriteKeySet(nil) returned %v; want ErrEmptyKeySet", err)
+	if err := WriteKeySet(path, []mcpkey.Record{activeRecord()}, time.Now()); err != nil {
+		t.Fatalf("WriteKeySet: %v", err)
 	}
-	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("WriteKeySet nil left a file (stat=%v)", statErr)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read published set: %v", err)
+	}
+	var doc struct {
+		State   string            `json:"state"`
+		Records []json.RawMessage `json:"records"`
+	}
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("published set is not parseable: %v", err)
+	}
+	if doc.State != stateActive {
+		t.Errorf("state = %q, want %q", doc.State, stateActive)
+	}
+	if len(doc.Records) == 0 {
+		t.Error("an active set published no records")
 	}
 }
 

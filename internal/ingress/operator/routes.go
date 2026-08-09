@@ -166,13 +166,13 @@ func (l *Listener) registerRoutes(mux *http.ServeMux) {
 		}
 		if outcome.DenyAllPending {
 			// The revoke succeeded and removed the LAST active key. It is a 200, not
-			// an error — but the operator MUST know the live gateway does not yet
-			// converge to deny-all (the config plane has no empty-set representation;
-			// open-computer-use#332), so the just-revoked key may keep validating
-			// until the gateway restarts.
-			writeStatus(w, http.StatusOK, "revoked; WARNING: last active key revoked — "+
-				"deny-all is not yet propagated to a live gateway (config-plane deny-all-artifact contract pending, open-computer-use#332); "+
-				"the revoked key may keep validating until the gateway restarts")
+			// an error, and the published boot-set now carries state "deny-all"
+			// (ADR-0047), so a live gateway refuses every caller from its next config
+			// refresh. The operator is still told plainly: they have just locked
+			// everyone out, which is what they asked for but worth stating.
+			writeStatus(w, http.StatusOK, "revoked; NOTICE: that was the last active key — "+
+				"a deny-all boot-set is published and every caller is refused from the gateway's next config refresh (within 5 minutes); "+
+				"issue a new key to restore access")
 			return
 		}
 		writeStatus(w, http.StatusOK, "revoked")

@@ -61,15 +61,11 @@ const maxScopeLen = 256
 type RenderOutcome struct {
 	// DenyAllPending is true when the revoke removed the LAST active key, so the
 	// re-render found no active records to publish. The revoke itself is a full
-	// success — audit is durable and the store records the key revoked — but the
-	// frozen A2 schema (records minItems 1) forbids publishing an empty active
-	// set, so the boot-set artifact cannot express "accept nothing". A live
-	// gateway that keeps its last-good set on a config-refresh miss therefore
-	// still accepts the just-revoked key until it restarts: the config plane has
-	// no deny-all representation. Converging the LIVE gateway to deny-all within
-	// the NFR-SEC-04 window needs the canon deny-all-artifact contract, tracked as
-	// open-computer-use#332. Control surfaces this state to the operator rather
-	// than hiding it behind a false success or a torn 503.
+	// success: audit is durable, the store records the key revoked, and the
+	// boot-set is published with state "deny-all" (ADR-0047), so a live gateway
+	// refuses every caller from its next config refresh — within the NFR-SEC-04
+	// window, without a restart. The flag is not a fault; it exists so the
+	// operator surface can say plainly that access is now closed to everyone.
 	DenyAllPending bool
 }
 
@@ -219,13 +215,11 @@ func (e *Engine) Create(ctx context.Context, scope ingress.OperatorScope, tenant
 // "revoke --id"; reason is operator-supplied context for the trail.
 //
 // The returned RenderOutcome carries DenyAllPending: true when this revoke removed
-// the LAST active key. That is a full success (audit durable, store revoked), but
-// the frozen A2 schema cannot publish an empty active set, so the live gateway may
-// keep accepting the just-revoked key until it restarts (open-computer-use#332,
-// the config-plane deny-all gap). Control returns the flag rather than a false
-// success or a torn error, so the operator surface can warn. A non-nil error is a
-// genuine fault (audit, store, or a render fault other than the empty-set case);
-// the empty-set case is NOT an error.
+// the LAST active key. That is a full success — audit durable, store revoked, and
+// a deny-all boot-set published (ADR-0047) that converges the live gateway on its
+// next refresh. Control returns the flag so the operator surface can say every
+// caller is now refused. A non-nil error is a genuine fault (audit, store, or a
+// render fault); emptying the active set is not one.
 func (e *Engine) Revoke(ctx context.Context, scope ingress.OperatorScope, keyID, reason string) (RenderOutcome, error) {
 	if !scope.Valid() {
 		return RenderOutcome{}, ErrScopeInvalid
@@ -258,7 +252,8 @@ func (e *Engine) Revoke(ctx context.Context, scope ingress.OperatorScope, keyID,
 	// the re-rendered artifact omits it — Control's half of the ≤5-min revoke
 	// budget (NFR-SEC-04). The gateway refresh (component-01) handles propagation.
 	// The RenderOutcome carries DenyAllPending when this revoke emptied the active
-	// set; that is surfaced, not swallowed (open-computer-use#332).
+	// set; the re-render then publishes a deny-all boot-set (ADR-0047) and the flag
+	// is surfaced, not swallowed.
 	if e.rerender == nil {
 		return RenderOutcome{}, nil
 	}

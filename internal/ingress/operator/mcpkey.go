@@ -63,8 +63,8 @@ func (h *Handlers) MCPKeyCreate(ctx context.Context, conn ingress.ConnInfo, tena
 // an already-revoked or absent key_id is a no-op success (no cross-tenant
 // existence oracle), so this route returns 200 rather than 404 for an unknown id.
 // The returned RenderOutcome carries DenyAllPending when this revoke removed the
-// last active key: a full success whose boot-set cannot be published as an empty
-// active set, so the route surfaces a warning to the operator (open-computer-use#332).
+// last active key: a full success that publishes a deny-all boot-set (ADR-0047),
+// so the route tells the operator every caller is now refused.
 func (h *Handlers) MCPKeyRevoke(ctx context.Context, conn ingress.ConnInfo, keyID, reason string) (mcpkey.RenderOutcome, error) {
 	if h.mcpKeyEngine == nil {
 		return mcpkey.RenderOutcome{}, ErrMCPKeyEngineUnset
